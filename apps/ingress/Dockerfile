@@ -39,4 +39,14 @@ EXPOSE 8000
 # actually a privacy leak -- but we disable it anyway so that
 # ingress.logging.log_event() stays the *only* code path that emits logs in
 # this service. One auditable emitter, not two.
-CMD ["sh", "-c", "uvicorn ingress.main:app --host 0.0.0.0 --port ${PORT} --no-access-log"]
+#
+# `exec` matters here: without it, `sh -c "uvicorn ..."` makes uvicorn a
+# child of the shell, which stays PID 1. Railway/Docker send SIGTERM to
+# PID 1 on redeploy/stop -- if that's `sh`, it (by default) doesn't forward
+# the signal to uvicorn, so uvicorn never sees it, the lifespan shutdown
+# handler in ingress/app.py (which cancels the retry background task and
+# closes the httpx client) never runs, and the container just gets
+# SIGKILLed after the grace period instead of shutting down cleanly.
+# `exec` replaces the shell process with uvicorn so uvicorn *is* PID 1 and
+# receives SIGTERM directly.
+CMD ["sh", "-c", "exec uvicorn ingress.main:app --host 0.0.0.0 --port ${PORT} --no-access-log"]

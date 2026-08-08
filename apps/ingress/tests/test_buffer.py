@@ -1,6 +1,12 @@
 """Unit tests for the buffer-and-wake retry queue (ingress.buffer)."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import dataclasses
+import json
+import logging
+
 from ingress.buffer import RetryBuffer, TenantBuffer
 
 
@@ -9,15 +15,15 @@ def test_tenant_buffer_drops_oldest_on_overflow(settings):
     buf = TenantBuffer("tenant-1", "http://tenant-1.internal", maxsize=3)
 
     overflow_flags = [
-        buf.enqueue(b"update-1", now=0.0, initial_delay=2.0),
-        buf.enqueue(b"update-2", now=1.0, initial_delay=2.0),
-        buf.enqueue(b"update-3", now=2.0, initial_delay=2.0),
+        buf.enqueue(b"update-1", bot_id=42, now=0.0, initial_delay=2.0),
+        buf.enqueue(b"update-2", bot_id=42, now=1.0, initial_delay=2.0),
+        buf.enqueue(b"update-3", bot_id=42, now=2.0, initial_delay=2.0),
     ]
     assert overflow_flags == [False, False, False]
     assert len(buf) == 3
 
     # Queue is full (maxlen=3); the 4th append must evict update-1.
-    overflowed = buf.enqueue(b"update-4", now=3.0, initial_delay=2.0)
+    overflowed = buf.enqueue(b"update-4", bot_id=42, now=3.0, initial_delay=2.0)
     assert overflowed is True
     assert len(buf) == 3
     assert [item.body for item in buf.items] == [b"update-2", b"update-3", b"update-4"]
@@ -99,3 +105,59 @@ async def test_retry_preserves_fifo_order_per_tenant(settings, fake_clock):
     await rb.retry_once()
 
     assert delivered == [b"first", b"second"]
+
+
+async def test_run_forever_survives_forward_fn_exceptions(settings, caplog):
+    """The background retry loop must not die if a single pass raises.
+
+    Real (not fake) clock here -- run_forever()'s pacing is driven by
+    asyncio.sleep(retry_loop_interval), which only respects real wall-clock
+    time. We shrink retry_loop_interval and retry_initial_delay so the test
+    doesn't need to actually wait long, and let a raising forward_fn stand
+    in for "something unexpected went wrong mid-retry" (as opposed to the
+    httpx.HTTPError family forward_update() already normalizes to False).
+    """
+    caplog.set_level(logging.INFO, logger="ingress")
+    fast_settings = dataclasses.replace(settings, retry_loop_interval=0.01, retry_initial_delay=0.0)
+
+    call_count = 0
+
+    async def forward_fn(internal_url: str, body: bytes) -> bool:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("boom -- simulated unexpected failure")
+
+    rb = RetryBuffer(fast_settings, forward_fn)  # default real clock
+    rb.enqueue("tenant-1", "http://tenant-1.internal", bot_id=7, body=b"hello")
+
+    task = asyncio.create_task(rb.run_forever())
+    try:
+        # A handful of loop iterations at a 0.01s interval; each one hits
+        # the same still-queued (never-removed-on-exception) item and
+        # raises again -- if the guard didn't work, the task would die on
+        # the very first exception and call_count would stay at 1.
+        await asyncio.sleep(0.1)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert call_count >= 2, "run_forever should have kept retrying across multiple raising passes"
+
+    error_events = [
+        json.loads(r.getMessage()) for r in caplog.records if json.loads(r.getMessage())["event"] == "retry_loop_error"
+    ]
+    assert len(error_events) >= 2
+    # Fixed schema only -- no exception message/traceback leaking through.
+    for event in error_events:
+        assert set(event.keys()) == {
+            "timestamp",
+            "event",
+            "bot_id",
+            "tenant_id",
+            "status_code",
+            "latency_ms",
+            "queue_depth",
+        }
+        assert event["bot_id"] is None
+        assert event["tenant_id"] is None

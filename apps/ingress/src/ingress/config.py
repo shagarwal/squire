@@ -27,6 +27,12 @@ class Settings:
     # so keep it short but non-zero.
     cache_ttl_seconds: float = 60.0
 
+    # Hard cap on distinct bot_ids held in the tenant cache at once. bot_id
+    # is attacker-controlled (it's a public URL path segment), so this
+    # bounds memory growth from someone hammering junk bot_ids -- see
+    # TenantCache._store's oldest-inserted eviction.
+    tenant_cache_max_entries: int = 10_000
+
     # Forwarding a Telegram update to the tenant container. Kept short: a
     # sleeping tenant should fail fast into the buffer-and-wake path rather
     # than holding the Telegram webhook connection open.
@@ -53,6 +59,7 @@ def load_settings() -> Settings:
         internal_api_token=os.environ["INTERNAL_API_TOKEN"],
         port=int(os.environ.get("PORT", "8000")),
         cache_ttl_seconds=float(os.environ.get("INGRESS_CACHE_TTL_SECONDS", "60")),
+        tenant_cache_max_entries=int(os.environ.get("INGRESS_TENANT_CACHE_MAX_ENTRIES", "10000")),
         forward_connect_timeout=float(os.environ.get("INGRESS_FORWARD_CONNECT_TIMEOUT", "5")),
         forward_total_timeout=float(os.environ.get("INGRESS_FORWARD_TOTAL_TIMEOUT", "10")),
         queue_max_size=int(os.environ.get("INGRESS_QUEUE_MAX_SIZE", "100")),

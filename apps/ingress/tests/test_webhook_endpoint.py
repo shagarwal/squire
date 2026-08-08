@@ -30,13 +30,17 @@ TENANT_PAYLOAD = {
 }
 
 
-def make_handler(*, control_status: int = 200, forward_status_seq=None):
+def make_handler(*, control_status: int = 200, forward_status_seq=None, tenant_payload=None):
     """Build a MockTransport handler routing control-api vs. tenant-forward calls.
 
     forward_status_seq: iterable of ints/exceptions consumed one per forward
     call (lets a test simulate "fails twice, then succeeds").
+    tenant_payload: override the control-api response body (defaults to
+    TENANT_PAYLOAD) -- used e.g. to simulate control-api returning an empty
+    webhook_secret.
     """
     forward_iter = iter(forward_status_seq) if forward_status_seq is not None else None
+    payload = tenant_payload if tenant_payload is not None else TENANT_PAYLOAD
     calls = {"control": [], "forward": []}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -44,7 +48,7 @@ def make_handler(*, control_status: int = 200, forward_status_seq=None):
             calls["control"].append(request)
             if control_status == 404:
                 return httpx.Response(404)
-            return httpx.Response(control_status, json=TENANT_PAYLOAD)
+            return httpx.Response(control_status, json=payload)
 
         if request.url.path == "/webhook/telegram":
             calls["forward"].append(request)
@@ -108,6 +112,28 @@ async def test_wrong_secret_header_returns_403(settings, fake_clock):
             json={"update_id": 1},
             headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
         )
+
+    assert resp.status_code == 403
+    assert len(calls["forward"]) == 0
+
+
+async def test_empty_configured_secret_never_authenticates_returns_403(settings, fake_clock):
+    """Regression test: an empty tenant.webhook_secret must not be an auth bypass.
+
+    hmac.compare_digest("", "") is True -- so if control-api ever returns an
+    empty webhook_secret (bad data / provisioning bug), a request with *no*
+    X-Telegram-Bot-Api-Secret-Token header at all (which also comes through
+    as "") would otherwise pass the secret check. app.py explicitly guards
+    against this with `if not tenant.webhook_secret or not hmac.compare...`.
+    """
+    empty_secret_payload = dict(TENANT_PAYLOAD, webhook_secret="")
+    handler, calls = make_handler(forward_status_seq=[200], tenant_payload=empty_secret_payload)
+    app = make_app(settings, fake_clock, handler)
+
+    async with webhook_client(app) as client:
+        # No secret header at all -- would compare "" == "" if we only did
+        # hmac.compare_digest without the emptiness guard.
+        resp = await client.post("/telegram/42", json={"update_id": 1})
 
     assert resp.status_code == 403
     assert len(calls["forward"]) == 0

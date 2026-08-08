@@ -115,10 +115,18 @@ def create_app(
             return Response(status_code=200)
 
         provided_secret = x_telegram_bot_api_secret_token or ""
-        # Constant-time compare -- this is a bearer-token-shaped secret
-        # check, not a place to leak timing info about how many characters
-        # matched.
-        if not hmac.compare_digest(provided_secret, tenant.webhook_secret):
+        # `not tenant.webhook_secret` guards against an auth bypass: if
+        # control-api ever returns an empty webhook_secret (bad data, a
+        # provisioning bug, whatever), a *missing* Telegram header also
+        # comes through as "" above, and hmac.compare_digest("", "") is
+        # True -- an empty secret would otherwise authenticate a request
+        # with no secret header at all. Treat an empty configured secret as
+        # "nothing can ever match it", not "anything matches it".
+        #
+        # The compare itself is constant-time -- this is a bearer-token-
+        # shaped secret check, not a place to leak timing info about how
+        # many characters matched.
+        if not tenant.webhook_secret or not hmac.compare_digest(provided_secret, tenant.webhook_secret):
             log_event(
                 "secret_mismatch",
                 bot_id=bot_id,
