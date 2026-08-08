@@ -130,12 +130,3 @@ class TrialKeyClient:
             )
             return False
         return True
-
-
-def create_trial_key(tenant_id: str) -> TrialKey | None:
-    """Module-level convenience wrapper."""
-    return TrialKeyClient().create_trial_key(tenant_id)
-
-
-def delete_trial_key(alias: str) -> bool:
-    return TrialKeyClient().delete_trial_key(alias)

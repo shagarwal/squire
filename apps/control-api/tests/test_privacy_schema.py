@@ -60,10 +60,10 @@ def test_no_column_can_hold_content_or_user_credentials(table):
             )
 
 
-def test_tenant_row_holds_only_registry_metadata():
-    """Whitelist, not blacklist -- the strongest form of this guard."""
-    columns = {c["name"] for c in inspect(get_engine()).get_columns("tenant")}
-    assert columns == {
+# Whitelist, not blacklist -- the strongest form of this guard. Every control-plane
+# column is enumerated here, so adding one is a deliberate, reviewed act.
+EXPECTED_COLUMNS = {
+    "tenant": {
         "id",
         "email",
         "status",
@@ -78,4 +78,41 @@ def test_tenant_row_holds_only_registry_metadata():
         "webhook_set",
         "created_at",
         "updated_at",
-    }
+    },
+    # `token` and `webhook_secret` are OUR pool-bot credentials (BotFather +
+    # self-generated), not the user's -- control-api cannot call setWebhook without
+    # them. No user credential belongs in this table.
+    "bot": {
+        "id",
+        "token",
+        "username",
+        "status",
+        "webhook_secret",
+        "assigned_tenant_id",
+        "created_at",
+    },
+    # `last_error` carries third-party error text, which is why it is scrubbed
+    # through `provisioning._redact` before it is ever persisted.
+    "provisionjob": {
+        "id",
+        "tenant_id",
+        "step",
+        "status",
+        "attempts",
+        "max_attempts",
+        "last_error",
+        "next_attempt_at",
+        "created_at",
+        "updated_at",
+    },
+}
+
+
+@pytest.mark.parametrize("table", sorted(ALLOWED_TABLES))
+def test_table_holds_only_the_whitelisted_columns(table):
+    columns = {c["name"] for c in inspect(get_engine()).get_columns(table)}
+    assert columns == EXPECTED_COLUMNS[table], (
+        f"{table} columns changed; if this is intentional, confirm the new column "
+        "cannot hold conversation content or a plaintext user credential, then "
+        "update EXPECTED_COLUMNS."
+    )

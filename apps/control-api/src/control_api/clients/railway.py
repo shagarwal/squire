@@ -114,10 +114,14 @@ class RailwayClient:
         Used before `serviceCreate` so a crash between "Railway created it" and
         "we committed the id" doesn't leave an orphan and then bill for a twin.
         """
+        # `first: 500` because a 1,000-tenant fleet is 1,000+ services and the
+        # default page size would silently hide ours, causing a duplicate create.
+        # TODO(Phase 1): follow `pageInfo.hasNextPage` properly once the fleet can
+        # exceed 500 services -- see implementation-plan.md §7 risk 2.
         query = """
         query project($id: String!) {
           project(id: $id) {
-            services { edges { node { id name } } }
+            services(first: 500) { edges { node { id name } } }
           }
         }
         """
@@ -128,6 +132,33 @@ class RailwayClient:
             if node.get("name") == name:
                 return node.get("id")
         return None
+
+    def get_variable_names(self, service_id: str) -> set[str] | None:
+        """Names of the variables currently set on a service. **Never values.**
+
+        Used to confirm an upsert actually landed. Deliberately returns only keys:
+        reading tenant variable *values* back into the control plane would hand it
+        the DEK it is architecturally supposed to never hold (PRD §4).
+        """
+        query = """
+        query variables($projectId: String!, $environmentId: String!, $serviceId: String) {
+          variables(
+            projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId
+          )
+        }
+        """
+        data = self._gql(
+            query,
+            {
+                "projectId": self.project_id,
+                "environmentId": self.environment_id,
+                "serviceId": service_id,
+            },
+        )
+        variables = data.get("variables")
+        if not isinstance(variables, dict):
+            return None
+        return set(variables.keys())
 
     def create_service(
         self,
@@ -180,13 +211,55 @@ class RailwayClient:
 
     # -- volumes -----------------------------------------------------------
 
+    def find_volume_for_service(self, service_id: str) -> str | None:
+        """Pre-flight idempotency probe: does this service already have a volume?
+
+        Returns None both for "no volume" and for "could not tell" -- callers treat
+        it as advisory. It exists so retries do not depend solely on pattern-matching
+        Railway's duplicate-volume error text (`_ALREADY_EXISTS_HINTS`); if Railway
+        words that error differently, a retry would otherwise burn every attempt and
+        hard-fail an otherwise healthy tenant.
+        """
+        query = """
+        query project($id: String!) {
+          project(id: $id) {
+            volumes {
+              edges {
+                node {
+                  id
+                  volumeInstances {
+                    edges { node { id serviceId mountPath } }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        try:
+            data = self._gql(query, {"id": self.project_id})
+        except RailwayError:
+            # Query shape is unverified against live Railway; never let the probe
+            # itself break provisioning.
+            log.warning("volume pre-flight probe failed", exc_info=True)
+            return None
+
+        edges = ((data.get("project") or {}).get("volumes") or {}).get("edges") or []
+        for edge in edges:
+            node = edge.get("node") or {}
+            instances = (node.get("volumeInstances") or {}).get("edges") or []
+            for instance in instances:
+                if (instance.get("node") or {}).get("serviceId") == service_id:
+                    return node.get("id")
+        return None
+
     def attach_volume(self, service_id: str, mount_path: str) -> str | None:
         """Create + attach the tenant's persistent volume (its `~/.hermes`).
 
         Returns the volume id, or None when Railway says one already exists (a retry
-        after a partial failure). Note the asymmetry with services: we cannot cheaply
-        list volumes by mount path, so we lean on Railway's own duplicate rejection
-        rather than a pre-flight probe.
+        after a partial failure). Callers should run `find_volume_for_service` first;
+        the error-substring path below is the fallback for when that probe cannot
+        answer.
         """
         mutation = """
         mutation volumeCreate($input: VolumeCreateInput!) {

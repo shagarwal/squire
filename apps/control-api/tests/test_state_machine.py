@@ -8,6 +8,7 @@ loudly (not silently half-provision) when it runs out of attempts.
 from __future__ import annotations
 
 import base64
+import threading
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -98,8 +99,10 @@ def test_full_provision_happy_path(pool_bot, fake_railway):
     assert ops == [
         "project",  # idempotency probe: does the service already exist?
         "serviceCreate",
+        "project",  # idempotency probe: does a volume already exist?
         "volumeCreate",
         "variableCollectionUpsert",
+        "variables",  # read-back: confirm SQUIRE_DEK landed (names only)
         "serviceInstanceUpdate",  # sleepApplication (serverless sleep -- Gate G1)
         "serviceInstanceDeploy",
     ]
@@ -198,40 +201,141 @@ def test_advance_on_a_finished_job_is_a_noop(pool_bot, fake_railway):
 
 
 @respx.mock
-def test_trial_key_is_reminted_if_the_process_restarted_before_it_was_used(
-    pool_bot, fake_railway
-):
-    """The minted key lives in memory between two steps. A restart in that window
-    must re-mint, not deploy the tenant with an empty ANTHROPIC_API_KEY."""
-    mock_all(fake_railway, telegram_ok=False)  # stop the run right after set_variables
-    with db.session_scope() as s:
-        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
-        tenant_id, job_id = tenant.id, job.id
+def test_trial_key_survives_a_set_variables_failure(pool_bot, fake_railway):
+    """REGRESSION: the key was popped from the stash *before* set_variables ran, so
+    a transient failure there lost it forever -- and because the machine only moves
+    forward, `create_trial_key` never ran again. The retry then succeeded with an
+    empty ANTHROPIC_API_KEY and the job reported DONE.
 
-    # Fail at create_trial_key's *successor* by simulating a crash: run the first
-    # steps, then wipe the in-memory stash as a restart would.
-    with db.session_scope() as s:
-        provisioning.advance_job(s, job_id)  # fails at set_webhook
-    provisioning._TRIAL_KEY_STASH.clear()
+    This test drives exactly that sequence through the public API only (no manual
+    step rewinding), so it fails against the old code.
+    """
+    mock_all(fake_railway)
+    fake_railway.fail_on.add("variableCollectionUpsert")
 
-    # Rewind to create_trial_key, as a fresh job/retry would.
     with db.session_scope() as s:
-        job = provisioning.get_job(s, job_id)
-        job.step = ProvisionStep.CREATE_TRIAL_KEY
-        s.add(job)
-        s.commit()
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
 
-    delete_route = respx.post(f"{LITELLM}/key/delete")
-    respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook").mock(
-        return_value=httpx.Response(200, json={"ok": True, "result": True})
-    )
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.step == ProvisionStep.SET_VARIABLES
+        assert job.status == JobStatus.PENDING
+
+    # Railway recovers; the retry must still carry a real key.
+    fake_railway.fail_on.discard("variableCollectionUpsert")
     with db.session_scope() as s:
         job = provisioning.advance_job(s, job_id, force=True)
-        assert job.status == JobStatus.DONE
+        assert job.status == JobStatus.DONE, job.last_error
+
+    sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
+    assert sent["ANTHROPIC_API_KEY"], "tenant must never deploy with an empty trial key"
+
+
+@respx.mock
+def test_trial_key_is_reminted_if_the_key_material_was_lost(pool_bot, fake_railway):
+    """Process restart between create_trial_key and set_variables: the material is
+    gone (it only ever lived in memory), so set_variables must revoke and re-mint
+    rather than deploy an empty key."""
+    mock_all(fake_railway)
+    fake_railway.fail_on.add("variableCollectionUpsert")
+
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)  # stops at set_variables
+
+    # Simulate the restart: in-memory stash is gone, DB still says a key is active.
+    provisioning._TRIAL_KEY_STASH.clear()
+
+    delete_route = respx.post(f"{LITELLM}/key/delete").mock(
+        return_value=httpx.Response(200, json={"deleted_keys": []})
+    )
+    fake_railway.fail_on.discard("variableCollectionUpsert")
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id, force=True)
+        assert job.status == JobStatus.DONE, job.last_error
 
     assert delete_route.called, "the orphaned key must be revoked before re-minting"
     sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
     assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
+
+
+@respx.mock
+def test_concurrent_advance_creates_exactly_one_service(pool_bot, fake_railway):
+    """REGRESSION: nothing claimed a job, so the BackgroundTask, the /advance
+    endpoint and the sweeper could all run `create_service` at once -- two Railway
+    services, two bills, for one tenant."""
+    mock_all(fake_railway)
+
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)  # maximise the overlap
+            with db.session_scope() as s:
+                provisioning.advance_job(s, job_id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    assert fake_railway.operations().count("serviceCreate") == 1
+    # And every other Railway mutation ran exactly once too.
+    for op in ("volumeCreate", "variableCollectionUpsert", "serviceInstanceDeploy"):
+        assert fake_railway.operations().count(op) == 1, op
+
+    with db.session_scope() as s:
+        assert provisioning.get_job(s, job_id).status == JobStatus.DONE
+
+
+@respx.mock
+def test_a_claimed_job_is_skipped_by_other_callers(pool_bot, fake_railway):
+    """A RUNNING job is left alone rather than double-driven."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+        job.status = JobStatus.RUNNING  # pretend another worker holds it
+        s.add(job)
+        s.commit()
+
+    with db.session_scope() as s:
+        result = provisioning.advance_job(s, job_id, force=True)
+        assert result.status == JobStatus.RUNNING
+    assert fake_railway.calls == [], "must not touch Railway while another worker holds it"
+    assert provisioning.run_pending_jobs() == 0
+
+
+@respx.mock
+def test_a_stale_claim_is_reclaimed(pool_bot, fake_railway):
+    """A worker that died mid-run must not strand its job in RUNNING forever."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+        job.status = JobStatus.RUNNING
+        job.updated_at = datetime.now(timezone.utc) - timedelta(
+            seconds=provisioning.STALE_CLAIM_SECONDS + 60
+        )
+        s.add(job)
+        s.commit()
+
+    assert provisioning.run_pending_jobs() == 1
+    with db.session_scope() as s:
+        assert provisioning.get_job(s, job_id).status == JobStatus.DONE
 
 
 @respx.mock
@@ -463,3 +567,146 @@ def test_worker_ignores_jobs_that_are_not_due_yet(pool_bot, fake_railway, monkey
         s.add(job)
         s.commit()
     assert provisioning.run_pending_jobs() == 1
+
+
+# ---------------------------------------------------------------------------
+# Secret hygiene in persisted error text
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_last_error_never_leaks_secrets_from_the_variables_payload(pool_bot, fake_railway):
+    """REGRESSION: Railway echoes invalid input back in GraphQL validation errors.
+    For set_variables that input is the whole credential payload, and `last_error`
+    is both persisted and served over the internal API."""
+    mock_all(fake_railway)
+    captured: dict[str, str] = {}
+
+    def echo_the_payload(request):
+        import json as _json
+
+        payload = _json.loads(request.read())
+        if "variableCollectionUpsert" in payload["query"]:
+            sent = payload["variables"]["input"]
+            captured.update(sent["variables"])
+            # Railway-style: reject and quote the offending input verbatim.
+            return httpx.Response(
+                200,
+                json={"errors": [{"message": f"Problem processing request: {sent}"}]},
+            )
+        return fake_railway.handler(request)
+
+    respx.post(GQL_URL).mock(side_effect=echo_the_payload)
+
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.PENDING
+        error = job.last_error or ""
+
+    assert "Problem processing request" in error, "the useful part must survive"
+    for name in ("SQUIRE_DEK", "TELEGRAM_BOT_TOKEN", "INTERNAL_API_TOKEN"):
+        assert captured[name] not in error, f"{name} value leaked into last_error"
+    assert "[REDACTED]" in error
+
+
+@respx.mock
+def test_retry_after_set_variables_failure_keeps_the_same_dek(pool_bot, fake_railway):
+    """Once a DEK is set, a retry must omit SQUIRE_DEK entirely -- rotating it would
+    orphan a volume already encrypted with the old key."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    first = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert "SQUIRE_DEK" in first
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).dek_set is True
+
+    # Re-run the step directly, as a retry of a resumed job would.
+    with db.session_scope() as s:
+        tenant = provisioning.get_tenant(s, tenant_id)
+        provisioning._step_set_variables(s, tenant, provisioning.ProvisionClients.build())
+    second = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert "SQUIRE_DEK" not in second, "a set DEK must never be rotated by a retry"
+
+
+@respx.mock
+def test_dek_set_requires_the_variable_to_be_readable_back(pool_bot, fake_railway):
+    """A mis-shaped upsert that still returns 200 must not be recorded as success."""
+    mock_all(fake_railway)
+    fake_railway.variable_names = {"TENANT_ID"}  # SQUIRE_DEK conspicuously absent
+
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.PENDING
+        assert job.step == ProvisionStep.SET_VARIABLES
+        assert "SQUIRE_DEK missing" in (job.last_error or "")
+        assert provisioning.get_tenant(s, tenant_id).dek_set is False
+
+
+@respx.mock
+def test_volume_preflight_probe_prevents_a_duplicate_volume(pool_bot, fake_railway):
+    """Idempotency must not depend only on matching Railway's error wording."""
+    mock_all(fake_railway)
+    fake_railway.existing_volume_service_ids.add("svc-1")
+
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    assert "volumeCreate" not in fake_railway.operations()
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).railway_volume_id == "vol-existing"
+
+
+# ---------------------------------------------------------------------------
+# Failed-job recovery
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_failed_job_can_be_retried_with_a_fresh_job(pool_bot, fake_railway):
+    """REGRESSION: a FAILED job was a dead end -- create_tenant handed back the same
+    corpse, /advance no-opped on it, and the CLI exited 1 forever."""
+    mock_all(fake_railway, telegram_ok=False)
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, failed_job_id = tenant.id, job.id
+
+    for _ in range(10):
+        with db.session_scope() as s:
+            status = provisioning.advance_job(s, failed_job_id, force=True).status
+        if status == JobStatus.FAILED:
+            break
+    assert status == JobStatus.FAILED
+
+    # Telegram recovers; re-running the CLI must make progress again.
+    respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    with db.session_scope() as s:
+        same_tenant, new_job = provisioning.create_tenant(s, email="alpha@squire.test")
+        assert same_tenant.id == tenant_id, "must not create a second tenant"
+        assert new_job.id != failed_job_id, "a FAILED job must not be handed back"
+        new_job_id = new_job.id
+        # Resumes where the failure happened rather than replaying Railway calls.
+        assert new_job.step == ProvisionStep.SET_WEBHOOK
+
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, new_job_id, force=True)
+        assert job.status == JobStatus.DONE
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).status == TenantStatus.RUNNING
+    # The retry created no duplicate Railway resources.
+    assert fake_railway.operations().count("serviceCreate") == 1

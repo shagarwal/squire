@@ -24,6 +24,12 @@ class FakeRailway:
     calls: list[tuple[str, dict]] = field(default_factory=list)
     fail_on: set[str] = field(default_factory=set)
     latest_deployment_id: str | None = "dep-1"
+    #: Service ids that already have a volume attached (pre-flight probe answers).
+    existing_volume_service_ids: set[str] = field(default_factory=set)
+    #: Variable NAMES the read-back probe reports. None = "every name we were sent",
+    #: which is the healthy case; set it explicitly to simulate a lost variable.
+    variable_names: set[str] | None = None
+    _upserted_names: set[str] = field(default_factory=set)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.read())
@@ -35,12 +41,35 @@ class FakeRailway:
         if op in self.fail_on:
             return httpx.Response(200, json={"errors": [{"message": f"forced failure: {op}"}]})
 
-        if op == "project":  # find_service_by_name
+        if op == "project":
+            # One operation name, two queries -- disambiguate on the selection set.
+            if "volumes" in query:  # find_volume_for_service
+                edges = [
+                    {
+                        "node": {
+                            "id": "vol-existing",
+                            "volumeInstances": {
+                                "edges": [{"node": {"id": "vi-1", "serviceId": sid}}]
+                            },
+                        }
+                    }
+                    for sid in self.existing_volume_service_ids
+                ]
+                return self._ok({"project": {"volumes": {"edges": edges}}})
+            # find_service_by_name
             edges = [
                 {"node": {"id": sid, "name": name}}
                 for name, sid in self.existing_services.items()
             ]
             return self._ok({"project": {"services": {"edges": edges}}})
+
+        if op == "variables":  # get_variable_names -- names only, values are dummies
+            names = (
+                self.variable_names
+                if self.variable_names is not None
+                else self._upserted_names
+            )
+            return self._ok({"variables": {name: "redacted" for name in names}})
 
         if op == "serviceCreate":
             name = variables["input"]["name"]
@@ -52,6 +81,7 @@ class FakeRailway:
             return self._ok({"volumeCreate": {"id": "vol-1"}})
 
         if op == "variableCollectionUpsert":
+            self._upserted_names.update(variables["input"]["variables"].keys())
             return self._ok({"variableCollectionUpsert": True})
 
         if op == "serviceInstanceUpdate":
