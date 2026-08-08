@@ -1,0 +1,30 @@
+[project]
+name = "squire-ingress"
+version = "0.1.0"
+description = "Squire ingress v0 -- routes Telegram webhooks to the right tenant container over Railway private networking. Structurally incapable of logging message bodies."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "httpx>=0.27,<1.0",
+]
+
+[project.optional-dependencies]
+# Test-only deps. We mock HTTP at the httpx transport layer directly
+# (httpx.MockTransport / httpx.ASGITransport) rather than pulling in respx --
+# same "no live HTTP calls in tests" guarantee, one fewer dependency.
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
