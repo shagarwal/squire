@@ -1,0 +1,185 @@
+# apps/trial-proxy/config.yaml
+#
+# LiteLLM proxy config for Squire's Task 0.5 "trial proxy v0".
+#
+# What this proxy is for (see docs/prd.md §4/§5.3, docs/implementation-plan.md
+# Task 0.5): every tenant's 3-day free trial runs on OUR Anthropic org key,
+# never the tenant's own credentials. Tenant containers are pointed at this
+# proxy via ANTHROPIC_BASE_URL + a per-tenant LiteLLM *virtual key* (NOT the
+# master key) so each tenant is individually revocable and individually
+# budget-capped without giving any tenant container access to our real
+# Anthropic API key.
+#
+# Division of responsibility (per the task brief):
+#   - THIS proxy (this file + Dockerfile) exposes the model(s), enforces the
+#     server-side mechanisms (budget/rate-limit engine, auth, privacy
+#     settings) and gets its own env vars from the Railway service.
+#   - control-api (separate task, built in parallel) is the ONLY thing that
+#     ever calls LiteLLM's admin API with LITELLM_MASTER_KEY:
+#       - `POST /key/generate` with `max_budget: 2.0` + `metadata: {tenant_id}`
+#         on trial start, to mint a tenant's virtual key.
+#       - `POST /key/delete` (or `/key/block`) on LLM-connect (tenant
+#         connected their own LLM — trial key is no longer needed/wanted) or
+#         on trial expiry (72h).
+#   This file does NOT create or manage any individual tenant's key — it just
+#   has to be configured so those admin-API calls actually work and actually
+#   get enforced.
+
+model_list:
+  # "trial-default" — the stable, proxy-owned model name. Use this if/when we
+  # control the caller (e.g. any Squire-authored service that talks to the
+  # proxy directly can just always ask for "trial-default" regardless of
+  # what the real underlying model is, so we can swap the underlying model
+  # here later without touching callers).
+  - model_name: trial-default
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # TO VERIFY (flagged per task brief): hermes-agent (the tenant runtime,
+  # tenant-image/) does NOT know about "trial-default" — it's configured via
+  # its own `hermes model anthropic:<model-id>` mechanism (see
+  # docs/reference/AGENTS-SETUP.md, e.g. `hermes model anthropic:claude-sonnet-4-5`)
+  # and sends that bare model id as the `model` field in its Anthropic-shaped
+  # request body. Whatever model id gets baked into the trial tenant's
+  # config (tenant-image / Task 0.2 territory, not this task) MUST exactly
+  # match a `model_name` entry here, or LiteLLM will 400 on an unrecognized
+  # model instead of silently routing it somewhere. Best guess, matching the
+  # Anthropic model id given in this task's brief, is `claude-haiku-4-5` —
+  # added below as an alias to the same underlying model/key. If the real
+  # tenant-image default model string differs (e.g. a dated snapshot id like
+  # `claude-haiku-4-5-20251001`), add another `model_name` entry here that
+  # mirrors it exactly.
+  #
+  # Deliberately NOT using LiteLLM's provider wildcard routing here (e.g.
+  # `model_name: "anthropic/*"` -> `litellm_params.model: "anthropic/*"`,
+  # see https://docs.litellm.ai/docs/wildcard_routing) even though it would
+  # sidestep this exact-name-matching problem: wildcard routing forwards
+  # whatever model name the caller asks for straight to Anthropic, which
+  # would let a trial tenant request e.g. `claude-opus-4-1` and burn the
+  # $2 cap in a couple of calls. Every model this trial key can reach must be
+  # an explicit, Haiku-pinned entry below — an unrecognized model name should
+  # fail closed (400), not fail open onto an expensive model.
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+# litellm_settings: proxy-wide behavior (applies to every model/key, not
+# tied to a specific key's admin-API params).
+litellm_settings:
+  # Privacy requirement (see docs/prd.md's "we cannot see their credentials,
+  # data, or conversations" guarantee, and the honesty-boundary section):
+  # trial traffic is still real tenant conversation content, even though it
+  # transits our infra during the trial window. This stops message/response
+  # bodies from being logged to any configured logging callback (Sentry,
+  # Langfuse, etc. — none are configured yet, but this is the setting that
+  # would matter the moment one is added). Request *metadata* (timestamps,
+  # token counts, cost, tenant_id from key metadata) is still logged, which
+  # is what budget enforcement and future usage-based abuse detection needs.
+  # Source: https://docs.litellm.ai/docs/proxy/config_settings
+  # ("turn_off_message_logging" under litellm_settings).
+  turn_off_message_logging: true
+
+# general_settings: proxy server / admin-API / auth / DB behavior.
+general_settings:
+  # Admin-API auth. control-api authenticates its /key/generate, /key/delete
+  # (etc.) calls with this. Must be set as a Railway service variable named
+  # exactly LITELLM_MASTER_KEY (LiteLLM requires master keys to start with
+  # "sk-" per https://docs.litellm.ai/docs/proxy/virtual_keys — make sure
+  # whatever value control-api/we generate follows that convention).
+  # NEVER hardcode a value here — os.environ/* is resolved from the Railway
+  # service's env at container start.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+  # Virtual keys (and their $2 budgets, revocation, spend tracking) are
+  # backed by LiteLLM's own Postgres schema — this proxy is NOT usable for
+  # per-tenant virtual keys without a real database_url. On Railway this
+  # should be a Railway Postgres plugin attached to this service so
+  # DATABASE_URL is injected automatically; if it's ever missing/misconfigured,
+  # key creation/lookup/budget enforcement silently has nothing to persist
+  # to. TO VERIFY: whether the plain `ghcr.io/berriai/litellm` image (as
+  # opposed to the `litellm-database` image variant, see Dockerfile comments)
+  # auto-applies its Prisma schema migrations against this URL on first
+  # boot, or whether a separate migrate step is needed — confirm against the
+  # pinned version's docs before first deploy.
+  database_url: os.environ/DATABASE_URL
+
+  # --- Privacy: don't retain tenant message content in our own DB ---
+  # Belt-and-suspenders with litellm_settings.turn_off_message_logging above,
+  # but this one specifically controls whether prompt/response TEXT gets
+  # written into the LiteLLM_SpendLogs Postgres table (i.e. persisted to our
+  # database_url, not just "a logging callback"). Explicitly false — trial
+  # tenants' conversation content must never land in our proxy DB, even
+  # though we DO want the spend-log *rows themselves* (cost, token counts,
+  # timestamps, key/tenant_id) for budget enforcement and the 75-msgs/day
+  # tracking discussed below.
+  # Source: https://docs.litellm.ai/docs/proxy/config_settings
+  # ("store_prompts_in_spend_logs" under general_settings).
+  store_prompts_in_spend_logs: false
+
+  # Fail CLOSED, not open, if the proxy can't reach Postgres to verify a
+  # virtual key. The default here matters a lot for us: budget/revocation
+  # enforcement is the entire point of this service, so a DB hiccup must
+  # block traffic, not silently let an over-budget or revoked tenant key
+  # through. Source: https://docs.litellm.ai/docs/proxy/config_settings
+  # ("allow_requests_on_db_unavailable" under general_settings) — TO VERIFY:
+  # confirm this option's default value on the pinned version; set explicitly
+  # here regardless so behavior doesn't depend on the default.
+  allow_requests_on_db_unavailable: false
+
+  # NOT setting general_settings-level `default_team_params.budget_duration`
+  # (or any other global budget-reset cadence) here on purpose. If we did,
+  # it would periodically RESET a key's spend back toward its max_budget —
+  # correct for e.g. a monthly team budget, but wrong for us: the trial's
+  # "$2 hard budget" is a flat, one-time cap across the whole 72h trial, not
+  # a recurring per-day allowance. budget_duration is set (or, more
+  # precisely, deliberately left unset) per-key at creation time by
+  # control-api's `POST /key/generate` call — this file has no per-key
+  # authority, it just must not silently impose a proxy-wide reset schedule
+  # underneath control-api's back.
+
+# --- 75 msgs/day: what's actually enforced here vs. what's approximated ---
+#
+# Non-negotiable, and fully enforced by the settings above + control-api's
+# key creation: the $2 hard budget (`max_budget: 2.0` at `POST /key/generate`
+# time, persisted via database_url, checked on every request because
+# allow_requests_on_db_unavailable is false). Once a key's spend hits $2,
+# LiteLLM rejects further requests on that key regardless of message count.
+#
+# 75 msgs/day is NOT a LiteLLM-native concept — LiteLLM's per-key rate/volume
+# primitives are `rpm_limit`/`tpm_limit` (requests/tokens per MINUTE, reset
+# every 60s, no daily accounting) and `max_budget`/`budget_duration` (a
+# dollar amount, optionally reset on a fixed cadence — see the
+# budget_duration note above for why we don't use that cadence for the
+# trial's total spend). There is no "N requests per rolling 24h" key
+# parameter as of the version pinned in the Dockerfile (TO VERIFY against
+# the pinned version's own /key/generate reference before assuming this is
+# still true — LiteLLM ships new params frequently).
+#
+# Given that, the intended split (this is a recommendation for control-api,
+# which owns all /key/generate calls — nothing here can enforce it since
+# proxy config has no per-tenant state):
+#   - control-api should set a generous `rpm_limit` (e.g. ~20-30) at key
+#     creation purely as a burst-abuse guard (stop a runaway loop from
+#     draining the $2 budget in seconds), NOT as the 75/day mechanism.
+#   - The actual 75 msgs/day cap should be enforced by control-api itself,
+#     since it already has to track trial state (start time, 72h expiry,
+#     connect-your-own-LLM transition) and is the only service in the whole
+#     of the "your LLM traffic never touches our infra" architecture that's
+#     expected to hold per-tenant counters. Two ways to get the count
+#     without violating the no-message-content-retention requirement above
+#     (both read metadata/cost only, never prompt/response text):
+#       1. Maintain its own per-tenant, per-UTC-day counter, incremented on
+#          every inbound Telegram message that reaches the tenant (ingress/
+#          control-api territory, not this proxy).
+#       2. Or poll LiteLLM's `GET /spend/logs` (filtered by key/tenant_id
+#          metadata, over today's UTC window) and count rows — safe to do
+#          precisely because store_prompts_in_spend_logs is false, so those
+#          rows carry no message content. TO VERIFY exact endpoint name/shape
+#          against the pinned LiteLLM version's API reference; `/key/block`
+#          (as opposed to `/key/delete`) may also be the more appropriate
+#          call once the daily cap is hit but the trial itself hasn't
+#          expired yet, so the key can be unblocked at UTC midnight rather
+#          than needing to be regenerated — TO VERIFY this endpoint exists
+#          and behaves that way on the pinned version.
