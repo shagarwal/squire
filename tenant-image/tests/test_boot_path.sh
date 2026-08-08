@@ -69,8 +69,10 @@ exit 0
 STUB
 chmod +x "$STUB_SUPERVISORD"
 
-# Extra env for a single boot() call; reset by boot() after use.
-EXTRA_ENV=()
+# NOTE: extra environment is passed as trailing ARGUMENTS to boot(), not via a
+# global. A global was tried and is subtly broken: boot() runs inside $( ), so
+# any reset it performs happens in that subshell and the parent's value
+# survives to leak into every later case.
 
 # boot [webhook_url]
 #
@@ -80,8 +82,10 @@ EXTRA_ENV=()
 #
 # SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 because a tmpdir is not a real mount point and
 # TENANT_ID is set; that combination is a hard error in production by design.
+# boot [webhook_url] [EXTRA=env ...]
 boot() {
   local url="${1:-}" rc
+  shift || true
   env -i PATH="$PATH" \
       HOME="$VOL" \
       HERMES_HOME="$VOL" \
@@ -97,12 +101,11 @@ boot() {
       SQUIRE_DEK="${SQUIRE_DEK_OVERRIDE:-$DEK}" \
       TENANT_ID=t-boot-test \
       ${url:+TELEGRAM_WEBHOOK_URL=$url} \
-      "${EXTRA_ENV[@]}" \
+      "$@" \
       bash "$BIN/squire-entrypoint.sh" 2>&1
-  # Capture BEFORE the EXTRA_ENV reset — an assignment returns 0 and would
-  # otherwise mask the entrypoint's exit status entirely.
+  # Capture immediately: any command in between (even an assignment, which
+  # returns 0) would overwrite the entrypoint's exit status.
   rc=$?
-  EXTRA_ENV=()
   return "$rc"
 }
 
@@ -150,12 +153,35 @@ SEC1="$(sed -n 's/^TELEGRAM_WEBHOOK_SECRET=//p' "$TMPFS/.env")"
 check "dev-fallback secret generated"  "$(says "$out" 'dev fallback')"
 check "webhook secret is 64 hex chars" "$([ "${#SEC1}" = 64 ] && echo 1 || echo 0)" "len=${#SEC1}"
 
+echo "  -- no plaintext secret in captured LOG OUTPUT --"
+# Everything these processes print goes to Railway's log aggregator, which sits
+# outside the tenant's isolation boundary. A secret echoed into a log is just as
+# exposed as one written to the volume — arguably more so, since logs are
+# retained, indexed and readable by anyone with project access.
+check "webhook secret absent from boot logs" \
+    "$([ "$(says "$out" "$SEC1")" = 0 ] && echo 1 || echo 0)"
+check "DEK absent from boot logs" \
+    "$([ "$(says "$out" "$DEK")" = 0 ] && echo 1 || echo 0)"
+# The ingress URL embeds the bot id, which is half a bot token.
+check "full webhook URL absent from boot logs" \
+    "$([ "$(says "$out" 'ingress.example.com')" = 0 ] && echo 1 || echo 0)"
+
 echo "  -- no plaintext secret anywhere on the volume --"
 # The tmpfs dir lives outside $VOL, so any hit here is a real leak.
 leak="$(grep -rl "$SEC1" "$VOL" 2>/dev/null | grep -v '^$' || true)"
 check "secret value not present in any volume file" "$([ -z "$leak" ] && echo 1 || echo 0)" "$leak"
 check "sealed blob is not plaintext" "$(yn bash -c "! grep -q '$SEC1' '$VOL/.squire/secrets/.env.enc'")"
 check "sealed blob has magic header" "$(yn bash -c "head -c 6 '$VOL/.squire/secrets/.env.enc' | grep -q SQENC1")"
+
+# Change-detection digests are SHA-256 of credential file contents — material
+# derived from a secret. On the volume they would let someone holding a backup
+# confirm a guessed key offline, without ever needing the DEK. Grepping for the
+# secret's literal value cannot catch this, so assert the location directly.
+check "no secret-derived digests on the volume" \
+    "$([ -z "$(find "$VOL" -name '*.sha256' 2>/dev/null)" ] && echo 1 || echo 0)" \
+    "$(find "$VOL" -name '*.sha256' 2>/dev/null | tr '\n' ' ')"
+check "digests live on tmpfs instead" \
+    "$([ -n "$(find "$TMPFS" -name '*.sha256' 2>/dev/null)" ] && echo 1 || echo 0)"
 
 echo "== 2. restart: same DEK, secrets survive =="
 rm -rf "${TMPFS:?}"/*                      # tmpfs is volatile — simulate a redeploy
@@ -189,8 +215,7 @@ echo "== 5. control-api owns TELEGRAM_WEBHOOK_SECRET =="
 # it verbatim. Both sides then register identical values with Telegram, so the
 # two setWebhook calls are idempotent instead of fighting.
 rm -rf "${TMPFS:?}"/*
-EXTRA_ENV=(TELEGRAM_WEBHOOK_SECRET=supplied-by-control-api)
-out="$(boot "$URL")"
+out="$(boot "$URL" TELEGRAM_WEBHOOK_SECRET=supplied-by-control-api)"
 check "supplied secret used verbatim" \
     "$([ "$(sed -n 's/^TELEGRAM_WEBHOOK_SECRET=//p' "$TMPFS/.env")" = "supplied-by-control-api" ] && echo 1 || echo 0)"
 check "logged as coming from control-api" "$(says "$out" 'control-api')"
@@ -200,8 +225,7 @@ check "supplied secret overrode the dev fallback" \
 # Rotation: a new value from control-api must propagate, not be masked by the
 # sealed copy of the old one.
 rm -rf "${TMPFS:?}"/*
-EXTRA_ENV=(TELEGRAM_WEBHOOK_SECRET=rotated-value)
-out="$(boot "$URL")"
+out="$(boot "$URL" TELEGRAM_WEBHOOK_SECRET=rotated-value)"
 check "rotated secret propagates" \
     "$([ "$(sed -n 's/^TELEGRAM_WEBHOOK_SECRET=//p' "$TMPFS/.env")" = "rotated-value" ] && echo 1 || echo 0)"
 check "no duplicate assignments in .env" \

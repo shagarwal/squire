@@ -29,15 +29,44 @@ set -uo pipefail
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
 STATE_DIR="${SQUIRE_STATE_DIR:-$HERMES_HOME/.squire}"
 SECRETS_ENC_DIR="$STATE_DIR/secrets"
-DIGEST_DIR="$STATE_DIR/digests"
 TMPFS_DIR="${SQUIRE_SECRETS_TMPFS:-/dev/shm/squire}"
+# CHANGE-DETECTION DIGESTS LIVE ON TMPFS, NOT ON THE VOLUME.
+#
+# They used to sit next to the sealed files at $STATE_DIR/digests. A SHA-256 of
+# a credential file is material derived from a secret, and the whole premise of
+# this design is that the volume holds nothing plaintext-derived — an attacker
+# with the volume and a guess at a key's format could confirm the guess offline
+# against the digest, without the DEK. It is a small hole, but it is a hole in
+# the one property we actually promise.
+#
+# Putting them on tmpfs closes it completely and costs almost nothing: on a cold
+# boot the digests are simply absent, so the first pass re-seals every managed
+# file once. The entrypoint already forces exactly that pass anyway.
+#
+# (HMAC-SHA256(DEK, content) would also have worked and would survive restarts.
+# It was rejected as more crypto surface for a benefit — skipping two small
+# writes per boot — that rounds to zero.)
+DIGEST_DIR="${SQUIRE_DIGEST_DIR:-$TMPFS_DIR/digests}"
 SECRETS="${SQUIRE_SECRET_FILES:-.env auth.json}"
 INTERVAL="${SQUIRE_SECRETS_SYNC_INTERVAL:-15}"
 # Same overridable interpreter/bin pair as squire-entrypoint.sh, so the sync
 # loop can be exercised outside a container.
 SQUIRE_PYTHON="${SQUIRE_PYTHON:-/opt/squire/venv/bin/python}"
 SQUIRE_BIN="${SQUIRE_BIN:-/opt/squire/bin}"
-SECRETS_TOOL="$SQUIRE_PYTHON $SQUIRE_BIN/squire_secrets.py"
+# Array, not a string — see squire-entrypoint.sh for why.
+SECRETS_TOOL=("$SQUIRE_PYTHON" "$SQUIRE_BIN/squire_secrets.py")
+
+# Used only to restart the Hindsight daemon after an LLM credential change.
+SUPERVISORCTL="${SQUIRE_SUPERVISORCTL:-/opt/squire/venv/bin/supervisorctl}"
+SUPERVISORD_CONF="${SQUIRE_SUPERVISORD_CONF:-/opt/squire/supervisord.conf}"
+HINDSIGHT_PROGRAM="${SQUIRE_HINDSIGHT_PROGRAM:-hindsight}"
+
+# True when invoked as `--once` from the entrypoint (supervisord not up yet).
+oneshot=false
+[ "${1:-}" = "--once" ] && oneshot=true
+
+# Set by sync_once when .env in particular was re-sealed.
+changed_env=false
 
 log() { printf '[squire-secrets-sync] %s\n' "$*"; }
 
@@ -46,6 +75,7 @@ chmod 0700 "$SECRETS_ENC_DIR" "$DIGEST_DIR" 2>/dev/null || true
 
 sync_once() {
     local name plain enc digest_file current previous
+    changed_env=false
     for name in $SECRETS; do
         plain="$TMPFS_DIR/$name"
         enc="$SECRETS_ENC_DIR/$name.enc"
@@ -67,10 +97,11 @@ sync_once() {
             continue
         fi
 
-        if $SECRETS_TOOL seal "$plain" "$enc" "$name"; then
+        if "${SECRETS_TOOL[@]}" seal "$plain" "$enc" "$name"; then
             printf '%s' "$current" > "$digest_file"
             chmod 0600 "$digest_file" 2>/dev/null || true
             log "re-sealed $name"
+            [ "$name" = ".env" ] && changed_env=true
         else
             # Leave the digest untouched so the next pass retries.
             log "ERROR: failed to seal $name — will retry in ${INTERVAL}s"
@@ -78,18 +109,57 @@ sync_once() {
     done
 }
 
-if [ "${1:-}" = "--once" ]; then
+# --- Re-wire Hindsight when the tenant's LLM credentials change --------------
+# The conversion moment: the user connects their own provider, the new key is
+# written into .env, and control-api revokes our trial key. The gateway picks
+# the new credentials up on its own, but the Hindsight daemon was configured at
+# boot and would keep calling the revoked key — every extraction 401s and the
+# agent quietly stops forming new memories, for exactly the users who just
+# converted. Nothing crashes, so nothing pages anyone.
+#
+# squire-hindsight-env.sh exits 10 when the derived config actually changed;
+# only then do we restart, so an ordinary .env write (a tool token, say) does
+# not interrupt in-flight extraction.
+rewire_hindsight_if_needed() {
+    local rc
+    "$SQUIRE_BIN/squire-hindsight-env.sh" --quiet
+    rc=$?
+    [ "$rc" -eq 10 ] || return 0
+
+    # --once runs from the entrypoint, before supervisord exists. Regenerating
+    # the env file is exactly right there; restarting is not possible and not
+    # needed, since the daemon has not started yet.
+    if [ "$oneshot" = true ]; then
+        log "LLM config written for first daemon start"
+        return 0
+    fi
+
+    log "LLM credentials changed — restarting the Hindsight daemon to pick them up"
+    if "$SUPERVISORCTL" -c "$SUPERVISORD_CONF" restart "$HINDSIGHT_PROGRAM" >/dev/null 2>&1; then
+        log "Hindsight restarted"
+    else
+        # Not fatal: the healthcheck loop will notice an unhealthy daemon, and
+        # the next redeploy re-reads the config regardless. Say so loudly
+        # though — silent memory loss is the failure we are here to prevent.
+        log "ERROR: could not restart Hindsight; extraction may be using stale credentials"
+    fi
+}
+
+if [ "$oneshot" = true ]; then
     sync_once
+    rewire_hindsight_if_needed
     exit 0
 fi
 
 # On SIGTERM (supervisord shutdown / Railway redeploy), do one last pass so a
-# credential written seconds before the stop is not lost.
+# credential written seconds before the stop is not lost. No Hindsight rewire
+# here: supervisord is already tearing the daemon down.
 trap 'log "SIGTERM — final sync"; sync_once; exit 0' TERM INT
 
 log "watching ${SECRETS} every ${INTERVAL}s"
 while true; do
     sync_once
+    [ "$changed_env" = true ] && rewire_hindsight_if_needed
     # `sleep & wait` rather than a bare `sleep`. bash does not run a trap while
     # a foreground builtin/child is executing — it waits for it to finish — so a
     # bare `sleep 15` would delay the SIGTERM handler by up to a full interval.

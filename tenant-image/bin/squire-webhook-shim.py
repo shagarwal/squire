@@ -114,6 +114,13 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "squire-webhook/1.0"
 
+    # Without a timeout, a client that opens a keep-alive connection and then
+    # goes quiet pins a handler thread forever. Under HTTP/1.1 every caller gets
+    # keep-alive by default, so a flaky network between ingress and the tenant
+    # would slowly consume the thread pool until the shim stops answering —
+    # while /health, on a fresh connection, still looked fine.
+    timeout = 30
+
     # Silence BaseHTTPRequestHandler's default stderr access log — it prints the
     # request line, which for us is fine, but it also runs on malformed input
     # and is noisy. We log deliberately instead.
@@ -178,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
 
         body = self.rfile.read(length)
 
+        conn = None
         try:
             conn = http.client.HTTPConnection(
                 UPSTREAM_HOST, UPSTREAM_PORT, timeout=UPSTREAM_TIMEOUT
@@ -195,7 +203,6 @@ class Handler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
             resp.read()  # drain so the connection can close cleanly
             status = resp.status
-            conn.close()
         except (OSError, http.client.HTTPException) as exc:
             # The gateway is still booting, restarting, or wedged. 503 +
             # Retry-After lets the caller (ingress, or Telegram itself) redeliver
@@ -207,6 +214,17 @@ class Handler(BaseHTTPRequestHandler):
                 extra_headers=(("Retry-After", "2"),),
             )
             return
+        finally:
+            # Always close, including on the error path. Without this a run of
+            # upstream failures leaks a socket per request until the shim runs
+            # out of file descriptors — which happens precisely during a cold
+            # start or a gateway crash loop, i.e. when the shim is the only
+            # thing still answering.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         if status >= 400:
             log(f"upstream returned {status}")

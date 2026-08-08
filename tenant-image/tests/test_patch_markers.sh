@@ -35,7 +35,27 @@ printf 'spaces\tagent/ok.py\tdef _to_oauth_wire_name(): pass\trequired\n' > "$tm
 bash "$tmp/patches/verify-markers.sh" "$tmp/tree"
 
 echo "--- case 5: apply-patches.sh with an empty overlay (expect no-op pass)"
-bash "$IMAGE_ROOT/patches/apply-patches.sh" "$tmp/tree"
+# Run against a COPY of the script in an empty directory, not against the real
+# patches/ dir. Once the founder's 001/002/003 patches are vendored, the real
+# directory is no longer empty and this case would start trying to apply them to
+# a two-file synthetic tree — a test that breaks the moment the thing it guards
+# starts being used is worse than no test.
+cp "$IMAGE_ROOT/patches/apply-patches.sh" "$tmp/patches/"
+bash "$tmp/patches/apply-patches.sh" "$tmp/tree"
+
+echo "--- case 6: apply-patches.sh rejects a patch that does not apply"
+cat > "$tmp/patches/001-bogus.patch" <<'PATCH'
+--- a/agent/ok.py
++++ b/agent/ok.py
+@@ -1 +1 @@
+-this context line does not exist in the target
++replacement
+PATCH
+if bash "$tmp/patches/apply-patches.sh" "$tmp/tree" >/dev/null 2>&1; then
+  echo "BUG: apply-patches.sh accepted a patch that does not apply"; exit 1
+fi
+echo "correctly refused a non-applying patch"
+rm -f "$tmp/patches/001-bogus.patch"
 
 echo "ALL MARKER CHECKS PASS"
 rm -rf "$tmp"

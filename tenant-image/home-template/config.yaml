@@ -82,6 +82,22 @@ skills:
 # one of the things the PRD sells (§2 "cross-chat approvals"), and re-deriving
 # its policy here would fork behaviour we want to inherit from upstream.
 
+# --- Logging ---------------------------------------------------------------
+# The gateway sees every message the user sends. Its stdout is shipped to
+# Railway's log aggregator, which sits OUTSIDE the tenant's isolation boundary
+# and is readable by anyone with project access — so log verbosity is a privacy
+# control here, not an ops preference.
+#
+# Upstream's default is INFO (hermes_cli/config_defaults.py:2379). WARNING keeps
+# errors and genuine operational problems visible while dropping the per-turn
+# chatter. There is no environment-variable equivalent, which is why this lives
+# in config rather than next to the Hindsight log settings in the Dockerfile.
+#
+# Raise to INFO/DEBUG only for a time-boxed, consented debugging session on a
+# specific tenant, and lower it again afterwards.
+logging:
+  level: "WARNING"
+
 # --- Timezone --------------------------------------------------------------
 # UTC until the concierge learns the user's real timezone in the first
 # conversation, at which point it writes the IANA name here.

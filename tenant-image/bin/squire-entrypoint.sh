@@ -34,7 +34,10 @@ INIT_MARKER="$STATE_DIR/initialized"
 # that) — everything else about the script is identical either way.
 SQUIRE_PYTHON="${SQUIRE_PYTHON:-/opt/squire/venv/bin/python}"
 SQUIRE_BIN="${SQUIRE_BIN:-/opt/squire/bin}"
-SECRETS_TOOL="$SQUIRE_PYTHON $SQUIRE_BIN/squire_secrets.py"
+# An ARRAY, not a string. An unquoted string expansion re-splits on IFS and
+# would break the moment an install path contained a space — the classic
+# shell footgun that only shows up on someone else's machine.
+SECRETS_TOOL=("$SQUIRE_PYTHON" "$SQUIRE_BIN/squire_secrets.py")
 
 # The final exec target, same override rationale. Making this substitutable is
 # what lets the boot test distinguish "booted successfully" (exit 0) from
@@ -104,7 +107,7 @@ log "durability ok: pg0 data root will be $PG0_DATA_ROOT"
 # Fail fast and loudly. A tenant that boots without its DEK would either run
 # with no credentials (looks like amnesia to the user) or, worse, re-initialize
 # and overwrite sealed state it cannot read.
-if ! $SECRETS_TOOL check; then
+if ! "${SECRETS_TOOL[@]}" check; then
     die "SQUIRE_DEK missing or malformed — expected base64 of exactly 32 bytes.
      control-api sets this per tenant; without it the volume cannot be read
      and must not be re-initialized."
@@ -187,7 +190,7 @@ install_secret() {
 
     if [ -f "$enc" ]; then
         # Restart path.
-        if ! $SECRETS_TOOL unseal "$enc" "$plain" "$name"; then
+        if ! "${SECRETS_TOOL[@]}" unseal "$enc" "$plain" "$name"; then
             die "could not decrypt $name — refusing to start.
      This means SQUIRE_DEK does not match this volume. Re-check the tenant's
      DEK before doing anything else; re-initialising would destroy the
@@ -201,7 +204,15 @@ install_secret() {
         # next boot is clean. Note the order: seal first, and only then remove
         # the plaintext.
         log "adopting pre-existing plaintext $name from the volume"
-        $SECRETS_TOOL seal "$link" "$enc" "$name"
+        # If the seal fails we must NOT delete the plaintext — that would
+        # destroy the only copy of the tenant's credentials — and we must not
+        # continue either, because the next secrets-sync pass would happily
+        # re-seal an empty file over it. Stop, loudly.
+        if ! "${SECRETS_TOOL[@]}" seal "$link" "$enc" "$name"; then
+            die "failed to seal pre-existing $name — refusing to continue.
+     The plaintext file has been left untouched at $link. Fix the DEK or the
+     volume permissions and restart; do not delete it."
+        fi
         cp "$link" "$plain"
         rm -f "$link"
     else
@@ -303,7 +314,11 @@ print(urlparse(sys.argv[1]).path or "/telegram")
 PY
     )"
     export SQUIRE_TELEGRAM_UPSTREAM_PATH
-    log "telegram webhook mode: public=$TELEGRAM_WEBHOOK_URL local=127.0.0.1:${TELEGRAM_WEBHOOK_PORT:-8443}$SQUIRE_TELEGRAM_UPSTREAM_PATH"
+    # Log the PATH ONLY, never the full URL. The ingress URL embeds the bot id,
+    # which is half of a Telegram bot token and a direct pointer at this
+    # specific tenant — not something to scatter through a shared log
+    # aggregator. The path is all anyone debugging routing actually needs.
+    log "telegram webhook mode: local=127.0.0.1:${TELEGRAM_WEBHOOK_PORT:-8443}$SQUIRE_TELEGRAM_UPSTREAM_PATH (public URL redacted)"
 else
     log "TELEGRAM_WEBHOOK_URL unset — adapter will use long polling (dev mode)"
 fi
@@ -311,28 +326,15 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Hindsight LLM wiring
 # ---------------------------------------------------------------------------
-# Hindsight needs an LLM for extraction/consolidation. During the trial that is
-# our metered proxy key; after the user connects their own provider it is
-# theirs. Both arrive as ordinary env vars, so we just forward whatever is
-# present. Haiku-class by default — this is background summarisation, not the
-# conversation, and it runs on every retained turn (PRD §5.3).
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    export HINDSIGHT_API_LLM_PROVIDER="${HINDSIGHT_API_LLM_PROVIDER:-anthropic}"
-    export HINDSIGHT_API_LLM_MODEL="${HINDSIGHT_API_LLM_MODEL:-claude-haiku-4-5}"
-    export HINDSIGHT_API_LLM_API_KEY="$ANTHROPIC_API_KEY"
-    if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
-        export HINDSIGHT_API_LLM_BASE_URL="$ANTHROPIC_BASE_URL"
-    fi
-elif [ -n "${OPENAI_API_KEY:-}" ]; then
-    export HINDSIGHT_API_LLM_PROVIDER="${HINDSIGHT_API_LLM_PROVIDER:-openai}"
-    export HINDSIGHT_API_LLM_MODEL="${HINDSIGHT_API_LLM_MODEL:-gpt-4.1-mini}"
-    export HINDSIGHT_API_LLM_API_KEY="$OPENAI_API_KEY"
-    if [ -n "${OPENAI_BASE_URL:-}" ]; then
-        export HINDSIGHT_API_LLM_BASE_URL="$OPENAI_BASE_URL"
-    fi
-else
-    log "no LLM key in env — hindsight will run without extraction until one is connected"
-fi
+# Derived by squire-hindsight-env.sh into a file that squire-hindsight-run.sh
+# sources at every daemon (re)start. Deliberately NOT exported into our own
+# environment: doing that is what made the credentials a boot-time constant and
+# left converted tenants extracting against a revoked trial key. See that
+# script's header for the full failure mode.
+#
+# Exit 10 means "changed", which on first boot is always true and needs no
+# action here — supervisord has not started the daemon yet.
+"$SQUIRE_BIN/squire-hindsight-env.sh" || true
 
 # ---------------------------------------------------------------------------
 # 7. Done initialising

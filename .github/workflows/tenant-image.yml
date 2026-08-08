@@ -118,6 +118,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Explicit interpreter + venv-free installs. `python3 -m pip install` into
+      # the runner's system Python fails on PEP 668 images ("externally-managed
+      # environment"), and PyYAML's presence on the runner is an assumption that
+      # has no business being load-bearing for a privacy-critical test suite.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # Same graceful-skip contract as the build job: this workflow must not go
       # red on a branch where tenant-image/ is still a placeholder.
       - name: Check tenant-image/ is populated
@@ -245,7 +254,12 @@ jobs:
       # those show up as a crash, so none of them would be caught by a build.
       - name: Install test dependencies
         if: steps.present.outputs.exists == 'true'
-        run: python3 -m pip install --quiet "cryptography>=45,<50"
+        # cryptography: AES-256-GCM for the secrets selftest.
+        # pyyaml: the template-parse step; not guaranteed present on a runner.
+        # Deliberately unpinned floors rather than the image's exact pins — the
+        # tests exercise long-stable APIs, and pinning here would mean a
+        # dependency bump in the image silently red-lining CI.
+        run: python3 -m pip install --quiet "cryptography>=41" "pyyaml>=6"
 
       - name: Secrets crypto selftest
         if: steps.present.outputs.exists == 'true'
@@ -262,6 +276,12 @@ jobs:
         # Includes the assertion that no plaintext secret ever appears on the
         # volume, and that pg0's data root is on the mount.
         run: bash tenant-image/tests/test_boot_path.sh
+
+      - name: Hindsight LLM re-wiring (the conversion moment)
+        if: steps.present.outputs.exists == 'true'
+        # Trial key -> user's own key. If this regresses, memory extraction dies
+        # silently for exactly the tenants who just paid us.
+        run: bash tenant-image/tests/test_hindsight_env.sh
 
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
@@ -288,4 +308,32 @@ jobs:
           check tenant-image/Dockerfile 'SQUIRE_WEBHOOK_PATH=/webhook/telegram'
           check tenant-image/Dockerfile 'SQUIRE_VOLUME=/opt/data'
           check tenant-image/bin/squire-webhook-shim.py '"SQUIRE_WEBHOOK_PATH", "/webhook/telegram"'
+
+          # HOME is what decides whether pg0 puts the tenant's Postgres cluster
+          # on the volume or on ephemeral container storage. A redeploy with the
+          # wrong value destroys every memory the tenant has, silently.
+          check tenant-image/Dockerfile 'ENV HOME=/opt/data'
+
+          # The base must be digest-pinned. A floating tag means upstream can
+          # change what every tenant runs — and what the patch overlay is
+          # applied to — without a commit here.
+          if grep -qE '^FROM .*@sha256:[0-9a-f]{64}' tenant-image/Dockerfile; then
+            echo "ok   base image is digest-pinned"
+          else
+            echo "::error::tenant-image/Dockerfile FROM is not pinned by digest"
+            fail=1
+          fi
+
+          # secrets-sync must start before, and therefore stop after, the
+          # gateway; otherwise credentials written during the gateway's drain
+          # are never sealed. supervisord stops in descending priority.
+          sync_prio=$(awk '/^\[program:secrets-sync\]/{f=1} f&&/^priority=/{print $0; exit}' tenant-image/supervisord.conf | cut -d= -f2)
+          gw_prio=$(awk '/^\[program:gateway\]/{f=1} f&&/^priority=/{print $0; exit}' tenant-image/supervisord.conf | cut -d= -f2)
+          if [ "${sync_prio:-999}" -lt "${gw_prio:-0}" ]; then
+            echo "ok   secrets-sync (priority $sync_prio) outlives gateway (priority $gw_prio)"
+          else
+            echo "::error::secrets-sync priority ($sync_prio) must be LOWER than gateway ($gw_prio) so it stops last"
+            fail=1
+          fi
+
           exit "$fail"

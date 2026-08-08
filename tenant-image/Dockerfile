@@ -50,13 +50,30 @@
 #
 FROM docker.io/nousresearch/hermes-agent@sha256:c0cab4e3711bcb27a312be1b3776254fc06fd50d5f7a6b8017915fc7171cb39e
 
-# Human-readable provenance for the digest above. Metadata only — changing it
-# does not change what is built, which is exactly why the FROM uses the digest.
+# Human-readable provenance for the tag the digest above corresponds to.
+# Metadata only — changing it does not change what is built, which is exactly why
+# the FROM uses the digest.
+#
+# There is deliberately NO HERMES_DIGEST ARG. It would be a second copy of the
+# literal on the FROM line, free to drift out of step with it, and a provenance
+# label that disagrees with what was actually built is worse than no label at
+# all. The base digest is already authoritative in one place (the FROM) and is
+# recoverable from the built image with:
+#
+#     docker image inspect --format '{{index .RootFS.Layers 0}}' <image>
+#     docker history --no-trunc <image>       # shows the base reference
+#
+# The CI job asserts instead on the property that matters — that the FROM line
+# is digest-pinned at all.
 ARG HERMES_VERSION=v2026.8.3
-ARG HERMES_DIGEST=sha256:c0cab4e3711bcb27a312be1b3776254fc06fd50d5f7a6b8017915fc7171cb39e
 
-# The memory server. Pinned; bump deliberately.
+# Pinned exactly, matching the digest-pin discipline above: a floating range is
+# the same mutable-input problem in a different coat. Every version below was
+# resolved against the real index on 2026-08-08; bump deliberately.
 ARG HINDSIGHT_VERSION=0.9.0
+ARG TORCH_VERSION=2.9.1
+ARG SUPERVISOR_VERSION=4.3.0
+ARG CRYPTOGRAPHY_VERSION=49.0.0
 
 # Everything below runs as root (build time). Runtime drops to the `hermes`
 # user (uid 10000) via upstream's main-wrapper.sh — see the CMD note at the
@@ -66,29 +83,21 @@ USER root
 
 LABEL org.opencontainers.image.title="squire-hermes-tenant" \
       org.opencontainers.image.description="Squire per-tenant agent runtime: hermes-agent + Hindsight + embedded Postgres" \
-      ai.squire.hermes.version="${HERMES_VERSION}" \
-      ai.squire.hermes.digest="${HERMES_DIGEST}"
+      ai.squire.hermes.version="${HERMES_VERSION}"
+
+# ===========================================================================
+# LAYER ORDER
+# ---------------------------------------------------------------------------
+# The two venv layers come FIRST, before any COPY of our own source. They are
+# by far the most expensive steps (torch alone is hundreds of MB) and they
+# change only when a pinned version above changes. The patch overlay and the
+# Squire scripts change on almost every commit. Building in this order means an
+# ordinary edit to a shell script or a patch re-runs seconds of work instead of
+# re-resolving and re-downloading the whole ML stack.
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
-# 1. Patch overlay
-# ---------------------------------------------------------------------------
-# The three-tier fork discipline from docs/reference/git-strategy.md, moved into
-# the image build: upstream is pinned and untouched; our deltas live as ordered
-# .patch files; a marker grep proves both our patches AND the upstream fixes we
-# depend on are present in the built tree.
-#
-# apply-patches.sh is a no-op when patches/ contains no .patch files, so the
-# image builds cleanly before the founder's 001/002/003 patches are copied in
-# from ~/.hermes/patches/. verify-markers.sh, however, ALWAYS runs and always
-# checks the upstream markers, so a silent upstream regression (e.g. the
-# _to_oauth_wire_name billing fix disappearing) fails the build rather than
-# reaching a tenant.
-COPY --chmod=0755 patches/ /opt/squire/patches/
-RUN /opt/squire/patches/apply-patches.sh /opt/hermes \
- && /opt/squire/patches/verify-markers.sh /opt/hermes
-
-# ---------------------------------------------------------------------------
-# 2. Squire control venv (small): supervisord + cryptography
+# 1. Squire control venv (small): supervisord + cryptography
 # ---------------------------------------------------------------------------
 # Deliberately NOT installed into /opt/hermes/.venv. That venv is upstream's
 # and is treated as sealed (the image sets HERMES_DISABLE_LAZY_INSTALLS=1 for
@@ -99,10 +108,10 @@ RUN /opt/squire/patches/apply-patches.sh /opt/hermes \
 #   supervisor   — process supervision inside the container
 RUN uv venv --python 3.13 /opt/squire/venv \
  && uv pip install --python /opt/squire/venv/bin/python --no-cache \
-        "supervisor==4.3.0" "cryptography>=45,<50"
+        "supervisor==${SUPERVISOR_VERSION}" "cryptography==${CRYPTOGRAPHY_VERSION}"
 
 # ---------------------------------------------------------------------------
-# 3. Hindsight venv (large): memory daemon + embedded Postgres
+# 2. Hindsight venv (large): memory daemon + embedded Postgres
 # ---------------------------------------------------------------------------
 # Also isolated from /opt/hermes/.venv — hindsight-api-slim pins sqlalchemy,
 # litellm, anthropic, openai and tornado, all of which hermes also depends on.
@@ -129,17 +138,46 @@ RUN uv venv --python 3.13 /opt/squire/venv \
 # upgrades — not worth the rebase debt for the size. If the image turns out to
 # be the binding constraint at G1, that is the next lever to pull.
 #
+# hindsight-embed is deliberately NOT installed. It is the daemon *manager* for
+# local_embedded mode, and the hermes plugin only imports it on that branch
+# (plugins/memory/hindsight/__init__.py: `if self._mode == "local_embedded":
+# import hindsight_embed.daemon_embed_manager`). We run local_external against a
+# daemon supervised by supervisord, so the gateway reaches Hindsight over HTTP
+# via hindsight-client (already baked into the upstream image) and never imports
+# the manager at all.
+#
 # torch is installed FIRST from PyTorch's CPU-only index. The default PyPI torch
 # wheel drags in the whole nvidia-cu* stack (multiple GB) a tenant can never
 # use; installing the CPU build first means the resolve below sees torch as
 # already satisfied.
 RUN uv venv --python 3.13 /opt/squire/hindsight-venv \
  && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
-        --index-url https://download.pytorch.org/whl/cpu "torch>=2.6.0" \
+        --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
  && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
         "hindsight-api-slim[embedded-db,local-ml]==${HINDSIGHT_VERSION}" \
-        "hindsight-embed>=0.1.0" \
  && /opt/squire/hindsight-venv/bin/hindsight-api --help > /dev/null
+
+# ---------------------------------------------------------------------------
+# 3. Patch overlay
+# ---------------------------------------------------------------------------
+# The three-tier fork discipline from docs/reference/git-strategy.md, moved into
+# the image build: upstream is pinned and untouched; our deltas live as ordered
+# .patch files; a marker grep proves both our patches AND the upstream fixes we
+# depend on are present in the built tree.
+#
+# apply-patches.sh is a no-op when patches/ contains no .patch files, so the
+# image builds cleanly before the founder's 001/002/003 patches are copied in
+# from ~/.hermes/patches/. verify-markers.sh, however, ALWAYS runs and always
+# checks the upstream markers, so a silent upstream regression (e.g. the
+# _to_oauth_wire_name billing fix disappearing) fails the build rather than
+# reaching a tenant.
+#
+# Copied without a blanket --chmod: markers.tsv and the .patch files are data
+# and have no business being executable. Only the two scripts get the bit.
+COPY patches/ /opt/squire/patches/
+RUN chmod 0755 /opt/squire/patches/*.sh \
+ && /opt/squire/patches/apply-patches.sh /opt/hermes \
+ && /opt/squire/patches/verify-markers.sh /opt/hermes
 
 # ---------------------------------------------------------------------------
 # 4. Squire runtime files
@@ -148,6 +186,44 @@ COPY --chmod=0755 bin/ /opt/squire/bin/
 COPY supervisord.conf /opt/squire/supervisord.conf
 # The baked ~/.hermes template. Seeded onto the (empty) volume on first boot
 # only — see bin/squire-entrypoint.sh. Never overwrites tenant-owned files.
+#
+# WHY home-template/hindsight/config.json CARRIES NO COMMENTARY
+# -------------------------------------------------------------
+# It used to hold a "_comment" key explaining the design. JSON has no comments,
+# and an unknown key is at the mercy of whatever loader reads it — a strict
+# schema would reject the file, and the plugin's failure mode for an unreadable
+# config is to fall back to defaults, i.e. mode="cloud"/local_embedded. That is
+# exactly the embedded-daemon-inside-the-gateway topology that
+# docs/reference/hindsight-optimization-guide.md §1 exists to eliminate, and it
+# would fail SILENTLY: memory would appear to work while the daemon ran in the
+# gateway's own process, ready to take the gateway down with it on OOM.
+#
+# So the file is now strictly schema-clean and the rationale lives here:
+#
+#   mode=local_external + api_url=127.0.0.1:9177
+#       Talk to the hindsight-api daemon supervised alongside the gateway
+#       (supervisord.conf) instead of running it in-process. Guide §1/§5: an
+#       embedded daemon that OOMs kills the gateway; a separate process can be
+#       restarted by the healthcheck loop without dropping the conversation.
+#   recall_types=observation
+#       Upstream's own narrowed default — consolidated beliefs are denser per
+#       token than the raw facts underneath them.
+#   retain_every_n_turns=1, retain_async=true
+#       Remember everything, but never block a reply on extraction.
+#   bank_retain_mission
+#       Steers extraction toward durable personal facts and away from small
+#       talk. This is what makes the agent feel like it knows the user rather
+#       than merely having a transcript.
+#
+# FIRST-LIVE-BOOT VERIFICATION (do this on the first real tenant — it cannot be
+# checked without a running daemon, and the silent-fallback risk above is
+# exactly why it must be checked at least once):
+#
+#   1. `curl -s 127.0.0.1:9177/health`            -> daemon is up and separate
+#   2. `pgrep -af hindsight-api`                  -> its own PID, not the gateway's
+#   3. `ls $HOME/.pg0/instances/hindsight/data`   -> cluster is on the volume
+#   4. In the gateway logs, confirm NO line about starting an embedded daemon
+#      and no "hindsight-embed" activity — that would mean local_embedded.
 COPY home-template/ /opt/squire/home-template/
 
 # Byte-compile our Python so a syntax error fails the BUILD, not a tenant boot.
@@ -231,15 +307,80 @@ ENV TELEGRAM_WEBHOOK_PORT=8443 \
 # lets the healthcheck reach the DB to clear wedged tasks. pg0 keeps its data
 # in $HOME/.pg0/instances/hindsight/data — and $HOME is /opt/data — so the
 # memory database lives on the volume and survives redeploys.
+# WORKER SLOTS — read this before "fixing" it to match the guide
+# --------------------------------------------------------------
+# The guide (§3) says to set HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=1 and
+# describes it as reducing "2 concurrent consolidation slots" to 1. That reading
+# is wrong, and it was wrong in 0.8.x too. Verified against hindsight-api-slim
+# 0.9.0's config.py:
+#
+#   * config.py:726-758 `_parse_worker_slot_reservations` — docstring:
+#     "``HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS`` is a deprecated alias for
+#      ``..._RESERVED_SLOTS`` — despite its name it always set the reservation
+#      floor, never a ceiling."
+#   * config.py:707-712 — a reservation is a guaranteed MINIMUM within the
+#     global WORKER_MAX_SLOTS pool; spare capacity stays shared, so "a
+#     reservation does NOT cap the type — it may overflow the shared pool."
+#   * config.py:740-744 — setting BOTH names raises ValueError at startup.
+#   * config.py:716-723 — the consolidation default reservation is 2.
+#
+# So: the knob that actually bounds concurrency (and therefore peak RSS) is
+# WORKER_MAX_SLOTS, which we set to 3 (upstream default 10). Lowering the
+# consolidation reservation from 2 to 1 is a *scheduling fairness* change — it
+# frees a slot for retain/graph work instead of guaranteeing it to
+# consolidation — and does not by itself reduce memory. We keep it because a
+# 3-slot pool with 2 slots pre-committed to consolidation starves everything
+# else, but the memory win the guide claims comes from WORKER_MAX_SLOTS alone.
+#
+# We use the modern RESERVED_SLOTS name. Using the deprecated MAX_SLOTS alias
+# would be identical in effect but logs a deprecation warning on every boot, and
+# setting both would be a hard startup failure.
+#
+# RETAIN_MAX_CONCURRENT (default 4, config.py:1272) is the other real memory
+# lever: it bounds concurrent retain DB phases (HNSW reads + writes). Halved.
 ENV HINDSIGHT_API_HOST=127.0.0.1 \
     HINDSIGHT_API_PORT=9177 \
-    HINDSIGHT_API_LOG_LEVEL=info \
     HINDSIGHT_API_DATABASE_URL=pg0://hindsight:5432 \
     HINDSIGHT_API_RERANKER_PROVIDER=rrf \
     HINDSIGHT_API_WORKER_MAX_SLOTS=3 \
     HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS=1 \
+    HINDSIGHT_API_RETAIN_MAX_CONCURRENT=2 \
     HINDSIGHT_API_DB_POOL_MIN_SIZE=3 \
     HINDSIGHT_API_DB_POOL_MAX_SIZE=15
+
+# --- Log-level policy: the gateway and Hindsight both see message content ----
+# Everything these two processes write to stdout is shipped to Railway's log
+# aggregator, which is outside the tenant's isolation boundary and readable by
+# anyone with project access. Debug logging in either would put fragments of the
+# user's conversation — and Hindsight's extracted memories, which are *more*
+# concentrated personal data than the raw messages — into that aggregator.
+#
+# So the levels are pinned conservatively here rather than left to a default
+# that a future upstream bump could change:
+#
+#   HINDSIGHT_API_LOG_LEVEL=warning  quieter than upstream's `info` default
+#                                    (config.py:1105), which logs per-operation
+#                                    detail on every retained turn
+#   HINDSIGHT_API_ACCESS_LOG=false   already the default (config.py:1108); pinned
+#                                    so it cannot drift, since request paths can
+#                                    carry bank and document identifiers
+#
+# The GATEWAY side is NOT set here, because upstream exposes no log-level
+# environment variable — it is a config key, `logging.level` (default "INFO",
+# hermes_cli/config_defaults.py:2379). It is therefore pinned to WARNING in
+# home-template/config.yaml instead. Setting a HERMES_LOG_LEVEL env var here
+# would look like policy while doing precisely nothing.
+#
+# Mitigating context, not an excuse: upstream runs a RedactingFormatter
+# (agent/redact.py:1000) over its own log files, so known credential shapes are
+# scrubbed. That covers secrets, not conversation content, and it is applied to
+# hermes' file handlers rather than to everything on stdout.
+#
+# Raise these ONLY for a deliberate, time-boxed debugging session on a tenant
+# whose owner has consented — and drop them back afterwards. tests/
+# test_boot_path.sh asserts that no plaintext secret reaches captured output.
+ENV HINDSIGHT_API_LOG_LEVEL=warning \
+    HINDSIGHT_API_ACCESS_LOG=false
 
 # --- Gateway supervision opt-out -------------------------------------------
 # CRITICAL, and non-obvious: upstream's `hermes gateway run` detects that it is

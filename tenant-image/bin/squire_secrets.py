@@ -67,7 +67,12 @@ def load_dek(env: dict[str, str] | None = None) -> bytes:
     padded = raw + "=" * (-len(raw) % 4)
     for decoder in (base64.b64decode, base64.urlsafe_b64decode):
         try:
-            key = decoder(padded)
+            # validate=True so stray characters are an ERROR rather than being
+            # silently discarded. Without it, a truncated or subtly corrupted
+            # DEK can still decode to 32 bytes — and we would cheerfully boot
+            # with the wrong key, fail to decrypt, and look like a lost volume.
+            # A malformed DEK must be diagnosed as malformed.
+            key = decoder(padded, validate=True)
         except Exception:
             continue
         if len(key) == KEY_LEN:
