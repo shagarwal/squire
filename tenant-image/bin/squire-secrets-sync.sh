@@ -90,5 +90,12 @@ trap 'log "SIGTERM — final sync"; sync_once; exit 0' TERM INT
 log "watching ${SECRETS} every ${INTERVAL}s"
 while true; do
     sync_once
-    sleep "$INTERVAL"
+    # `sleep & wait` rather than a bare `sleep`. bash does not run a trap while
+    # a foreground builtin/child is executing — it waits for it to finish — so a
+    # bare `sleep 15` would delay the SIGTERM handler by up to a full interval.
+    # `wait` IS interruptible: the signal lands immediately, the final re-seal
+    # runs at once, and the whole shutdown fits inside supervisord's
+    # stopwaitsecs instead of racing it.
+    sleep "$INTERVAL" &
+    wait $!
 done

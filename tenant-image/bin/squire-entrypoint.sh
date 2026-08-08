@@ -36,7 +36,58 @@ SQUIRE_PYTHON="${SQUIRE_PYTHON:-/opt/squire/venv/bin/python}"
 SQUIRE_BIN="${SQUIRE_BIN:-/opt/squire/bin}"
 SECRETS_TOOL="$SQUIRE_PYTHON $SQUIRE_BIN/squire_secrets.py"
 
-log "tenant=${TENANT_ID:-<unset>} hermes_home=$HERMES_HOME port=${PORT:-8080}"
+VOLUME_PATH="${SQUIRE_VOLUME:-/opt/data}"
+
+log "tenant=${TENANT_ID:-<unset>} hermes_home=$HERMES_HOME home=${HOME:-<unset>} port=${PORT:-8080}"
+
+# ---------------------------------------------------------------------------
+# 0. Durability gate — is the Postgres cluster actually on the volume?
+# ---------------------------------------------------------------------------
+# The most expensive silent failure in this container: pg0 puts the embedded
+# PostgreSQL data directory under $HOME/.pg0/instances/<name>/data. If $HOME is
+# not the mounted volume, Hindsight works perfectly, the tenant's memory builds
+# up normally — and the next redeploy throws all of it away with no error. The
+# user just finds that their assistant has forgotten them.
+#
+# So assert it, loudly, before anything starts. This is cheap insurance against
+# an upstream image bump quietly changing HOME.
+PG0_DATA_ROOT="${HOME:-}/.pg0"
+
+if [ -z "${HOME:-}" ]; then
+    die "HOME is unset — pg0 would put the memory database somewhere unpredictable.
+     The Dockerfile sets HOME=$VOLUME_PATH; something has unset it."
+fi
+
+# realpath both sides so a symlinked mount still compares equal.
+home_real="$(realpath -m "$HOME")"
+volume_real="$(realpath -m "$VOLUME_PATH")"
+if [ "$home_real" != "$volume_real" ]; then
+    die "HOME ($home_real) is not the mounted volume ($volume_real).
+     pg0 would write the embedded PostgreSQL cluster to $PG0_DATA_ROOT, which
+     is on the container filesystem — every redeploy would destroy the tenant's
+     long-term memory. Set HOME=$VOLUME_PATH."
+fi
+
+# Second, weaker check: is the volume actually a mount, or just a directory in
+# the image? /proc/self/mountinfo is the reliable source (a bind mount of a
+# subdirectory still shows up there).
+#
+# This is only fatal when TENANT_ID is set. control-api always sets it when
+# provisioning a real tenant, so its presence is a precise signal for "this is
+# production and a missing volume means data loss". A bare `docker run` for
+# local testing has no TENANT_ID and is allowed to run volume-less.
+if ! grep -q " $volume_real " /proc/self/mountinfo 2>/dev/null; then
+    if [ -n "${TENANT_ID:-}" ] && [ "${SQUIRE_ALLOW_EPHEMERAL_VOLUME:-}" != "1" ]; then
+        die "$volume_real is not a mount point, but TENANT_ID=$TENANT_ID is set.
+     This tenant would run entirely on ephemeral container storage: memory,
+     credentials and conversation history would all be lost on redeploy.
+     Attach the Railway volume at $volume_real.
+     (Set SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 to override — testing only.)"
+    fi
+    log "WARNING: $volume_real is not a mount point — state is EPHEMERAL (dev mode)"
+fi
+
+log "durability ok: pg0 data root will be $PG0_DATA_ROOT"
 
 # ---------------------------------------------------------------------------
 # 1. DEK gate
@@ -162,12 +213,24 @@ for name in $SECRETS; do
     install_secret "$name"
 done
 
-# --- .env values we own -----------------------------------------------------
-# TELEGRAM_WEBHOOK_SECRET authenticates Telegram -> tenant. python-telegram-bot
-# REFUSES to start in webhook mode without it (upstream cites GHSA-3vpc-7q5r-
-# 276h), and the value must be stable across restarts because it is what the
-# adapter registers with setWebhook. So: generate once, keep it in the sealed
-# .env, reuse forever.
+# --- TELEGRAM_WEBHOOK_SECRET ------------------------------------------------
+# This secret is the shared truth between three parties: Telegram (which stamps
+# it on every update), the tenant's PTB adapter (which rejects updates without
+# it), and ingress/control-api (which stores it). python-telegram-bot REFUSES to
+# start in webhook mode without one (upstream cites GHSA-3vpc-7q5r-276h).
+#
+# WHO OWNS IT: control-api. Both TELEGRAM_WEBHOOK_URL and TELEGRAM_WEBHOOK_SECRET
+# are part of the provisioning env contract. That resolves the setWebhook
+# ownership question: because control-api and the tenant register the *same* URL
+# with the *same* secret, the tenant's PTB setWebhook call and control-api's own
+# are idempotent — last writer wins and both writers agree, so there is no fight
+# and ingress's stored secret stays valid across tenant restarts.
+#
+# The generate-and-persist branch below is a STANDALONE-DEV FALLBACK only. It
+# exists so `docker run` without control-api still boots; in that mode the tenant
+# is the only writer, so self-generating is correct. It must never be the path a
+# provisioned tenant takes — if it is, control-api forgot to set the variable and
+# ingress will hold a secret the tenant does not know.
 ENV_FILE="$TMPFS_DIR/.env"
 
 env_get() {
@@ -175,19 +238,39 @@ env_get() {
     sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1
 }
 
-env_set_if_absent() {
-    local key="$1" value="$2"
-    if [ -z "$(env_get "$key")" ]; then
-        printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
-        log "generated $key"
-    fi
+env_put() {
+    # Idempotent upsert: drop any existing assignment, then append.
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp "$TMPFS_DIR/.env.XXXXXX")"
+    chmod 0600 "$tmp"
+    grep -v "^$key=" "$ENV_FILE" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$ENV_FILE"
 }
 
-env_set_if_absent TELEGRAM_WEBHOOK_SECRET "$(openssl rand -hex 32)"
+if [ -n "${TELEGRAM_WEBHOOK_SECRET:-}" ]; then
+    # Normal, provisioned path. Mirror the control-api value into .env so the
+    # adapter's profile-scoped get_secret() read finds it too, and so a value
+    # rotation propagates on redeploy rather than being masked by a stale one.
+    if [ "$(env_get TELEGRAM_WEBHOOK_SECRET)" != "$TELEGRAM_WEBHOOK_SECRET" ]; then
+        env_put TELEGRAM_WEBHOOK_SECRET "$TELEGRAM_WEBHOOK_SECRET"
+        log "TELEGRAM_WEBHOOK_SECRET taken from the environment (control-api)"
+    fi
+elif [ -n "$(env_get TELEGRAM_WEBHOOK_SECRET)" ]; then
+    log "TELEGRAM_WEBHOOK_SECRET reused from sealed .env (dev fallback)"
+else
+    # Dev fallback. Uses Python's `secrets` module rather than `openssl rand`:
+    # openssl is not a declared dependency of the upstream image and a missing
+    # binary here would abort boot under `set -e`, whereas the interpreter is
+    # already a hard dependency of everything else in this script.
+    env_put TELEGRAM_WEBHOOK_SECRET \
+        "$("$SQUIRE_PYTHON" -c 'import secrets; print(secrets.token_hex(32))')"
+    log "TELEGRAM_WEBHOOK_SECRET generated (dev fallback — control-api did not supply one)"
+fi
 chmod 0600 "$ENV_FILE"
 
-# Export it into our own environment too: the webhook shim needs the same value
-# to stamp on forwarded requests, and it does not read hermes' .env.
+# Export for the webhook shim, which stamps it on forwarded requests and does
+# not read hermes' .env.
 TELEGRAM_WEBHOOK_SECRET="$(env_get TELEGRAM_WEBHOOK_SECRET)"
 export TELEGRAM_WEBHOOK_SECRET
 

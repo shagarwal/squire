@@ -33,13 +33,23 @@ upstream-oauth-wire-name	agent/anthropic_adapter.py	_to_oauth_wire_name	required
 # A single `mcp_` is the exact token that triggers the extra-usage lane.
 upstream-mcp-prefix	agent/anthropic_adapter.py	_MCP_TOOL_PREFIX = "mcp__"	required
 
-# --- Patch target files must still exist ------------------------------------
-# Cheap structural check: the update plan's file-disjoint patch rule assigns
-# 001 -> anthropic_adapter.py, 002 -> approval.py, 003 -> slash_commands.py.
-# If upstream moves or renames one of these, the corresponding patch will fail
-# to apply — this row makes the reason obvious in the build log.
-patch-002-target	tools/approval.py	def 	required
-patch-003-target	gateway/slash_commands.py	def 	required
+# --- Anchors the cross-chat approval patches attach to ----------------------
+# The update plan's file-disjoint rule assigns 002 -> tools/approval.py and
+# 003 -> gateway/slash_commands.py. These rows pin the specific upstream
+# functions those patches hook, so an upstream refactor that renames or removes
+# them fails the build with an obvious reason instead of a mystery patch
+# rejection (or, worse, a patch that still applies to the wrong place).
+#
+# Both strings verified present in the v2026.8.3 tree.
+#
+# 002 hooks the gateway approval-resolution plumbing so an approval raised in
+#     one chat can be resolved from another.
+patch-002-anchor	tools/approval.py	def resolve_gateway_approval(	required
+patch-002-anchor-notify	tools/approval.py	def register_gateway_notify(	required
+# 003 extends the /approve slash command to accept a session key. Update plan
+#     §2: "Native /approve accepts no session-key argument ... patch 003 is
+#     still required for cross-chat approve."
+patch-003-anchor	gateway/slash_commands.py	_handle_approve_command	required
 
 # --- Squire patch markers ---------------------------------------------------
 # These correspond to the founder's patches 001/002/003, which are NOT yet

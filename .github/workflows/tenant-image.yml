@@ -149,7 +149,7 @@ jobs:
         if: steps.present.outputs.exists == 'true'
         run: |
           set -euo pipefail
-          python3 -m compileall -q tenant-image/bin
+          python3 -m compileall -q tenant-image/bin tenant-image/tests
           echo "python sources compile"
 
       - name: Templates parse (YAML / JSON)
@@ -234,36 +234,39 @@ jobs:
               sys.exit(1)
           PY
 
-      - name: verify-markers.sh self-check
+      # ----------------------------------------------------------------------
+      # Behavioural test suites (tenant-image/tests/)
+      # ----------------------------------------------------------------------
+      # All three run WITHOUT Docker, by design: the image takes tens of minutes
+      # to build and needs no daemon for any of this. They are the regression
+      # protection for the parts of the image whose failures are SILENT — a
+      # credential written in plaintext to the volume, a Postgres cluster landing
+      # on ephemeral storage, a marker guard that no longer fails closed. None of
+      # those show up as a crash, so none of them would be caught by a build.
+      - name: Install test dependencies
         if: steps.present.outputs.exists == 'true'
-        run: |
-          set -euo pipefail
-          # Exercise the real script against a synthetic tree: one file that
-          # satisfies a marker and one that does not, proving it fails when it
-          # should. A marker checker that can only pass is not a checker.
-          tmp="$(mktemp -d)"
-          mkdir -p "$tmp/tree/agent" "$tmp/patches"
-          printf 'def _to_oauth_wire_name(): pass\n' > "$tmp/tree/agent/ok.py"
-          cp tenant-image/patches/verify-markers.sh "$tmp/patches/"
-          printf 'ok\tagent/ok.py\t_to_oauth_wire_name\trequired\n' > "$tmp/patches/markers.tsv"
-          bash "$tmp/patches/verify-markers.sh" "$tmp/tree"
-
-          printf 'missing\tagent/ok.py\tthis_string_is_not_present\trequired\n' > "$tmp/patches/markers.tsv"
-          if bash "$tmp/patches/verify-markers.sh" "$tmp/tree"; then
-            echo "::error::verify-markers.sh passed a tree with a missing required marker"
-            exit 1
-          fi
-          echo "verify-markers.sh fails closed as expected"
+        run: python3 -m pip install --quiet "cryptography>=45,<50"
 
       - name: Secrets crypto selftest
         if: steps.present.outputs.exists == 'true'
-        run: |
-          set -euo pipefail
-          python3 -m pip install --quiet "cryptography>=45,<50"
-          # Round-trips AES-256-GCM, and asserts that a wrong key and a wrong
-          # AAD (the file-rename guard) both fail. See tenant-image/bin/
-          # squire_secrets.py::cmd_selftest.
-          python3 tenant-image/bin/squire_secrets.py selftest
+        # Round-trips AES-256-GCM and asserts that a wrong key and a wrong AAD
+        # (the file-rename guard) both fail.
+        run: python3 tenant-image/bin/squire_secrets.py selftest
+
+      - name: Patch-marker guard fails closed
+        if: steps.present.outputs.exists == 'true'
+        run: bash tenant-image/tests/test_patch_markers.sh
+
+      - name: Boot path (first boot, restart, rotation, wrong DEK, durability)
+        if: steps.present.outputs.exists == 'true'
+        # Includes the assertion that no plaintext secret ever appears on the
+        # volume, and that pg0's data root is on the mount.
+        run: bash tenant-image/tests/test_boot_path.sh
+
+      - name: Webhook shim contract
+        if: steps.present.outputs.exists == 'true'
+        # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s.
+        run: python3 tenant-image/tests/test_webhook_shim.py
 
       - name: Container contract constants
         if: steps.present.outputs.exists == 'true'

@@ -25,3 +25,7 @@ __pycache__/
 # Local scratch
 *.log
 .tmp/
+
+# Tests run in CI against the source tree, never inside the image. Keeping them
+# out of the build context also means editing a test cannot bust the build cache.
+tests/

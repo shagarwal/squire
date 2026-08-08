@@ -29,32 +29,33 @@
 #
 # PINNING / BUMPING
 # -----------------
-# HERMES_VERSION is the upstream *release tag*. v2026.8.3 is the current
-# release as of 2026-08-07 (the same tag docs/reference/hermes-update-plan-
-# v2026.8.3.md rehearsed and executed against, so the patch overlay and marker
-# greps below are known-good on it).
+# The base is pinned BY DIGEST, not by tag. A tag is a mutable pointer: upstream
+# re-tagging v2026.8.3 would silently change what every tenant runs, and the
+# patch overlay below would be applying to a tree we never verified. The digest
+# makes the base immutable and the build reproducible.
 #
-# To bump: change HERMES_VERSION, clear HERMES_DIGEST (or replace it with the
-# new amd64 digest from `docker buildx imagetools inspect`), rerun the patch
-# overlay locally, and re-verify the markers. Never bump without re-running the
+# Digest below == docker.io/nousresearch/hermes-agent:v2026.8.3 (linux/amd64),
+# resolved 2026-08-07. That is the current upstream release, and the same tag
+# docs/reference/hermes-update-plan-v2026.8.3.md rehearsed and executed against,
+# so the patch overlay and marker greps are known-good on it.
+#
+# NOTE: pinning a per-arch digest makes this image amd64-only. That is what
+# Railway runs, and a tenant image is not something anyone builds on a laptop.
+# For multi-arch, swap to the multi-arch manifest digest.
+#
+# To bump: `docker buildx imagetools inspect nousresearch/hermes-agent:<newtag>`,
+# update BOTH the digest below and HERMES_VERSION (which is metadata only), then
+# re-run the patch overlay and re-verify the markers. Never bump without the
 # canary drill in the update plan (§7 verification gates).
 #
-ARG HERMES_IMAGE=docker.io/nousresearch/hermes-agent
+FROM docker.io/nousresearch/hermes-agent@sha256:c0cab4e3711bcb27a312be1b3776254fc06fd50d5f7a6b8017915fc7171cb39e
+
+# Human-readable provenance for the digest above. Metadata only — changing it
+# does not change what is built, which is exactly why the FROM uses the digest.
 ARG HERMES_VERSION=v2026.8.3
-
-FROM ${HERMES_IMAGE}:${HERMES_VERSION}
-
-# Re-declare after FROM so the values are readable inside build stages.
-ARG HERMES_VERSION
-# amd64 manifest digest for nousresearch/hermes-agent:v2026.8.3, recorded on
-# 2026-08-07 for provenance. Not used as the FROM ref (that would break the
-# multi-arch manifest); it is stamped into the image so `docker inspect` can
-# prove which upstream build a tenant is running.
 ARG HERMES_DIGEST=sha256:c0cab4e3711bcb27a312be1b3776254fc06fd50d5f7a6b8017915fc7171cb39e
 
-# hindsight-all bundles hindsight-api-slim[all] (the memory server + local
-# embeddings) plus pg0-embedded (the bundled PostgreSQL 18 that hindsight-api
-# starts for itself). Pinned; bump deliberately.
+# The memory server. Pinned; bump deliberately.
 ARG HINDSIGHT_VERSION=0.9.0
 
 # Everything below runs as root (build time). Runtime drops to the `hermes`
@@ -109,15 +110,35 @@ RUN uv venv --python 3.13 /opt/squire/venv \
 # the daemon over HTTP (local_external mode), never by import, so isolation
 # costs us nothing.
 #
-# torch is installed FIRST from PyTorch's CPU-only index. The default PyPI
-# torch wheel drags in the whole nvidia-cu* stack (multiple GB) that a tenant
-# container can never use. Installing the CPU build first means the
-# hindsight-all resolve below sees torch as already satisfied.
+# WHY hindsight-api-slim[embedded-db,local-ml] AND NOT hindsight-all
+# ------------------------------------------------------------------
+# `hindsight-all` pulls `hindsight-api-slim[all]`, and [all] = [embedded-db] +
+# [local-ml] + [local-onnx]. We do not use the ONNX embeddings backend (the
+# default `local` backend is sentence-transformers/torch), so [local-onnx]'s
+# onnxruntime is pure image weight on every tenant — and image size feeds
+# straight into the G1 economics gate (docs/implementation-plan.md §2).
+#
+# Requesting the two extras we actually need is a strict subset of [all], so it
+# cannot remove anything [all] provided that we depend on. numpy and
+# huggingface-hub are dropped from the *direct* set but come back transitively
+# via sentence-transformers.
+#
+# Honest caveat: [local-ml] still carries mlx, mlx-lm and flashrank, which this
+# container never uses. There is no finer-grained extra upstream, so trimming
+# those would mean hand-listing dependencies and owning that list across
+# upgrades — not worth the rebase debt for the size. If the image turns out to
+# be the binding constraint at G1, that is the next lever to pull.
+#
+# torch is installed FIRST from PyTorch's CPU-only index. The default PyPI torch
+# wheel drags in the whole nvidia-cu* stack (multiple GB) a tenant can never
+# use; installing the CPU build first means the resolve below sees torch as
+# already satisfied.
 RUN uv venv --python 3.13 /opt/squire/hindsight-venv \
  && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
         --index-url https://download.pytorch.org/whl/cpu "torch>=2.6.0" \
  && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
-        "hindsight-all==${HINDSIGHT_VERSION}" \
+        "hindsight-api-slim[embedded-db,local-ml]==${HINDSIGHT_VERSION}" \
+        "hindsight-embed>=0.1.0" \
  && /opt/squire/hindsight-venv/bin/hindsight-api --help > /dev/null
 
 # ---------------------------------------------------------------------------
@@ -154,6 +175,20 @@ ENV PORT=8080 \
     SQUIRE_STATE_DIR=/opt/data/.squire \
     SQUIRE_HOME_TEMPLATE=/opt/squire/home-template
 
+# --- HOME is load-bearing, not cosmetic ------------------------------------
+# pg0 resolves its data root from $HOME: the embedded PostgreSQL cluster lands
+# in $HOME/.pg0/instances/hindsight/data. If HOME is anything other than the
+# mounted volume, the entire memory database sits on the container filesystem
+# and every Railway redeploy silently wipes the tenant's long-term memory —
+# the agent would forget the user, with no error anywhere.
+#
+# Upstream's main-wrapper.sh already exports HOME=/opt/data on the supervised
+# path, but relying on that is relying on an implementation detail of a
+# dependency we pin by digest and bump on a schedule. Setting it here makes it
+# ours. squire-entrypoint.sh additionally ASSERTS it before starting anything,
+# because a wrong value is silent and expensive.
+ENV HOME=/opt/data
+
 # --- Secrets ---------------------------------------------------------------
 # Plaintext credentials live ONLY here, and this is a tmpfs. /dev/shm is a
 # tmpfs in every OCI runtime with no extra capabilities required (mounting our
@@ -163,11 +198,22 @@ ENV SQUIRE_SECRETS_TMPFS=/dev/shm/squire \
     SQUIRE_SECRET_FILES=".env auth.json"
 
 # --- Telegram adapter, webhook mode ----------------------------------------
-# The adapter (plugins/platforms/telegram/adapter.py) switches to webhook mode
-# purely on TELEGRAM_WEBHOOK_URL being set, and derives its local listen path
-# from that URL's path component. control-api supplies the real public URL at
-# runtime; if it is absent the adapter falls back to long polling, which keeps
-# `docker run` local testing working with no ingress at all.
+# Supplied per tenant by control-api at provision time (NOT baked here):
+#
+#   TELEGRAM_BOT_TOKEN       enables the platform (gateway/config.py keys off it)
+#   TELEGRAM_WEBHOOK_URL     the PUBLIC ingress URL for this tenant's bot
+#   TELEGRAM_WEBHOOK_SECRET  shared with Telegram, ingress and this container
+#
+# The adapter switches to webhook mode purely on TELEGRAM_WEBHOOK_URL being set,
+# and derives its local listen path from that URL's path component. It then calls
+# setWebhook itself. That is safe precisely because control-api owns both the URL
+# and the secret: both writers register identical values, so the calls are
+# idempotent last-writer-wins rather than a fight, and ingress's stored secret
+# stays valid across tenant restarts. See squire-entrypoint.sh for the matching
+# logic and for the standalone-dev fallback when the secret is not supplied.
+#
+# With TELEGRAM_WEBHOOK_URL absent the adapter falls back to long polling, which
+# keeps `docker run` local testing working with no ingress at all.
 #
 # It binds 127.0.0.1 on purpose — the shim is the only thing that should own a
 # public port, so the adapter's HTTP server is unreachable except through it.
