@@ -100,7 +100,7 @@ def test_find_service_by_name(railway):
 @respx.mock
 def test_attach_volume(railway):
     route = respx.post(GQL).mock(return_value=gql_response({"volumeCreate": {"id": "vol-1"}}))
-    volume_id = railway.attach_volume("svc-1", "/root/.hermes")
+    volume_id = railway.attach_volume("svc-1", "/opt/data")
     assert volume_id == "vol-1"
 
     import json
@@ -110,7 +110,7 @@ def test_attach_volume(railway):
         "projectId": "proj-123",
         "environmentId": "env-123",
         "serviceId": "svc-1",
-        "mountPath": "/root/.hermes",
+        "mountPath": "/opt/data",
     }
 
 
@@ -124,7 +124,7 @@ def test_attach_volume_is_idempotent_when_railway_says_it_exists(railway):
             json={"errors": [{"message": "A volume already exists for this service"}]},
         )
     )
-    assert railway.attach_volume("svc-1", "/root/.hermes") is None
+    assert railway.attach_volume("svc-1", "/opt/data") is None
 
 
 @respx.mock

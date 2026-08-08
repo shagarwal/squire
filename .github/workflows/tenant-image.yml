@@ -21,6 +21,14 @@ on:
   pull_request:
     paths:
       - "tenant-image/**"
+      # A PR that only edits this workflow must still run it, or a broken check
+      # merges green and first fails on someone else's unrelated change.
+      - ".github/workflows/tenant-image.yml"
+      # The container-contract job asserts a cross-service constant that lives in
+      # control-api's config (the tenant volume mount path). Changing it there
+      # must re-run this workflow -- that drift is what made every provisioned
+      # tenant undeployable once already.
+      - "apps/control-api/src/control_api/config.py"
 
 env:
   # ghcr.io/<org>/<repo>/<image-name>
@@ -343,6 +351,17 @@ jobs:
           # on the volume or on ephemeral container storage. A redeploy with the
           # wrong value destroys every memory the tenant has, silently.
           check tenant-image/Dockerfile 'ENV HOME=/opt/data'
+          check tenant-image/Dockerfile 'HERMES_HOME=/opt/data'
+
+          # /opt/data is a CROSS-SERVICE CONSTANT, not just an image detail:
+          # control-api tells Railway to mount the tenant's volume at
+          # TENANT_VOLUME_MOUNT_PATH, and this image expects to find it there.
+          # They drifted once (control-api defaulted to /root/.hermes) and the
+          # result is not a degradation — the entrypoint's durability gate
+          # refuses to boot, so EVERY provisioned tenant would be dead on
+          # arrival. Pinned on both sides: here, and in control-api's
+          # tests/test_cross_service_contracts.py, which parses this file.
+          check apps/control-api/src/control_api/config.py 'tenant_volume_mount_path: str = "/opt/data"'
 
           # The base must be digest-pinned. A floating tag means upstream can
           # change what every tenant runs — and what the patch overlay is

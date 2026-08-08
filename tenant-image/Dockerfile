@@ -329,7 +329,21 @@ ENV PORT=8080 \
 # dependency we pin by digest and bump on a schedule. Setting it here makes it
 # ours. squire-entrypoint.sh additionally ASSERTS it before starting anything,
 # because a wrong value is silent and expensive.
-ENV HOME=/opt/data
+#
+# HERMES_HOME is set alongside it as the single source of truth for the Squire
+# scripts. Every one of them defaults to `${HERMES_HOME:-/opt/data}`, which meant
+# the real value was a literal repeated across six files; setting it here makes
+# those defaults a fallback for running the scripts outside a container rather
+# than six independent chances to disagree.
+#
+# All three of HOME, HERMES_HOME and SQUIRE_VOLUME must be the same path, and
+# must equal control-api's TENANT_VOLUME_MOUNT_PATH -- the volume Railway mounts.
+# apps/control-api/tests/test_cross_service_contracts.py reads this file and
+# fails if they drift; the container-contract job in tenant-image.yml pins them
+# too. A mismatch is not a degradation: the entrypoint's durability gate refuses
+# to boot, because pg0 would put the tenant's memory on ephemeral storage.
+ENV HOME=/opt/data \
+    HERMES_HOME=/opt/data
 
 # --- Secrets ---------------------------------------------------------------
 # Plaintext credentials live ONLY here, and this is a tmpfs. /dev/shm is a
@@ -453,6 +467,29 @@ ENV HINDSIGHT_API_LOG_LEVEL=warning \
 # SQUIRE_HEARTBEAT_INTERVAL seconds. 300s (5 min) against control-api's 900s
 # staleness window means a tenant has to miss three beats before /fleet calls it
 # stale — one missed beat is a redeploy, three is a problem.
+#
+# !! VERIFY ON THE FIRST LIVE DEPLOY — THIS INTERVAL MAY COST US GATE G1 !!
+# ---------------------------------------------------------------------------
+# Railway's serverless sleep is half of the unit-economics bet
+# (docs/implementation-plan.md §2, Gate G1): tenants are supposed to scale to zero
+# between conversations, and the whole $5/month price depends on them actually
+# doing so. A container that makes an outbound HTTPS request every 5 minutes may
+# never look idle to Railway — in which case this monitoring feature would
+# quietly destroy the economics it was added to measure. That is a genuinely
+# expensive way to be wrong, and it cannot be checked without the platform.
+#
+# What to check on the first real tenant, before onboarding anyone:
+#   1. Does Railway's sleep trigger on INBOUND request idleness only, or on any
+#      process activity / outbound traffic? (Docs say inbound; unverified.)
+#   2. Leave one provisioned tenant untouched for longer than the sleep window
+#      and confirm from Railway usage that it actually slept.
+#   3. If it did not: raise SQUIRE_HEARTBEAT_INTERVAL well above the sleep window
+#      (a sleeping tenant reports nothing anyway, and /fleet already treats
+#      silence as "stale"), or gate beats on there having been activity since the
+#      last one. Do NOT keep 300s and hope.
+#
+# control-api's HEARTBEAT_STALE_SECONDS must be raised alongside it (it is sized
+# at 3x this interval).
 #
 # Supplied per tenant by control-api, NOT baked here:
 #   CONTROL_API_URL, INTERNAL_API_TOKEN, TENANT_ID  (provisioning contract)
