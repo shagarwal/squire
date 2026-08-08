@@ -72,6 +72,27 @@ def test_trial_default_model_maps_to_haiku_via_env_api_key(config):
     )
 
 
+def test_claude_haiku_4_5_alias_present_for_hermes_agent(config):
+    """Load-bearing alias, not decorative: hermes-agent (tenant-image) does
+    not know about "trial-default" -- it sends whatever bare Anthropic model
+    id its own `hermes model anthropic:<id>` config was set to as the
+    `model` field on each request. Per config.yaml's model_list comments,
+    our best-guess match for that id is `claude-haiku-4-5`; without an
+    explicit model_name entry for it here, LiteLLM 400s on every trial
+    tenant request instead of silently misrouting one (which is the
+    intended fail-closed behavior -- but only useful if this entry exists to
+    catch the expected case)."""
+    entries = {m["model_name"]: m for m in config["model_list"]}
+    assert "claude-haiku-4-5" in entries, (
+        "config.yaml must expose a model_name literally called "
+        "'claude-haiku-4-5' as the hermes-agent-facing alias -- see the "
+        "TO-VERIFY comment above this model_list entry in config.yaml"
+    )
+    params = entries["claude-haiku-4-5"]["litellm_params"]
+    assert params["model"] == "anthropic/claude-haiku-4-5"
+    assert params["api_key"] == "os.environ/ANTHROPIC_API_KEY"
+
+
 def test_no_model_list_entry_hardcodes_a_non_haiku_anthropic_model(config):
     """Guard against silently widening the trial key's blast radius: every
     model this trial proxy can reach must resolve to a Haiku-class model.
@@ -108,6 +129,23 @@ def test_general_settings_database_url_wired_to_env(config):
         "LiteLLM's Postgres-backed key store; without this, control-api's "
         "POST /key/generate calls have nothing to persist a tenant's key, "
         "budget, or spend to"
+    )
+
+
+def test_prisma_schema_self_migration_explicitly_enabled(config):
+    """Virtual keys are useless without their Postgres tables existing. The
+    plain `litellm` image self-applies its Prisma schema on every normal
+    boot (confirmed against the pinned version's actual source -- see the
+    Dockerfile's version-pin comment), gated on this being false. It
+    defaults to false already, but is set explicitly here so that intent is
+    visible in the repo rather than relying on an undocumented library
+    default -- this test guards against someone flipping it (or a copied
+    snippet setting it true) by accident."""
+    gs = config.get("general_settings", {})
+    assert gs.get("disable_prisma_schema_update") is False, (
+        "general_settings.disable_prisma_schema_update must be explicitly "
+        "false -- true would stop the proxy from ever creating/updating "
+        "the virtual-keys schema on a fresh Postgres DB"
     )
 
 
