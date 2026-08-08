@@ -1,0 +1,208 @@
+name: deploy
+
+# Deploys the Railway-hosted app services (apps/*) — NOT tenant-image, which has
+# its own workflow (tenant-image.yml) and its own release cadence (git tags).
+#
+# - Automatic: push to main touching a service's directory -> deploy that service
+#   to the `squire-staging` Railway project, authenticated with RAILWAY_TOKEN_STAGING.
+# - Manual: workflow_dispatch, choose a service -> deploy that service to the
+#   `squire-prod` Railway project, authenticated with RAILWAY_TOKEN_PROD. Prod is
+#   intentionally never triggered by a plain push.
+#
+# Required GitHub secrets (repo or "staging"/"production" environment secrets —
+# not set yet as of Task 0.1; Railway project creation is being handled
+# separately, add these once the projects + service tokens exist):
+#   RAILWAY_TOKEN_STAGING — Railway CLI token scoped to the squire-staging project
+#   RAILWAY_TOKEN_PROD    — Railway CLI token scoped to the squire-prod project
+#
+# NOTE (Task 0.1, Phase 0): apps/control-api, apps/ingress, apps/trial-proxy, and
+# apps/web are currently empty placeholders (only a .gitkeep file — real code
+# lands in later tasks: 0.3, 0.4, 0.5, and Phase 1 respectively). Every deploy job
+# below has a "does this service have real content yet?" guard step and skips the
+# actual `railway up` when the directory is still just a placeholder, so this
+# workflow does not fail/block merges to main in the meantime.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/control-api/**"
+      - "apps/ingress/**"
+      - "apps/trial-proxy/**"
+      - "apps/web/**"
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service to deploy to production (squire-prod)"
+        required: true
+        type: choice
+        options:
+          - control-api
+          - ingress
+          - trial-proxy
+          - web
+
+jobs:
+  # Determines which service directories changed on this push, so each deploy
+  # job below only runs for the service(s) actually touched. Not used for
+  # workflow_dispatch runs — those explicitly name the service via the `service`
+  # input instead.
+  changes:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # NOTE: output/filter keys use underscores, not the services' hyphenated
+    # directory names — GitHub Actions expression dot-notation (e.g.
+    # `needs.changes.outputs.control-api`) parses `-` as subtraction, which
+    # would silently break these lookups. Bracket notation would also work,
+    # but underscores are simpler to read.
+    outputs:
+      control_api: ${{ steps.filter.outputs.control_api }}
+      ingress: ${{ steps.filter.outputs.ingress }}
+      trial_proxy: ${{ steps.filter.outputs.trial_proxy }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            control_api:
+              - 'apps/control-api/**'
+            ingress:
+              - 'apps/ingress/**'
+            trial_proxy:
+              - 'apps/trial-proxy/**'
+            web:
+              - 'apps/web/**'
+
+  deploy-control-api:
+    needs: changes
+    if: |
+      always() &&
+      ((github.event_name == 'push' && needs.changes.outputs.control_api == 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.service == 'control-api'))
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Placeholder guard: apps/control-api/ only has .gitkeep until Task 0.3.
+      - name: Check apps/control-api has real content
+        id: content-check
+        run: |
+          if [ -z "$(find apps/control-api -type f ! -name '.gitkeep')" ]; then
+            echo "has_content=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::apps/control-api is still an empty placeholder — skipping deploy."
+          else
+            echo "has_content=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Railway CLI
+        if: steps.content-check.outputs.has_content == 'true'
+        run: npm install -g @railway/cli
+
+      - name: railway up
+        if: steps.content-check.outputs.has_content == 'true'
+        working-directory: apps/control-api
+        env:
+          RAILWAY_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.RAILWAY_TOKEN_PROD || secrets.RAILWAY_TOKEN_STAGING }}
+        run: railway up --service control-api --ci
+
+  deploy-ingress:
+    needs: changes
+    if: |
+      always() &&
+      ((github.event_name == 'push' && needs.changes.outputs.ingress == 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.service == 'ingress'))
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Placeholder guard: apps/ingress/ only has .gitkeep until Task 0.4.
+      - name: Check apps/ingress has real content
+        id: content-check
+        run: |
+          if [ -z "$(find apps/ingress -type f ! -name '.gitkeep')" ]; then
+            echo "has_content=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::apps/ingress is still an empty placeholder — skipping deploy."
+          else
+            echo "has_content=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Railway CLI
+        if: steps.content-check.outputs.has_content == 'true'
+        run: npm install -g @railway/cli
+
+      - name: railway up
+        if: steps.content-check.outputs.has_content == 'true'
+        working-directory: apps/ingress
+        env:
+          RAILWAY_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.RAILWAY_TOKEN_PROD || secrets.RAILWAY_TOKEN_STAGING }}
+        run: railway up --service ingress --ci
+
+  deploy-trial-proxy:
+    needs: changes
+    if: |
+      always() &&
+      ((github.event_name == 'push' && needs.changes.outputs.trial_proxy == 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.service == 'trial-proxy'))
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Placeholder guard: apps/trial-proxy/ only has .gitkeep until Task 0.5.
+      - name: Check apps/trial-proxy has real content
+        id: content-check
+        run: |
+          if [ -z "$(find apps/trial-proxy -type f ! -name '.gitkeep')" ]; then
+            echo "has_content=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::apps/trial-proxy is still an empty placeholder — skipping deploy."
+          else
+            echo "has_content=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Railway CLI
+        if: steps.content-check.outputs.has_content == 'true'
+        run: npm install -g @railway/cli
+
+      - name: railway up
+        if: steps.content-check.outputs.has_content == 'true'
+        working-directory: apps/trial-proxy
+        env:
+          RAILWAY_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.RAILWAY_TOKEN_PROD || secrets.RAILWAY_TOKEN_STAGING }}
+        run: railway up --service trial-proxy --ci
+
+  deploy-web:
+    needs: changes
+    if: |
+      always() &&
+      ((github.event_name == 'push' && needs.changes.outputs.web == 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.service == 'web'))
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Placeholder guard: apps/web/ only has .gitkeep until Phase 1 (1A Signup web app).
+      - name: Check apps/web has real content
+        id: content-check
+        run: |
+          if [ -z "$(find apps/web -type f ! -name '.gitkeep')" ]; then
+            echo "has_content=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::apps/web is still an empty placeholder — skipping deploy."
+          else
+            echo "has_content=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Railway CLI
+        if: steps.content-check.outputs.has_content == 'true'
+        run: npm install -g @railway/cli
+
+      - name: railway up
+        if: steps.content-check.outputs.has_content == 'true'
+        working-directory: apps/web
+        env:
+          RAILWAY_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.RAILWAY_TOKEN_PROD || secrets.RAILWAY_TOKEN_STAGING }}
+        run: railway up --service web --ci

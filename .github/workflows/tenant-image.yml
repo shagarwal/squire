@@ -1,0 +1,92 @@
+name: tenant-image
+
+# Builds the hermes-tenant OCI image from tenant-image/.
+#
+# - On a pull_request touching tenant-image/**: build only (no push). Sanity-checks
+#   that the Dockerfile still builds before merge.
+# - On push of a tag matching tenant-image-v* (e.g. tenant-image-v0.1.0): build AND
+#   push to GHCR, tagged with the version from the git tag plus `latest`.
+#
+# NOTE (Task 0.1, Phase 0): tenant-image/ is currently an empty placeholder
+# (tenant-image/Dockerfile does not exist yet — it lands in Task 0.2). Every job
+# below starts with a "Dockerfile exists?" check step and skips the remaining
+# steps gracefully if it's missing, so this workflow does not fail/block the repo
+# in the meantime. Once Task 0.2 adds tenant-image/Dockerfile, the checks below
+# will start actually building the image with no further changes needed here.
+
+on:
+  push:
+    tags:
+      - "tenant-image-v*"
+  pull_request:
+    paths:
+      - "tenant-image/**"
+
+env:
+  # ghcr.io/<org>/<repo>/<image-name>
+  IMAGE_NAME: ghcr.io/shagarwal/squire/hermes-tenant
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Only meaningful once tenant-image/Dockerfile exists; we still let the job
+    # run so the "Dockerfile exists?" step can short-circuit with a clear log
+    # message rather than the workflow silently not appearing at all.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Graceful-skip guard: tenant-image/Dockerfile doesn't exist until Task 0.2.
+      # Rather than letting docker/build-push-action fail the job (and show the
+      # workflow as red on every PR/tag in the meantime), we detect this here and
+      # skip the build/push steps via each subsequent step's `if:` condition.
+      - name: Check tenant-image/Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f "tenant-image/Dockerfile" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tenant-image/Dockerfile not found yet (lands in Task 0.2) — skipping build."
+          fi
+
+      - name: Determine image tags
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # Strip the "tenant-image-v" prefix to get the bare version, e.g.
+            # tenant-image-v0.1.0 -> 0.1.0
+            VERSION="${GITHUB_REF_NAME#tenant-image-v}"
+            echo "tags=${IMAGE_NAME}:${VERSION},${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            # pull_request build: no registry push, just prove it builds.
+            echo "tags=${IMAGE_NAME}:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.dockerfile-check.outputs.exists == 'true' && steps.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on tag)
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: tenant-image/
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
