@@ -1,0 +1,17 @@
+{
+  "_comment": "Squire tenant Hindsight client config. Seeded on first boot only. mode=local_external points the in-gateway client at the hindsight-api daemon supervised alongside it in this container (see supervisord.conf), rather than local_embedded which would run the daemon inside the gateway process. That split is the core recommendation of docs/reference/hindsight-optimization-guide.md sections 1 and 5: an embedded daemon that OOMs takes the whole gateway with it, and a separate process can be restarted by the healthcheck loop without dropping the user's conversation. Daemon-side tuning (rrf reranker, worker slots, DB pool) is set as HINDSIGHT_API_* environment variables in the Dockerfile, because those are read by the daemon, not by this client.",
+  "mode": "local_external",
+  "api_url": "http://127.0.0.1:9177",
+  "bank_id": "hermes",
+  "recall_budget": "mid",
+  "memory_mode": "hybrid",
+  "auto_recall": true,
+  "auto_retain": true,
+  "retain_async": true,
+  "retain_every_n_turns": 1,
+  "recall_prefetch_method": "recall",
+  "recall_max_tokens": 3072,
+  "recall_types": "observation",
+  "retain_context": "personal assistant conversation between the agent and its user over a messaging app",
+  "bank_retain_mission": "Capture durable facts about this person: their name and preferred form of address, timezone and working hours, the people and projects that matter to them, standing preferences about how they want to be helped, and commitments either side has made. Skip small talk, one-off trivia, and anything the agent itself said unless it was a promise."
+}

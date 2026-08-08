@@ -90,3 +90,199 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ==========================================================================
+  # Patch-overlay + container-contract checks (added in Task 0.2)
+  # ==========================================================================
+  # Static counterpart to the patch discipline in
+  # docs/reference/hermes-update-plan-v2026.8.3.md §Phase 4 ("apply-patches.sh
+  # then grep the markers").
+  #
+  # The *semantic* marker enforcement — do the markers actually appear in the
+  # pinned upstream tree — happens inside the Docker build itself: the
+  # Dockerfile runs patches/verify-markers.sh right after applying the overlay,
+  # so a missing required marker fails the `build` job above and no bad image is
+  # ever published. That is the hard gate.
+  #
+  # This job is the fast, container-free half: it catches the mistakes that
+  # would otherwise only surface after a 20-minute image build — a malformed
+  # markers.tsv, a marker row pointing at a .patch file nobody committed, a
+  # shell script with a syntax error, a YAML/JSON template that does not parse.
+  # It runs independently of `build` (no `needs:`) so the existing build/push
+  # behaviour is completely unchanged.
+  patch-overlay-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same graceful-skip contract as the build job: this workflow must not go
+      # red on a branch where tenant-image/ is still a placeholder.
+      - name: Check tenant-image/ is populated
+        id: present
+        run: |
+          if [ -f "tenant-image/patches/markers.tsv" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tenant-image/patches/markers.tsv not found — skipping patch-overlay checks."
+          fi
+
+      - name: Shell syntax
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' f; do
+            echo "bash -n $f"
+            bash -n "$f"
+            found=$((found + 1))
+          done < <(find tenant-image -type f -name '*.sh' -print0)
+          echo "checked $found shell script(s)"
+          # A tenant-image with no shell scripts means the entrypoint or the
+          # patch overlay was deleted, which is never intentional.
+          test "$found" -gt 0
+
+      - name: Python syntax
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q tenant-image/bin
+          echo "python sources compile"
+
+      - name: Templates parse (YAML / JSON)
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, sys
+          import yaml  # PyYAML ships on ubuntu-latest runners
+
+          failures = []
+          root = pathlib.Path("tenant-image")
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              try:
+                  if path.suffix in (".yaml", ".yml"):
+                      yaml.safe_load(path.read_text())
+                  elif path.suffix == ".json":
+                      json.loads(path.read_text())
+                  else:
+                      continue
+              except Exception as exc:
+                  failures.append(f"{path}: {exc}")
+              else:
+                  print(f"ok  {path}")
+          if failures:
+              print("\n".join(f"FAIL {f}" for f in failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: markers.tsv is well formed
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys
+
+          patch_dir = pathlib.Path("tenant-image/patches")
+          markers = patch_dir / "markers.tsv"
+          errors, rows = [], 0
+          seen_ids = set()
+
+          for lineno, raw in enumerate(markers.read_text().splitlines(), 1):
+              line = raw.rstrip("\n")
+              if not line.strip() or line.lstrip().startswith("#"):
+                  continue
+              parts = line.split("\t")
+              if len(parts) != 4:
+                  errors.append(f"line {lineno}: expected 4 tab-separated columns, got {len(parts)}")
+                  continue
+              marker_id, target, pattern, required = (p.strip() for p in parts)
+              rows += 1
+              if not marker_id or not target or not pattern:
+                  errors.append(f"line {lineno}: empty id/file/pattern")
+              if marker_id in seen_ids:
+                  errors.append(f"line {lineno}: duplicate marker id {marker_id!r}")
+              seen_ids.add(marker_id)
+              if required not in ("required", "optional"):
+                  errors.append(
+                      f"line {lineno}: 4th column must be 'required' or 'optional', got {required!r}"
+                  )
+
+          if rows == 0:
+              errors.append("markers.tsv declares no markers — the upstream regression guard is disabled")
+
+          # Every committed .patch must have at least one marker row, or a patch
+          # can rot into a silent no-op after an upstream refactor. This is the
+          # file-disjoint / marker discipline from the update plan, enforced.
+          patches = sorted(p.name for p in patch_dir.glob("*.patch"))
+          for name in patches:
+              stem = name.split("-", 1)[0]
+              if not any(stem in m for m in seen_ids):
+                  errors.append(
+                      f"patch {name} has no corresponding marker row in markers.tsv "
+                      "(add one so an upstream refactor cannot silently void it)"
+                  )
+          print(f"{rows} marker row(s), {len(patches)} patch file(s): {patches or 'none (empty overlay)'}")
+
+          if errors:
+              print("\n".join(f"FAIL {e}" for e in errors), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: verify-markers.sh self-check
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          # Exercise the real script against a synthetic tree: one file that
+          # satisfies a marker and one that does not, proving it fails when it
+          # should. A marker checker that can only pass is not a checker.
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/tree/agent" "$tmp/patches"
+          printf 'def _to_oauth_wire_name(): pass\n' > "$tmp/tree/agent/ok.py"
+          cp tenant-image/patches/verify-markers.sh "$tmp/patches/"
+          printf 'ok\tagent/ok.py\t_to_oauth_wire_name\trequired\n' > "$tmp/patches/markers.tsv"
+          bash "$tmp/patches/verify-markers.sh" "$tmp/tree"
+
+          printf 'missing\tagent/ok.py\tthis_string_is_not_present\trequired\n' > "$tmp/patches/markers.tsv"
+          if bash "$tmp/patches/verify-markers.sh" "$tmp/tree"; then
+            echo "::error::verify-markers.sh passed a tree with a missing required marker"
+            exit 1
+          fi
+          echo "verify-markers.sh fails closed as expected"
+
+      - name: Secrets crypto selftest
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "cryptography>=45,<50"
+          # Round-trips AES-256-GCM, and asserts that a wrong key and a wrong
+          # AAD (the file-rename guard) both fail. See tenant-image/bin/
+          # squire_secrets.py::cmd_selftest.
+          python3 tenant-image/bin/squire_secrets.py selftest
+
+      - name: Container contract constants
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          # ingress, control-api and the tenant image are built in parallel
+          # against a fixed contract. Changing any of these is a breaking change
+          # for another service, so make it impossible to do by accident.
+          fail=0
+          check() {
+            if grep -qF -- "$2" "$1"; then
+              echo "ok   $2"
+            else
+              echo "::error::container contract violated — '$2' missing from $1"
+              fail=1
+            fi
+          }
+          check tenant-image/Dockerfile 'PORT=8080'
+          check tenant-image/Dockerfile 'SQUIRE_WEBHOOK_PATH=/webhook/telegram'
+          check tenant-image/Dockerfile 'SQUIRE_VOLUME=/opt/data'
+          check tenant-image/bin/squire-webhook-shim.py '"SQUIRE_WEBHOOK_PATH", "/webhook/telegram"'
+          exit "$fail"
