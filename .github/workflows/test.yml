@@ -65,6 +65,11 @@ jobs:
               - '.github/workflows/test.yml'
             trial_proxy:
               - 'apps/trial-proxy/**'
+              # The proxy's suite asserts a cross-service contract: the model id
+              # the tenant template requests must be a model_name this proxy
+              # exposes, or LiteLLM 400s every trial message. Changing the tenant
+              # template must therefore re-run this suite.
+              - 'tenant-image/home-template/config.yaml'
               - '.github/workflows/test.yml'
 
   # control-api's suite also covers the infra/ CLIs (its pyproject puts

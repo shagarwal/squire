@@ -36,20 +36,25 @@ model_list:
       model: anthropic/claude-haiku-4-5
       api_key: os.environ/ANTHROPIC_API_KEY
 
-  # TO VERIFY (flagged per task brief): hermes-agent (the tenant runtime,
-  # tenant-image/) does NOT know about "trial-default" — it's configured via
-  # its own `hermes model anthropic:<model-id>` mechanism (see
+  # VERIFIED 2026-08-08 (Task 0.6), was TO VERIFY: hermes-agent (the tenant
+  # runtime, tenant-image/) does NOT know about "trial-default" — it's
+  # configured via its own `hermes model anthropic:<model-id>` mechanism (see
   # docs/reference/AGENTS-SETUP.md, e.g. `hermes model anthropic:claude-sonnet-4-5`)
   # and sends that bare model id as the `model` field in its Anthropic-shaped
-  # request body. Whatever model id gets baked into the trial tenant's
-  # config (tenant-image / Task 0.2 territory, not this task) MUST exactly
-  # match a `model_name` entry here, or LiteLLM will 400 on an unrecognized
-  # model instead of silently routing it somewhere. Best guess, matching the
-  # Anthropic model id given in this task's brief, is `claude-haiku-4-5` —
-  # added below as an alias to the same underlying model/key. If the real
-  # tenant-image default model string differs (e.g. a dated snapshot id like
-  # `claude-haiku-4-5-20251001`), add another `model_name` entry here that
-  # mirrors it exactly.
+  # request body. Whatever model id gets baked into the trial tenant's config
+  # MUST exactly match a `model_name` entry here, or LiteLLM will 400 on an
+  # unrecognized model instead of silently routing it somewhere.
+  #
+  # THE CONTRACT, both sides now checked against each other:
+  #   tenant-image/home-template/config.yaml -> model: "anthropic:claude-haiku-4-5"
+  #   this file                              -> model_name: claude-haiku-4-5
+  # The provider prefix is stripped before the request, so the bare id the proxy
+  # receives is `claude-haiku-4-5` and the alias below matches it exactly. No
+  # dated snapshot id is involved on either side.
+  #
+  # tests/test_config.py::test_the_tenant_images_default_model_is_reachable reads
+  # the tenant template directly and fails if either side drifts — do not "fix" a
+  # mismatch by editing only one file.
   #
   # Deliberately NOT using LiteLLM's provider wildcard routing here (e.g.
   # `model_name: "anthropic/*"` -> `litellm_params.model: "anthropic/*"`,

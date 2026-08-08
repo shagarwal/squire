@@ -76,21 +76,69 @@ def test_claude_haiku_4_5_alias_present_for_hermes_agent(config):
     """Load-bearing alias, not decorative: hermes-agent (tenant-image) does
     not know about "trial-default" -- it sends whatever bare Anthropic model
     id its own `hermes model anthropic:<id>` config was set to as the
-    `model` field on each request. Per config.yaml's model_list comments,
-    our best-guess match for that id is `claude-haiku-4-5`; without an
-    explicit model_name entry for it here, LiteLLM 400s on every trial
-    tenant request instead of silently misrouting one (which is the
-    intended fail-closed behavior -- but only useful if this entry exists to
-    catch the expected case)."""
+    `model` field on each request. That id is `claude-haiku-4-5` (verified
+    against the tenant template by the test below); without an explicit
+    model_name entry for it here, LiteLLM 400s on every trial tenant request
+    instead of silently misrouting one (which is the intended fail-closed
+    behavior -- but only useful if this entry exists to catch the expected
+    case)."""
     entries = {m["model_name"]: m for m in config["model_list"]}
     assert "claude-haiku-4-5" in entries, (
         "config.yaml must expose a model_name literally called "
         "'claude-haiku-4-5' as the hermes-agent-facing alias -- see the "
-        "TO-VERIFY comment above this model_list entry in config.yaml"
+        "model-name contract comment above this model_list entry in config.yaml"
     )
     params = entries["claude-haiku-4-5"]["litellm_params"]
     assert params["model"] == "anthropic/claude-haiku-4-5"
     assert params["api_key"] == "os.environ/ANTHROPIC_API_KEY"
+
+
+# --- the cross-service half of the same contract ---------------------------
+TENANT_CONFIG_PATH = (
+    CONFIG_PATH.parent.parent.parent / "tenant-image" / "home-template" / "config.yaml"
+)
+
+
+def test_the_tenant_images_default_model_is_reachable_through_this_proxy():
+    """Close the loop the comment in config.yaml describes (Task 0.6).
+
+    The two files are owned by different tasks and edited by different people,
+    and nothing else connects them: a tenant asking for a model this proxy does
+    not list gets a 400 on its very first message, which looks to the user like
+    an agent that never worked at all. So assert the contract from both ends.
+
+    This reaches outside apps/trial-proxy on purpose. The alternative -- a
+    duplicated constant -- is exactly the drift this is meant to catch.
+    (`.github/workflows/test.yml` therefore also runs this suite when the tenant
+    template changes.)
+    """
+    if not TENANT_CONFIG_PATH.is_file():  # pragma: no cover - not in this checkout
+        pytest.skip(f"tenant template not present at {TENANT_CONFIG_PATH}")
+
+    with open(TENANT_CONFIG_PATH, "r", encoding="utf-8") as f:
+        tenant_config = yaml.safe_load(f)
+
+    requested = tenant_config.get("model")
+    assert requested, "the tenant template must pin a model"
+
+    # hermes' config is `provider:model`; the bare model id is what lands in the
+    # request body's `model` field, and that is what LiteLLM matches on.
+    provider, _, model_id = requested.partition(":")
+    assert provider == "anthropic", (
+        f"the tenant template requests provider {provider!r}; the trial proxy only "
+        "fronts Anthropic models"
+    )
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        proxy_config = yaml.safe_load(f)
+    names = {m["model_name"] for m in proxy_config["model_list"]}
+
+    assert model_id in names, (
+        f"tenant-image/home-template/config.yaml requests {requested!r}, so trial "
+        f"tenants send model={model_id!r} -- but this proxy only exposes {sorted(names)}. "
+        "LiteLLM would 400 every trial message. Add a model_name entry here (Haiku-"
+        "pinned, per the no-wildcard-routing rule) or change the tenant template."
+    )
 
 
 def test_no_model_list_entry_hardcodes_a_non_haiku_anthropic_model(config):
