@@ -1,0 +1,4 @@
+# Bot token batches are secrets -- never commit them.
+bots.txt
+*.tokens
+__pycache__/

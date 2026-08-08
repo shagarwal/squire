@@ -1,0 +1,100 @@
+"""A respx handler that fakes the Railway GraphQL endpoint.
+
+Railway multiplexes everything over one POST URL, so an ordered `side_effect` list
+would be extremely brittle. Instead we dispatch on the operation name embedded in
+the query string, which also lets tests assert "which mutations were called, with
+what" after the fact.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+import httpx
+
+GQL_URL = "https://backboard.railway.com/graphql/v2"
+
+
+@dataclass
+class FakeRailway:
+    """Stateful fake: records calls and lets tests force per-operation failures."""
+
+    existing_services: dict[str, str] = field(default_factory=dict)  # name -> id
+    calls: list[tuple[str, dict]] = field(default_factory=list)
+    fail_on: set[str] = field(default_factory=set)
+    latest_deployment_id: str | None = "dep-1"
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read())
+        query = payload["query"]
+        variables = payload.get("variables", {})
+        op = self._operation(query)
+        self.calls.append((op, variables))
+
+        if op in self.fail_on:
+            return httpx.Response(200, json={"errors": [{"message": f"forced failure: {op}"}]})
+
+        if op == "project":  # find_service_by_name
+            edges = [
+                {"node": {"id": sid, "name": name}}
+                for name, sid in self.existing_services.items()
+            ]
+            return self._ok({"project": {"services": {"edges": edges}}})
+
+        if op == "serviceCreate":
+            name = variables["input"]["name"]
+            sid = f"svc-{len(self.existing_services) + 1}"
+            self.existing_services[name] = sid
+            return self._ok({"serviceCreate": {"id": sid, "name": name}})
+
+        if op == "volumeCreate":
+            return self._ok({"volumeCreate": {"id": "vol-1"}})
+
+        if op == "variableCollectionUpsert":
+            return self._ok({"variableCollectionUpsert": True})
+
+        if op == "serviceInstanceUpdate":
+            return self._ok({"serviceInstanceUpdate": True})
+
+        if op == "serviceInstanceDeploy":
+            return self._ok({"serviceInstanceDeploy": True})
+
+        if op == "deployments":
+            edges = (
+                [{"node": {"id": self.latest_deployment_id, "status": "SUCCESS"}}]
+                if self.latest_deployment_id
+                else []
+            )
+            return self._ok({"deployments": {"edges": edges}})
+
+        if op == "deploymentStop":
+            return self._ok({"deploymentStop": True})
+
+        if op == "serviceDelete":
+            return self._ok({"serviceDelete": True})
+
+        raise AssertionError(f"unexpected Railway operation: {op}\n{query}")
+
+    # -- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _ok(data: dict) -> httpx.Response:
+        return httpx.Response(200, json={"data": data})
+
+    @staticmethod
+    def _operation(query: str) -> str:
+        """Extract the operation name (`mutation serviceCreate(...)` -> serviceCreate)."""
+        head = query.strip().split("{", 1)[0].strip()
+        head = head.removeprefix("mutation").removeprefix("query").strip()
+        return head.split("(")[0].strip()
+
+    def variables_for(self, op: str) -> dict:
+        """Last variables sent for a given operation."""
+        for name, variables in reversed(self.calls):
+            if name == op:
+                return variables
+        raise AssertionError(f"{op} was never called; saw {[c[0] for c in self.calls]}")
+
+    def operations(self) -> list[str]:
+        return [c[0] for c in self.calls]
