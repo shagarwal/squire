@@ -1,0 +1,127 @@
+# Squire — Phased Implementation Plan (Railway-first)
+
+> **For agentic workers:** This is a program-level roadmap. Phase 0 tasks are directly executable; each Phase 1/2 workstream gets its own detailed task-level plan (superpowers:writing-plans) when its phase begins. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ship **Squire** — "sign up → get a Telegram text → that's your agent" — as a paid product ($5/$10 early-bird, 3-day trial), per `prd.md` (this folder).
+
+**Architecture:** Everything that can run on Railway runs on Railway — control plane, ingress, trial proxy, and (pending the economics gate) the per-tenant agent runtimes as one-container-per-tenant Railway services with volumes. Claude operates Railway directly via the authenticated CLI + official MCP; no manual dashboard work required from Shaurya except one-time OAuth/account actions.
+
+**Tech Stack:** Railway (compute, Postgres, volumes, cron, serverless sleep), FastAPI control plane, Next.js signup page, LiteLLM trial proxy, hermes-agent tenant image (podman/OCI built in CI, deployed as Railway services), Stripe, AWS KMS, Backblaze B2, Telegram Bot API.
+
+---
+
+## 0. Tooling & operating model (DONE / one-offs)
+
+- [x] Railway CLI installed (v4.31.0) and authenticated as shaurya123@gmail.com — Claude drives Railway via `railway ... --json` in Bash.
+- [x] Official Railway MCP registered (`https://mcp.railway.com`, HTTP transport) — Shaurya: run `/mcp` once to complete OAuth when prompted.
+- [ ] Shaurya one-offs (only manual steps in the whole plan): upgrade Railway to **Pro** ($20/seat — needed for usage headroom and support), create Stripe account, create AWS account (KMS only), create Backblaze B2 bucket, create 1–2 Telegram accounts for the bot pool. Claude will prompt for each exactly when needed with `!`-prefixed commands where possible.
+
+**Division of labor from here on:** Claude executes (Railway provisioning, deploys, env vars, logs, debugging) and reports; Shaurya approves spend, does OAuth/browser-only steps, and scans QR-free (no QR anywhere in this product — that died with Baileys).
+
+---
+
+## 1. Railway platform mapping
+
+One Railway **project** per environment (`squire-prod`, `squire-staging`). Services:
+
+| Railway service | What | Notes |
+|---|---|---|
+| `web` | Next.js signup/billing/status page | Replaces Vercel |
+| `control-api` | FastAPI monolith: tenant registry, provisioning state machine, bot pool, Stripe webhooks | |
+| `control-db` | Railway Postgres | Replaces Supabase/Neon |
+| `ingress` | Telegram webhook router → tenant services (private networking) | Body-non-logging |
+| `trial-proxy` | LiteLLM + our Anthropic key, per-tenant virtual keys/budgets | |
+| `tenant-<id>` × N | **One service per tenant**: single container bundling hermes-gateway + Hindsight + embedded PG (supervisord), one Railway volume as `~/.hermes` | Created programmatically by `control-api` via Railway GraphQL API |
+
+**Provisioning is Railway-API-driven:** `control-api` calls Railway's GraphQL API to create/start/stop/delete `tenant-<id>` services — this replaces the PRD's per-host provisioner agent entirely. The PRD's placement table becomes a mirror of Railway state.
+
+**Irreducible non-Railway services** (each has no Railway equivalent): Stripe (payments), AWS KMS (per-tenant DEK wrapping + CloudTrail audit), Backblaze B2 (DEK-encrypted restic backups — Railway volumes are not backup storage), Telegram/BotFather (bot pool), an email sender (Resend, transactional only), DNS/domain (Cloudflare registrar, DNS only — no proxy needed, Railway terminates TLS).
+
+**Privacy note (PRD §4 honesty boundary, amended):** on Railway, Railway Inc. is a subprocessor — their platform can technically access containers and volumes, and TLS terminates at Railway's edge. The credential one-time link still never transits *our* shared services, and all at-rest secrets remain DEK-encrypted app-side; but the published privacy claim must name Railway as a subprocessor. LUKS/host-disk control from the PRD applies only if/when the data plane moves to Hetzner (Gate G1).
+
+---
+
+## 2. The economics gate (the one big Railway caveat)
+
+Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive always-on 1GB Hermes tenant ≈ **$12/mo — 2.4× our $5 price**. The plan bets on two levers, measured in Phase 0:
+
+1. **Footprint**: Hindsight/PG tuning (per `reference/hindsight-optimization-guide.md`) to get idle RSS ≤ 512MB.
+2. **Serverless sleep**: agents are idle 95%+; Railway scale-to-zero + webhook wake + Railway cron for scheduled jobs. Sleeping 90% of the time at 512MB ≈ **$1–2/mo/tenant**.
+
+**Gate G1 (end of Phase 0, hard commitment):** measure real per-tenant $/mo and wake-from-sleep latency across 10 alpha tenants.
+- **Pass** (≤ $3/tenant AND p95 wake ≤ 8s to first typing indicator): data plane stays on Railway through Phase 1; revisit at 500 tenants.
+- **Fail**: tenant data plane moves to Hetzner boxes (PRD §4 original design, provisioner agent revived); control plane, ingress, proxy, web all **stay on Railway** — no fragmentation of the app layer either way.
+
+**Also verify during Phase 0 (ask Railway support):** max services per project/environment (a 1,000-tenant fleet = 1,000+ services), GraphQL API rate limits on service creation, and whether serverless wake fires on private-network requests from `ingress`.
+
+---
+
+## 3. Phase 0 — Founder-scale alpha (weeks 1–6, 10 invited tenants)
+
+Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
+
+### Task 0.1 — Repos & CI skeleton
+- [x] GitHub repo `squire` created and linked to this folder (2026-08-07); grow into monorepo layout: `apps/web`, `apps/control-api`, `apps/ingress`, `tenant-image/`, `infra/`, `docs/`.
+- [ ] Create Railway projects `squire-staging`, `squire-prod` — Claude via `railway init` / MCP.
+- [ ] GitHub Actions: build + push `tenant-image` to GHCR on tag; deploy `web`/`control-api`/`ingress` to Railway on merge (Railway GitHub integration or `railway up` with service tokens).
+
+### Task 0.2 — Tenant image v0
+- [ ] Dockerfile: upstream hermes-agent pinned at current release tag + patch overlay applied at build (adapt `~/.hermes/patches/apply-patches.sh` + marker greps from `reference/hermes-update-plan-v2026.8.3.md` into a CI check) + supervisord running gateway + Hindsight daemon + embedded PG in one container.
+- [ ] Bake productized `~/.hermes` template: SOUL.md (de-personalized from Shaurya's), skills, config.yaml with Telegram adapter (webhook mode), Hindsight tuned per `reference/hindsight-optimization-guide.md`.
+- [ ] Concierge skill v1 (baked): greet → name/timezone → trial explainer → connect-your-LLM flow (state machine in config-adjacent file; 4 provider options with honest labels per PRD §2).
+- [ ] Secrets init shim: entrypoint decrypts DEK-encrypted `.env`/`auth.json` from volume into tmpfs before gateway start; DEK arrives via Railway service variable set per-tenant by `control-api` at creation (rotate = redeploy). *(Railway variables are visible to our API token — acceptable for alpha; Gate G2 below hardens this.)*
+- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s.
+
+### Task 0.3 — Control API v0 + provisioning
+- [ ] FastAPI + SQLModel on `control-db`: `tenants`, `bots`, `provision_jobs` tables.
+- [ ] Railway GraphQL client: create service from GHCR image, attach volume, set variables (bot token, DEK, ingress URL), deploy, delete. Idempotent state machine with retries.
+- [ ] Bot pool: manual BotFather batch (20 bots via Shaurya's Telegram) → tokens loaded via CLI script → `control-api` assigns + sets webhook to `ingress/<bot_id>`.
+- [ ] CLI command (`infra/provision.py`): `provision --email x@y.com` → tenant live + t.me link printed. **This is the alpha signup.**
+
+### Task 0.4 — Ingress v0
+- [ ] Thin FastAPI/uvicorn service: `POST /<bot_id>` → look up tenant → forward over Railway private networking → 200 to Telegram. No body logging (structural: log schema has no body field). Buffer-and-wake path for sleeping tenants.
+
+### Task 0.5 — Trial proxy v0
+- [ ] LiteLLM on Railway, virtual key per tenant, $2 budget / 75 msg/day / Haiku-class default; `control-api` creates/revokes keys on trial start / LLM-connect / expiry.
+
+### Task 0.6 — Alpha operations
+- [ ] Heartbeat: tenant emits counts-only metrics to `control-api`; `/fleet` status endpoint.
+- [ ] Nightly restic → B2, client-side encrypted with tenant DEK (runs in-container via Railway cron).
+- [ ] Upgrade drill: build image vN+1 → redeploy 1 canary tenant → verify → roll fleet via API loop. Rollback = redeploy previous image tag.
+- [ ] Onboard 10 invited alpha users. Run 2 weeks. **Measure G1.**
+
+---
+
+## 4. Phase 1 — Public beta (weeks 7–14, target ~300 tenants)
+
+Each workstream gets a detailed plan at kickoff. Exit criteria: stranger can sign up, trial, pay $5/$10, and churn — all untouched by us.
+
+- **1A Signup web app**: Next.js on Railway; Auth.js (email+password, Google); signup → `control-api` provision → "agent waking up" page with t.me deep link; status page (running/plan/connected-LLM only).
+- **1B Billing**: Stripe Checkout ($5 Starter / $10 Pro / annual $50/$100 push); 3-day trial state machine (no card) → hard stop at 72h (subscribe-link-only replies) → hibernate +48h (Railway service stop) → crypto-shred day 14 (delete service + volume + wrapped DEK); webhook-driven resume on payment.
+- **1C Credential one-time link**: tenant serves `GET /connect/<nonce>` on its Railway-provided domain; all 4 LLM paths (Anthropic/OpenAI × key/OAuth device-code); Telegram paste-fallback with immediate message delete; trial-proxy key revoked on connect.
+- **1D Gate G2 — secrets hardening**: move DEK delivery off Railway variables → `control-api` hands a one-time sealed token at boot; KMS decrypt only in-tenant; CloudTrail alerting; break-glass policy doc.
+- **1E Abuse & fair use**: one trial per Telegram ID, disposable-email block, velocity limits, egress allowlist for trial tenants, cron-frequency + storage quotas, anomaly auto-suspend.
+- **1F Fleet automation**: canary-ring rollout (ring 0 = our own tenants), bot-pool watermark alerts + BYO-bot nudge flow, synthetic signup canary in CI (<60s SLA).
+- **1G Launch checklist**: privacy page with honesty boundary (incl. Railway-as-subprocessor), ToS, GDPR deletion flow verified end-to-end, PRD §8 red-team checklist executed.
+
+## 5. Phase 2 — Expansion (weeks 15+)
+
+- **2A WhatsApp Cloud API** channel on Pro tier (programmatic numbers, 24h-window + template logic for cron output; re-check Meta's Oct 1 2026 in-window pricing before build).
+- **2B Tool connections** (Google Workspace, GitHub) via tenant-served OAuth callbacks.
+- **2C Density push**: hibernation tuning or Hetzner migration per G1; re-price when unit economics are proven (PRD §5.4 raise plan).
+- **2D Hardening**: SOC2-lite audit logging, status page, on-call rotation.
+
+---
+
+## 6. Verification (program level)
+
+- Every phase ends against PRD §8: synthetic signup <60s, isolation red-team, 4-path LLM switchover, upgrade drill with forced rollback, trial-cap hard stops.
+- G1 (economics) and G2 (secrets) are blocking gates — Phase 1 public launch does not happen without both resolved.
+- Weekly: infra $/tenant from Railway usage API vs. plan price; alert if trailing margin < 20%.
+
+## 7. Risk register (delta vs PRD §6)
+
+1. **Railway tenant economics** — the plan's biggest bet; bounded by G1 with a rehearsed Hetzner exit.
+2. **Railway service-count / API limits** — unverified; ask support in week 1 (Task 0.3 blocker if creation is rate-limited).
+3. **Wake latency UX** — sleeping tenants must feel alive; mitigation: ingress sends Telegram "typing…" action instantly on wake, before the gateway is up.
+4. **Railway as subprocessor** — weakens the "we can't see" claim vs self-managed hosts; disclosed honestly; Hetzner path restores it later.
