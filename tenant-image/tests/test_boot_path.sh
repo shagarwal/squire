@@ -33,6 +33,42 @@ check() { if [ "$2" = "1" ]; then echo "  PASS  $1"; else echo "  FAIL  $1 ${3:-
 yn() { if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
 says() { echo "$1" | grep -q "$2" && echo 1 || echo 0; }
 
+# assert_fatal <label> <output> <rc> <distinctive substring>
+#
+# A "refuses to boot" assertion has to prove the boot ACTUALLY DIED, not merely
+# that a scary-looking string appeared in the log. Substring-only checks are
+# mutation-blind: downgrading a `die` to a `log` leaves the message intact and
+# the assertion still passes, which is exactly the bug this helper exists to
+# close. So every fatality is checked three ways:
+#
+#   1. non-zero exit status  — the process really stopped
+#   2. 'starting supervisord' ABSENT — it stopped BEFORE launching services
+#   3. a distinctive substring — it stopped for the RIGHT reason, and the
+#      operator is told what to do
+#
+# (2) is the negation of the "dev run still reaches supervisord" assertion and
+# is what makes (3) unambiguous when a fatal path and a warning path share
+# wording.
+assert_fatal() {
+    local label="$1" out="$2" rc="$3" needle="$4"
+    check "$label: exits non-zero" \
+        "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" "rc=$rc"
+    check "$label: never starts services" \
+        "$([ "$(says "$out" 'starting supervisord')" = 0 ] && echo 1 || echo 0)"
+    check "$label: says why" "$(says "$out" "$needle")"
+}
+
+# Stub supervisord: a successful boot must be able to exit 0, otherwise the exit
+# status cannot distinguish "booted" from "refused" (the real binary does not
+# exist outside the image, so a bare exec would fail on EVERY path).
+STUB_SUPERVISORD="$ROOT/stub-supervisord"
+cat > "$STUB_SUPERVISORD" <<'STUB'
+#!/bin/sh
+echo "[stub-supervisord] would supervise: $*"
+exit 0
+STUB
+chmod +x "$STUB_SUPERVISORD"
+
 # Extra env for a single boot() call; reset by boot() after use.
 EXTRA_ENV=()
 
@@ -45,7 +81,7 @@ EXTRA_ENV=()
 # SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 because a tmpdir is not a real mount point and
 # TENANT_ID is set; that combination is a hard error in production by design.
 boot() {
-  local url="${1:-}"
+  local url="${1:-}" rc
   env -i PATH="$PATH" \
       HOME="$VOL" \
       HERMES_HOME="$VOL" \
@@ -56,19 +92,46 @@ boot() {
       SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
       SQUIRE_PYTHON="$(command -v python3)" \
       SQUIRE_BIN="$BIN" \
+      SQUIRE_SUPERVISORD="$STUB_SUPERVISORD" \
+      SQUIRE_SUPERVISORD_CONF="$IMAGE_ROOT/supervisord.conf" \
       SQUIRE_DEK="${SQUIRE_DEK_OVERRIDE:-$DEK}" \
       TENANT_ID=t-boot-test \
       ${url:+TELEGRAM_WEBHOOK_URL=$url} \
       "${EXTRA_ENV[@]}" \
       bash "$BIN/squire-entrypoint.sh" 2>&1
+  # Capture BEFORE the EXTRA_ENV reset — an assignment returns 0 and would
+  # otherwise mask the entrypoint's exit status entirely.
+  rc=$?
   EXTRA_ENV=()
+  return "$rc"
+}
+
+# raw_boot <env assignments...> — for cases that need to violate the defaults
+# boot() enforces (a wrong HOME, a missing volume, no DEK at all).
+raw_boot() {
+  env -i PATH="$PATH" \
+      SQUIRE_STATE_DIR="$VOL/.squire" \
+      SQUIRE_SECRETS_TMPFS="$TMPFS" \
+      SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
+      SQUIRE_PYTHON="$(command -v python3)" \
+      SQUIRE_BIN="$BIN" \
+      SQUIRE_SUPERVISORD="$STUB_SUPERVISORD" \
+      SQUIRE_SUPERVISORD_CONF="$IMAGE_ROOT/supervisord.conf" \
+      "$@" \
+      bash "$BIN/squire-entrypoint.sh" 2>&1
 }
 
 URL="https://ingress.example.com/webhook/telegram"
 
 echo "== 1. first boot on an empty volume =="
-out="$(boot "$URL")"
+out="$(boot "$URL")"; rc=$?
 echo "$out" | sed 's/^/    | /' | grep -E 'durability ok|first boot|seeded|TELEGRAM_WEBHOOK_SECRET|telegram webhook|complete' || true
+
+# The positive half of the exit-status contract: a healthy boot MUST exit 0 and
+# MUST reach supervisord. Without this, "non-zero == refused" would be
+# meaningless because every boot would be non-zero.
+check "healthy boot exits 0"            "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
+check "healthy boot reaches supervisord" "$(says "$out" 'starting supervisord')"
 
 check "template SOUL.md seeded"      "$(yn test -f "$VOL/SOUL.md")"
 check "template config.yaml seeded"  "$(yn test -f "$VOL/config.yaml")"
@@ -149,50 +212,49 @@ echo "== 6. wrong DEK must refuse to boot, not re-initialise =="
 rm -rf "${TMPFS:?}"/*
 # Assignment prefix INSIDE the substitution, so the override is scoped to this
 # one boot and does not leak into every later case.
-out="$(SQUIRE_DEK_OVERRIDE="$DEK2" boot "$URL")"
-check "refuses with a clear message" "$(says "$out" 'could not decrypt')"
+out="$(SQUIRE_DEK_OVERRIDE="$DEK2" boot "$URL")"; rc=$?
+assert_fatal "wrong DEK" "$out" "$rc" 'could not decrypt'
 check "sealed .env NOT destroyed"    "$(yn test -f "$VOL/.squire/secrets/.env.enc")"
 rm -rf "${TMPFS:?}"/*
-out="$(boot "$URL")"
+out="$(boot "$URL")"; rc=$?
 check "recovers with the correct DEK" "$(yn grep -q 'sk-ant-user-supplied' "$TMPFS/.env")"
+check "recovery boot exits 0"         "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
 
 echo "== 7. missing DEK must fail fast =="
-out="$(env -i PATH="$PATH" HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
-    SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 SQUIRE_STATE_DIR="$VOL/.squire" \
-    SQUIRE_SECRETS_TMPFS="$TMPFS" SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
-    SQUIRE_PYTHON="$(command -v python3)" SQUIRE_BIN="$BIN" \
-    bash "$BIN/squire-entrypoint.sh" 2>&1)"
-check "refuses without SQUIRE_DEK" "$(says "$out" 'SQUIRE_DEK missing')"
+out="$(raw_boot HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
+        SQUIRE_ALLOW_EPHEMERAL_VOLUME=1)"; rc=$?
+assert_fatal "missing SQUIRE_DEK" "$out" "$rc" 'SQUIRE_DEK missing'
 
 echo "== 8. durability assertions =="
 # HOME pointing anywhere but the volume means pg0 writes the PostgreSQL cluster
-# to ephemeral container storage. Must be fatal, and must say why.
-out="$(env -i PATH="$PATH" HOME="$ROOT/elsewhere" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
-    SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 SQUIRE_STATE_DIR="$VOL/.squire" \
-    SQUIRE_SECRETS_TMPFS="$TMPFS" SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
-    SQUIRE_PYTHON="$(command -v python3)" SQUIRE_BIN="$BIN" SQUIRE_DEK="$DEK" \
-    TENANT_ID=t-boot-test \
-    bash "$BIN/squire-entrypoint.sh" 2>&1)"
-check "HOME != volume is fatal" "$(says "$out" 'is not the mounted volume')"
-check "error names the real risk" "$(says "$out" 'long-term memory')"
+# to ephemeral container storage, and every redeploy silently destroys the
+# tenant's memory. Must be fatal, and must say why.
+out="$(raw_boot HOME="$ROOT/elsewhere" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
+        SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 SQUIRE_DEK="$DEK" TENANT_ID=t-boot-test)"; rc=$?
+assert_fatal "HOME != volume" "$out" "$rc" 'is not the mounted volume'
+check "HOME != volume names the real risk" "$(says "$out" 'long-term memory')"
 
-out="$(env -i PATH="$PATH" HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
-    SQUIRE_STATE_DIR="$VOL/.squire" \
-    SQUIRE_SECRETS_TMPFS="$TMPFS" SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
-    SQUIRE_PYTHON="$(command -v python3)" SQUIRE_BIN="$BIN" SQUIRE_DEK="$DEK" \
-    TENANT_ID=t-boot-test \
-    bash "$BIN/squire-entrypoint.sh" 2>&1)"
-check "provisioned tenant + unmounted volume is fatal" "$(says "$out" 'not a mount point')"
+# A provisioned tenant (TENANT_ID set) on storage that is not a mount point.
+# The needle is deliberately 'Attach the Railway volume' and NOT 'not a mount
+# point': the latter also appears in the non-fatal dev-mode warning below, so
+# grepping it would pass even with this whole branch deleted.
+out="$(raw_boot HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
+        SQUIRE_DEK="$DEK" TENANT_ID=t-boot-test)"; rc=$?
+assert_fatal "provisioned tenant + unmounted volume" "$out" "$rc" 'Attach the Railway volume'
 
 # No TENANT_ID == local dev. Must warn, not die.
 rm -rf "${TMPFS:?}"/*
-out="$(env -i PATH="$PATH" HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
-    SQUIRE_STATE_DIR="$VOL/.squire" \
-    SQUIRE_SECRETS_TMPFS="$TMPFS" SQUIRE_HOME_TEMPLATE="$IMAGE_ROOT/home-template" \
-    SQUIRE_PYTHON="$(command -v python3)" SQUIRE_BIN="$BIN" SQUIRE_DEK="$DEK" \
-    bash "$BIN/squire-entrypoint.sh" 2>&1)"
+out="$(raw_boot HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
+        SQUIRE_DEK="$DEK")"; rc=$?
 check "dev run without a volume warns and continues" "$(says "$out" 'state is EPHEMERAL')"
 check "dev run still reaches supervisord" "$(says "$out" 'starting supervisord')"
+check "dev run exits 0"                   "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
+
+# The override must actually work, or operators cannot unblock themselves.
+out="$(raw_boot HOME="$VOL" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
+        SQUIRE_ALLOW_EPHEMERAL_VOLUME=1 SQUIRE_DEK="$DEK" TENANT_ID=t-boot-test)"; rc=$?
+check "SQUIRE_ALLOW_EPHEMERAL_VOLUME overrides the hard fail" \
+    "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
 
 echo "== 9. polling mode when no webhook URL is supplied =="
 rm -rf "${TMPFS:?}"/*

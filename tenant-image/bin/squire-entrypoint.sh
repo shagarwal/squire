@@ -36,6 +36,15 @@ SQUIRE_PYTHON="${SQUIRE_PYTHON:-/opt/squire/venv/bin/python}"
 SQUIRE_BIN="${SQUIRE_BIN:-/opt/squire/bin}"
 SECRETS_TOOL="$SQUIRE_PYTHON $SQUIRE_BIN/squire_secrets.py"
 
+# The final exec target, same override rationale. Making this substitutable is
+# what lets the boot test distinguish "booted successfully" (exit 0) from
+# "refused to boot" (non-zero) — without it every test boot ends in a failed
+# exec and the exit status carries no signal at all, which is precisely how the
+# fatality assertions in tests/test_boot_path.sh managed to pass against a
+# non-fatal entrypoint.
+SQUIRE_SUPERVISORD="${SQUIRE_SUPERVISORD:-/opt/squire/venv/bin/supervisord}"
+SQUIRE_SUPERVISORD_CONF="${SQUIRE_SUPERVISORD_CONF:-/opt/squire/supervisord.conf}"
+
 VOLUME_PATH="${SQUIRE_VOLUME:-/opt/data}"
 
 log "tenant=${TENANT_ID:-<unset>} hermes_home=$HERMES_HOME home=${HOME:-<unset>} port=${PORT:-8080}"
@@ -339,4 +348,4 @@ fi
 "$SQUIRE_BIN/squire-secrets-sync.sh" --once || log "warning: initial reseal failed"
 
 log "starting supervisord"
-exec /opt/squire/venv/bin/supervisord -n -c /opt/squire/supervisord.conf
+exec "$SQUIRE_SUPERVISORD" -n -c "$SQUIRE_SUPERVISORD_CONF"
