@@ -29,9 +29,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Only meaningful once tenant-image/Dockerfile exists; we still let the job
-    # run so the "Dockerfile exists?" step can short-circuit with a clear log
-    # message rather than the workflow silently not appearing at all.
     permissions:
       contents: read
       packages: write
@@ -43,6 +40,9 @@ jobs:
       # Rather than letting docker/build-push-action fail the job (and show the
       # workflow as red on every PR/tag in the meantime), we detect this here and
       # skip the build/push steps via each subsequent step's `if:` condition.
+      # The job itself still runs (rather than being gated off entirely) so this
+      # "Dockerfile exists?" step can short-circuit with a clear log message,
+      # instead of the workflow silently not appearing at all.
       - name: Check tenant-image/Dockerfile exists
         id: dockerfile-check
         run: |
