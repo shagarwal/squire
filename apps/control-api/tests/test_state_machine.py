@@ -137,6 +137,8 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
     assert sent["PORT"] == "8080"
+    # No CONTROL_API_INTERNAL_URL configured in this environment -> falls back to
+    # the public URL rather than handing every tenant an empty string.
     assert sent["CONTROL_API_URL"] == "https://control-api.squire.test"
     assert sent["ANTHROPIC_BASE_URL"] == "https://trial-proxy.squire.test"
     assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
@@ -147,6 +149,31 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         assert provisioning.get_tenant(s, tenant_id).image_ref == sent["SQUIRE_IMAGE_REF"]
     # DEK is exactly 32 random bytes, base64 encoded.
     assert len(base64.b64decode(sent["SQUIRE_DEK"])) == 32
+
+
+@respx.mock
+def test_tenants_are_pointed_at_the_private_control_api_when_one_is_configured(
+    pool_bot, fake_railway, monkeypatch
+):
+    """Tenant -> control-api traffic (a heartbeat from every container every five
+    minutes, plus trial-key revocation) should stay on Railway's private network
+    rather than leaving it and being billed as egress at both ends."""
+    from control_api import config
+
+    monkeypatch.setenv("CONTROL_API_INTERNAL_URL", "http://control-api.railway.internal:8080")
+    config.get_settings.cache_clear()
+    try:
+        mock_all(fake_railway)
+        with db.session_scope() as s:
+            _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+            job_id = job.id
+        with db.session_scope() as s:
+            provisioning.advance_job(s, job_id)
+
+        sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+        assert sent["CONTROL_API_URL"] == "http://control-api.railway.internal:8080"
+    finally:
+        config.get_settings.cache_clear()
 
 
 @respx.mock

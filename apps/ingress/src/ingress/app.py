@@ -87,6 +87,22 @@ def create_app(
     app.state.buffer = buffer
     app.state.client = client
 
+    @app.get("/healthz", tags=["ops"])
+    async def healthz() -> dict[str, str]:
+        """Unauthenticated liveness probe for Railway.
+
+        Same shape and path as control-api's, deliberately: an operator should not
+        have to remember which of our services calls it /healthz and which /health.
+
+        LIVENESS, NOT READINESS. It reports that this process is up and serving --
+        it does NOT check control-api or any tenant. That is the right contract for
+        a platform probe: ingress stays useful when control-api is briefly
+        unreachable (it answers Telegram 200 and logs loudly rather than
+        retry-storming), and a probe that went red on a dependency's blip would
+        have the platform restart a healthy router mid-incident.
+        """
+        return {"status": "ok"}
+
     @app.post("/telegram/{bot_id}")
     async def telegram_webhook(
         bot_id: int,

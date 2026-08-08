@@ -25,6 +25,17 @@ Polling a sleeping tenant would wake it, which would defeat the thing being
 measured. A push costs one request per interval from a container that is awake
 anyway, and silence is itself the signal — `/fleet` reports a missing heartbeat.
 
+!! UNVERIFIED ASSUMPTION, AND AN EXPENSIVE ONE IF WRONG !!
+The paragraph above assumes Railway's sleep is driven by INBOUND request
+idleness, so our outbound beat does not keep the container awake. If sleep is
+instead triggered by any process/network activity, then beating every 5 minutes
+means no tenant ever sleeps — and this monitoring feature would silently destroy
+the unit economics (Gate G1) it exists to measure. Verify on the first live
+deploy: leave one tenant idle past the sleep window and confirm from Railway
+usage that it slept. If it did not, raise SQUIRE_HEARTBEAT_INTERVAL above the
+sleep window or gate beats on activity since the last one. See the matching note
+in tenant-image/Dockerfile.
+
 EVERY COLLECTOR FAILS INDEPENDENTLY
 -----------------------------------
 Each one returns None on any error and the field is simply omitted. A tenant that
@@ -137,6 +148,13 @@ PAYLOAD_FIELDS = {
     "hindsight_ops_failed",
     "backup_last_success_age_seconds",
 }
+
+#: control-api's HeartbeatRequest caps image_ref at 512 characters. One
+#: over-long value would 422 the ENTIRE beat -- losing the liveness signal and
+#: every counter with it -- so truncate rather than let a malformed reference
+#: blind the fleet view for that tenant. A ref this long is already broken; the
+#: heartbeat is not the place to find out.
+MAX_IMAGE_REF_LEN = 512
 
 START_MONOTONIC = time.monotonic()
 
@@ -306,7 +324,7 @@ def build_payload() -> dict:
         "hindsight_up": hindsight_up(),
     }
     if IMAGE_REF:
-        payload["image_ref"] = IMAGE_REF
+        payload["image_ref"] = IMAGE_REF[:MAX_IMAGE_REF_LEN]
 
     rss = memory_rss_mb()
     if rss is not None:

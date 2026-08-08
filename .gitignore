@@ -45,3 +45,6 @@ Thumbs.db
 # --- Logs / local scratch ---
 *.log
 .tmp/
+
+# --- Agent tooling (Claude Code worktrees, session state) ---
+.claude/

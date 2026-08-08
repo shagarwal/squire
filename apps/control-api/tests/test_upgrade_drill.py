@@ -78,7 +78,10 @@ def mock_fleet(*sequence: httpx.Response):
 
 
 def mock_redeploy(
-    tenant_id: str, response: httpx.Response | None = None, image_ref: str = NEW
+    tenant_id: str,
+    response: httpx.Response | None = None,
+    image_ref: str = NEW,
+    deployed: bool = True,
 ):
     return respx.post(f"{API}/internal/tenants/{tenant_id}/redeploy").mock(
         return_value=response
@@ -87,7 +90,7 @@ def mock_redeploy(
             json={
                 "tenant_id": tenant_id,
                 "image_ref": image_ref,
-                "deployment_triggered": True,
+                "deployment_triggered": deployed,
             },
         )
     )
@@ -209,6 +212,79 @@ def test_dry_run_issues_no_redeploys(capsys):
     assert code == 0
     assert not route.called
     assert "would redeploy" in capsys.readouterr().out
+
+
+@respx.mock
+def test_a_tenant_that_is_not_started_is_not_waited_for(capsys):
+    """control-api updates a STOPPED tenant's image but does not start it.
+
+    Such a tenant will never heartbeat, so waiting for convergence would burn the
+    full 600s timeout and then report a failure that is really a correct refusal
+    to resurrect a container the product switched off.
+    """
+    mock_redeploy("t-1")
+    mock_redeploy("t-2", deployed=False)
+    mock_fleet(
+        fleet_response(row("t-1", reported=NEW), row("t-2")),
+        fleet_response(row("t-1", reported=NEW), row("t-2")),
+    )
+
+    code = upgrade_drill.main(
+        [*ARGS, *IMPATIENT, "--image-tag", "v2", "--canary", "t-1", "--roll"]
+    )
+    assert code == 0, "a deliberately-not-started tenant is not a drill failure"
+    out = capsys.readouterr().out
+    assert "not started (tenant is stopped)" in out
+    assert "FAILED" not in out
+
+
+# ---------------------------------------------------------------------------
+# The image comparator
+# ---------------------------------------------------------------------------
+
+
+def test_one_comparator_is_used_for_skipping_and_for_verifying():
+    """The skip check and the convergence check must agree.
+
+    They used to differ -- loose suffix matching when deciding whether to skip a
+    tenant, exact matching when deciding whether it converged -- so the same
+    tenant could be counted as "already there" and "did not converge" in one run.
+    """
+    fresh = {"heartbeat_fresh": True, "reported_image_ref": NEW}
+
+    assert upgrade_drill.on_image(fresh, NEW) is True  # full reference
+    assert upgrade_drill.on_image(fresh, "v2") is True  # bare tag
+    assert upgrade_drill.on_image(fresh, "v1") is False
+
+    # Suffix matching used to accept both of these. Neither is the target tag.
+    assert upgrade_drill.on_image(fresh, "2") is False
+    assert (
+        upgrade_drill.on_image(
+            {"heartbeat_fresh": True, "reported_image_ref": "ghcr.io/o/i:pre-v2"}, "v2"
+        )
+        is False
+    )
+    # A repository whose NAME ends in the tag is not a tenant running that tag.
+    assert (
+        upgrade_drill.on_image(
+            {"heartbeat_fresh": True, "reported_image_ref": "ghcr.io/o/thing-v2"}, "v2"
+        )
+        is False
+    )
+
+    # A stale heartbeat is never "on" anything: the old container's last beat
+    # stays inside the freshness window for minutes after a redeploy.
+    assert upgrade_drill.on_image({"heartbeat_fresh": False, "reported_image_ref": NEW}, NEW) is False
+    # A tenant that has never reported an image cannot be assumed converged.
+    assert upgrade_drill.on_image({"heartbeat_fresh": True, "reported_image_ref": None}, "v2") is False
+    assert upgrade_drill.on_image(None, "v2") is False
+
+
+def test_tag_extraction_handles_registry_ports_and_digests():
+    assert upgrade_drill.tag_of("ghcr.io/org/img:v2") == "v2"
+    assert upgrade_drill.tag_of("ghcr.io:443/org/img:v2") == "v2"
+    assert upgrade_drill.tag_of("ghcr.io:443/org/img") == ""
+    assert upgrade_drill.tag_of("ghcr.io/org/img@sha256:" + "a" * 64) == ""
 
 
 # ---------------------------------------------------------------------------

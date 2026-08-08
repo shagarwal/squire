@@ -167,8 +167,25 @@ states:
     goal: Confirm and get out of the way.
     say:
       - Confirm which provider is now live, in one line.
-      - Note that the trial key has been revoked and their traffic goes direct.
+      - Note that their own key is in use from now on, so the trial's caps no
+        longer apply to them.
       - Offer one concrete thing you can now do better. Then stop talking.
+    notes: >
+      DO NOT say the trial key "has been revoked" or that their traffic "now goes
+      direct". Neither is true yet: nothing calls
+      `POST /internal/tenants/<id>/revoke-trial-key` until Phase 1 workstream 1C
+      (docs/implementation-plan.md §4) builds the connect flow, so at this point
+      our trial key still exists on the proxy — it is simply no longer the
+      credential this tenant uses.
+
+      The wording above is the honest version of the same good news: their key is
+      live, our caps stop applying. It stays true both before and after 1C ships,
+      so this line does not need revisiting then.
+
+      This matters more than it looks. "Your traffic never touches our
+      infrastructure" is a load-bearing product promise (PRD §2), and an agent
+      that announces it a release early is not a copy problem — it is the product
+      telling a user something false about where their data goes.
     then: complete
 
   complete:

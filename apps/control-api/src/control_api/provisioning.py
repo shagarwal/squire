@@ -487,7 +487,10 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         "TELEGRAM_WEBHOOK_SECRET": bot.webhook_secret,
         "ANTHROPIC_BASE_URL": settings.effective_trial_base_url,
         "ANTHROPIC_API_KEY": trial_key or "",
-        "CONTROL_API_URL": settings.control_api_url,
+        # The PRIVATE address when one is configured (see `control_api_internal_url`).
+        # Every tenant beats every 5 minutes; there is no reason for that to leave
+        # Railway's private network and be billed as egress at both ends.
+        "CONTROL_API_URL": settings.effective_control_api_url,
         "INTERNAL_API_TOKEN": settings.internal_api_token,
         "PORT": str(settings.tenant_port),
         # What image this container is running, echoed back on every heartbeat.
@@ -532,10 +535,16 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
     # Only now is the key safely delivered; dropping it any earlier risks losing it.
     _pop_trial_key(tenant.id)
 
-    # Confirm the variable actually landed before claiming `dek_set`. The upsert's
-    # exact input shape is MEDIUM-confidence (unverified against live Railway), and
-    # a 200 on a mutation we mis-shaped would otherwise leave us believing a DEK
-    # exists when it does not. NAMES ONLY -- values are never read back or logged.
+    # Confirm the variable actually landed before claiming `dek_set`.
+    #
+    # `variableCollectionUpsert` is HIGH confidence (verbatim from Railway's API
+    # cookbook -- see the confidence table in clients/railway.py), so this is not
+    # hedging against a mis-shaped mutation. It guards the failure that stays
+    # silent either way: GraphQL answers 200 even when it reports errors, and a
+    # partially-applied upsert would leave us recording `dek_set=True` for a
+    # service that has no DEK -- a tenant that then refuses to boot with no clue
+    # why. Cheap check, catastrophic thing to get wrong.
+    # NAMES ONLY -- values are never read back or logged.
     if dek is not None:
         if not _confirm_variable_present(clients, tenant, "SQUIRE_DEK"):
             raise ProvisioningError(

@@ -30,6 +30,9 @@ on:
       - "apps/ingress/**"
       - "apps/trial-proxy/**"
       - "apps/web/**"
+      # Editing the deploy workflow itself must trigger it, or a change to how we
+      # deploy sits unexercised until the next unrelated service change.
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
     inputs:
       service:

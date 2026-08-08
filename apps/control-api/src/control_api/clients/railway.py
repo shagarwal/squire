@@ -114,6 +114,14 @@ class RailwayClient:
 
         Used before `serviceCreate` so a crash between "Railway created it" and
         "we committed the id" doesn't leave an orphan and then bill for a twin.
+
+        Project-scoped with no `environmentId`, which is correct rather than an
+        oversight: in Railway's model a SERVICE belongs to a project and has one
+        instance per environment, so a service id is not environment-specific and
+        there is nothing to disambiguate. Names are unique per project and ours
+        embed the tenant id (`tenant-<id>`), so a match is unambiguous. The
+        environment only enters when we configure or deploy an instance, and both
+        of those paths do pass `environmentId`.
         """
         # `first: 500` because a 1,000-tenant fleet is 1,000+ services and the
         # default page size would silently hide ours, causing a duplicate create.
@@ -195,7 +203,22 @@ class RailwayClient:
     def delete_service(self, service_id: str) -> bool:
         """Destroy the service and its deployments. Idempotent: an already-deleted
         service reports success-as-False rather than raising, because deletion is
-        the crypto-shred path and must be safe to re-run."""
+        the crypto-shred path and must be safe to re-run.
+
+        DELIBERATELY NOT ENVIRONMENT-SCOPED, and this is the one place where that
+        needs saying out loud. `serviceDelete` accepts an optional `environmentId`,
+        and passing it would be the safer-looking choice -- but it changes the
+        meaning of the call: it deletes that environment's service INSTANCE rather
+        than the service. The volume would survive, and with it the tenant's data.
+        Crypto-shred requires the service and its volume to be gone, so the
+        unscoped form is the correct one here.
+
+        The cross-environment risk that scoping would guard against does not exist
+        in this architecture: staging and prod are separate Railway PROJECTS
+        (`railway_project_id`), not two environments of one project, and this
+        client is bound to a single project. There is no path from a prod call to
+        a staging service.
+        """
         mutation = """
         mutation serviceDelete($id: String!) {
           serviceDelete(id: $id)
@@ -220,6 +243,11 @@ class RailwayClient:
         Railway's duplicate-volume error text (`_ALREADY_EXISTS_HINTS`); if Railway
         words that error differently, a retry would otherwise burn every attempt and
         hard-fail an otherwise healthy tenant.
+
+        No `environmentId` for the same reason as `find_service_by_name`, plus a
+        stronger one: the match here is on `serviceId`, which is already unique
+        within the project. Filtering by environment could only ever narrow a set
+        that has at most one member.
         """
         query = """
         query project($id: String!) {
