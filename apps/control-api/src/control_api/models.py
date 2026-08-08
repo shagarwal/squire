@@ -109,6 +109,12 @@ class Tenant(SQLModel, table=True):
     railway_service_name: str | None = None
     railway_volume_id: str | None = None
 
+    # The container image reference control-api last set on this tenant's service.
+    # This is the *desired* state; what the tenant actually reports running lives on
+    # its `Heartbeat` row. The upgrade drill (infra/upgrade_drill.py) compares the
+    # two to decide whether a canary really converged onto vN+1.
+    image_ref: str | None = None
+
     # Private-network base URL ingress forwards to, e.g.
     # http://tenant-<id>.railway.internal:8080
     internal_url: str | None = None
@@ -124,6 +130,56 @@ class Tenant(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class Heartbeat(SQLModel, table=True):
+    """Latest self-reported state of one tenant container (Task 0.6).
+
+    **Latest-state, not a time series.** One row per tenant, overwritten on every
+    beat. A history table would be a slow-growing pile of per-tenant behavioural
+    data in the control plane, which is precisely what PRD §4 says we do not keep;
+    it would also need a retention policy nobody would remember to write. If we
+    ever want trends, they belong in a metrics system outside the control DB.
+
+    **Counts and gauges only.** Every column below is an integer, a boolean, or the
+    image reference the container was handed. There is deliberately no room for a
+    chat id, a message preview, an error string, or a free-form JSON blob -- the
+    tenant is the only thing that sees conversation content, and the ingest schema
+    (`schemas.HeartbeatRequest`, `extra="forbid"`) rejects anything else at the door.
+
+    `updates_*` count Telegram *updates* the tenant's webhook shim handled, by
+    outcome. They are cumulative since the container started, so they reset on every
+    redeploy -- read them alongside `uptime_seconds`.
+    """
+
+    tenant_id: str = Field(primary_key=True, foreign_key="tenant.id")
+    received_at: datetime = Field(default_factory=utcnow, index=True)
+
+    # Seconds since the emitter started == roughly the container's age. A value that
+    # went backwards is how you tell a tenant restarted between two beats.
+    uptime_seconds: int = 0
+    #: What the container says it is running (SQUIRE_IMAGE_REF, set at redeploy).
+    #: None for tenants provisioned before their first drill-driven redeploy.
+    image_ref: str | None = None
+
+    gateway_up: bool = False
+    hindsight_up: bool = False
+
+    # Gauges for the G1 economics gate: RSS is container-wide (cgroup), the volume
+    # figures come from statvfs on the mount.
+    memory_rss_mb: int | None = None
+    volume_used_mb: int | None = None
+    volume_total_mb: int | None = None
+
+    updates_forwarded: int | None = None
+    updates_failed: int | None = None
+    updates_rejected: int | None = None
+
+    # Hindsight's async_operations queue depth, by status. None means the tenant
+    # could not read its own memory DB -- distinct from "the queue is empty".
+    hindsight_ops_pending: int | None = None
+    hindsight_ops_processing: int | None = None
+    hindsight_ops_failed: int | None = None
 
 
 class ProvisionJob(SQLModel, table=True):

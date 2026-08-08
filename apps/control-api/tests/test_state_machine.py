@@ -368,6 +368,76 @@ def test_a_stale_claim_is_reclaimed(pool_bot, fake_railway):
 
 
 @respx.mock
+def test_advance_does_not_sweep_the_fleet_for_a_finished_job(pool_bot, fake_railway, monkeypatch):
+    """`infra/provision.py` polls /advance in a loop, including after the job is DONE.
+
+    Each of those calls used to run a fleet-wide `UPDATE provisionjob` that could not
+    possibly change a terminal job's answer. Gate it: only a job stuck in RUNNING can
+    need reclaiming, and the background sweeper still reclaims fleet-wide on its tick.
+    """
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        assert provisioning.advance_job(s, job_id).status == JobStatus.DONE
+
+    calls = []
+    real_reclaim = provisioning.reclaim_stale_jobs
+    monkeypatch.setattr(
+        provisioning,
+        "reclaim_stale_jobs",
+        lambda session: (calls.append(1), real_reclaim(session))[1],
+    )
+
+    with db.session_scope() as s:
+        assert provisioning.advance_job(s, job_id, force=True).status == JobStatus.DONE
+    assert calls == [], "a terminal job must not trigger the stale-claim sweep"
+
+    # ...but a job stranded in RUNNING still gets its reclaim, or it never recovers.
+    with db.session_scope() as s:
+        job = provisioning.get_job(s, job_id)
+        job.status = JobStatus.RUNNING
+        job.updated_at = datetime.now(timezone.utc) - timedelta(
+            seconds=provisioning.STALE_CLAIM_SECONDS + 60
+        )
+        s.add(job)
+        s.commit()
+    with db.session_scope() as s:
+        assert provisioning.advance_job(s, job_id, force=True).status == JobStatus.DONE
+    assert calls, "a RUNNING job must still be reclaimable through /advance"
+
+
+@respx.mock
+def test_set_variables_refuses_to_deploy_a_tenant_with_no_dek(
+    pool_bot, fake_railway, monkeypatch
+):
+    """SQUIRE_DEK is omitted only when a DEK is already set.
+
+    If that invariant ever breaks, the tenant deploys with a volume it cannot read
+    and refuses to boot. So it is a hard failure of the step -- not a bare `assert`,
+    which vanishes under `python -O` and would let the deploy proceed.
+
+    The bug is simulated the way a real one would look: DEK generation silently
+    produces nothing while `dek_set` is still False.
+    """
+    mock_all(fake_railway)
+    from control_api import crypto
+
+    monkeypatch.setattr(crypto, "generate_dek", lambda: None)
+
+    with db.session_scope() as s:
+        tenant, _ = provisioning.create_tenant(s, email="alpha@squire.test")
+        assert tenant.dek_set is False
+        with pytest.raises(provisioning.ProvisioningError, match="without a DEK"):
+            provisioning._step_set_variables(
+                s, tenant, provisioning.ProvisionClients.build()
+            )
+    # Nothing was written to Railway -- the guard fires before the upsert.
+    assert "variableCollectionUpsert" not in fake_railway.operations()
+
+
+@respx.mock
 def test_create_service_adopts_an_orphaned_railway_service(pool_bot, fake_railway):
     """If we crashed after Railway created the service but before we committed the
     id, the retry must adopt the existing service instead of creating a twin."""

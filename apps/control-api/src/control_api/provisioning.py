@@ -33,6 +33,7 @@ from control_api.models import (
     PROVISION_STEP_ORDER,
     Bot,
     BotStatus,
+    Heartbeat,
     JobStatus,
     ProvisionJob,
     ProvisionStep,
@@ -48,7 +49,27 @@ log = logging.getLogger(__name__)
 MAX_BACKOFF_SECONDS = 300.0
 
 #: A job left RUNNING for longer than this is assumed to belong to a dead worker
-#: and is returned to the pool. Must comfortably exceed the slowest single step.
+#: and is returned to the pool. Must comfortably exceed the slowest single step --
+#: `updated_at` is refreshed after every completed step, so the unit to size this
+#: against is one step, not one job.
+#:
+#: Worst-case arithmetic, from the per-client httpx timeouts in `config.py`
+#: (railway 30s, telegram 20s, litellm 30s). The slowest step is `set_variables`,
+#: whose unhappy path is:
+#:
+#:     re-mint a lost trial key: litellm /key/delete   30s
+#:                             + litellm /key/generate 30s
+#:     variableCollectionUpsert (railway)              30s
+#:     get_variable_names read-back (railway)          30s
+#:     -----------------------------------------------------
+#:     total                                          120s
+#:
+#: (`create_service` is 60s: find_service_by_name + serviceCreate. Every other step
+#: is one or two calls.) 300s is 2.5x the worst step, which leaves room for TCP
+#: connect + retry jitter without ever reclaiming a job that is merely slow.
+#:
+#: Raise this if any per-client timeout above is raised; a stale window shorter
+#: than a legitimate step means two workers running the same Railway mutation.
 STALE_CLAIM_SECONDS = 300.0
 
 #: Shortest string we will treat as a secret worth redacting. Guards against
@@ -350,6 +371,11 @@ def _step_create_service(session: Session, tenant: Tenant, clients: ProvisionCli
     tenant.railway_service_name = name
     tenant.railway_service_id = service_id
     tenant.internal_url = internal_url_for(tenant.id, settings)
+    # Desired-image bookkeeping for `/fleet` and the upgrade drill. Note this is NOT
+    # also written as a service variable here: the provisioning variable set is an
+    # interface contract with the tenant image, and SQUIRE_IMAGE_REF only starts
+    # being reported back once a redeploy sets it (see `redeploy_tenant`).
+    tenant.image_ref = settings.tenant_image
     _touch(session, tenant)
 
 
@@ -458,8 +484,16 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
     # the variable -- `replace=False` leaves whatever Railway already holds.
     if dek is not None:
         variables["SQUIRE_DEK"] = dek
-    else:
-        assert tenant.dek_set, "SQUIRE_DEK may only be omitted once a DEK is set"
+    elif not tenant.dek_set:
+        # Unreachable by construction (`dek` is None only when dek_set is True), but
+        # a real raise rather than an `assert`: assertions vanish under `python -O`,
+        # and the failure this guards against -- deploying a tenant with no DEK at
+        # all -- is one where the container refuses to boot and the volume cannot be
+        # read. Fail the step and retry instead.
+        raise ProvisioningError(
+            f"tenant {tenant.id} would deploy without a DEK: SQUIRE_DEK was omitted "
+            "but dek_set is False"
+        )
 
     # Keep every credential in this payload out of any error message we persist.
     # The webhook secret is included now that it travels as a Railway variable --
@@ -637,11 +671,21 @@ def advance_job(
     endpoint and the provisioning CLI use. It does NOT bypass the concurrency claim;
     a job another worker is actively running is returned untouched.
     """
-    reclaim_stale_jobs(session)
-
     job = get_job(session, job_id)
     if job.status in (JobStatus.DONE, JobStatus.FAILED):
+        # Terminal. Return before the reclaim sweep: `infra/provision.py` polls this
+        # endpoint, and every poll after the job finished was previously paying for
+        # a fleet-wide UPDATE that could not possibly change this job's answer.
         return job
+
+    # Only a job stuck in RUNNING can be one a dead worker is holding, and this
+    # job's own row is the only one whose state can unblock *this* call. The
+    # background sweeper (`run_pending_jobs`) still reclaims fleet-wide on its own
+    # tick, so nothing goes unrecovered -- this just stops the hot path paying for
+    # it. Cheap gate: one already-loaded status check.
+    if job.status is JobStatus.RUNNING:
+        reclaim_stale_jobs(session)
+        job = get_job(session, job_id)
 
     now = datetime.now(timezone.utc)
     if not force and as_aware(job.next_attempt_at) > now:
@@ -822,16 +866,163 @@ def delete_tenant(
     if tenant.railway_service_id:
         clients.railway.delete_service(tenant.railway_service_id)
 
+    # The heartbeat row goes with the container. Keeping counters for a tenant that
+    # no longer exists would leave behavioural data behind a deletion that is
+    # supposed to be total (PRD §4 crypto-shred).
+    beat = session.get(Heartbeat, tenant_id)
+    if beat is not None:
+        session.delete(beat)
+
     tenant.status = TenantStatus.DELETED
     tenant.bot_id = None
     tenant.railway_service_id = None
     tenant.railway_volume_id = None
     tenant.internal_url = None
+    tenant.image_ref = None
     tenant.dek_set = False
     tenant.webhook_set = False
     _touch(session, tenant)
     session.refresh(tenant)
     return tenant
+
+
+def resolve_image_ref(image_tag: str, settings: Settings | None = None) -> str:
+    """Turn what an operator typed into a full container image reference.
+
+    `v2`                      -> ghcr.io/shagarwal/squire/hermes-tenant:v2
+    `ghcr.io/org/img:v2`      -> unchanged
+    `ghcr.io:443/org/img:v2`  -> unchanged (registry port is not mistaken for a tag)
+
+    A bare tag is resolved against the repository part of `TENANT_IMAGE`, which is
+    the same image every tenant is provisioned from -- so the drill cannot
+    accidentally roll the fleet onto a *different repository* by fat-fingering a tag.
+    """
+    settings = settings or get_settings()
+    image_tag = image_tag.strip()
+    if "/" in image_tag:
+        return image_tag  # already a full reference
+
+    base = settings.tenant_image
+    # Split the tag off only if the colon is in the final path segment; otherwise it
+    # is a registry port (`ghcr.io:443/...`) and the reference carries no tag at all.
+    last_segment = base.rsplit("/", 1)[-1]
+    if ":" in last_segment:
+        base = base[: len(base) - len(last_segment)] + last_segment.split(":", 1)[0]
+    return f"{base}:{image_tag}"
+
+
+def redeploy_tenant(
+    session: Session,
+    tenant_id: str,
+    image_tag: str,
+    clients: ProvisionClients | None = None,
+) -> tuple[Tenant, str]:
+    """Re-point one tenant's Railway service at a new image and deploy it.
+
+    This is the whole mechanism behind Task 0.6's upgrade drill: canary one tenant,
+    verify it via `/fleet`, roll the rest, and roll back by calling this again with
+    the previous tag. There is no separate rollback path -- a rollback is just a
+    redeploy of an older reference, which is why this function has no notion of
+    "newer".
+
+    Order matters. `SQUIRE_IMAGE_REF` is written first (with Railway's own
+    auto-deploy suppressed) so the container that comes up already knows which image
+    it is and reports it on its first heartbeat. Verifying convergence any other way
+    means trusting that a deploy we asked for is the deploy that happened.
+    """
+    tenant = get_tenant(session, tenant_id)
+    if tenant.status is TenantStatus.DELETED:
+        raise ProvisioningError(f"tenant {tenant_id} is deleted")
+    if not tenant.railway_service_id:
+        raise ProvisioningError(
+            f"tenant {tenant_id} has no Railway service to redeploy (still provisioning?)"
+        )
+
+    image_ref = resolve_image_ref(image_tag)
+    clients = clients or ProvisionClients.build()
+
+    clients.railway.set_variables(
+        tenant.railway_service_id, {"SQUIRE_IMAGE_REF": image_ref}
+    )
+    clients.railway.configure_service_instance(tenant.railway_service_id, image=image_ref)
+    clients.railway.deploy(tenant.railway_service_id)
+
+    tenant.image_ref = image_ref
+    _touch(session, tenant)
+    session.refresh(tenant)
+    log.info("tenant %s redeployed onto %s", tenant_id, image_ref)
+    return tenant, image_ref
+
+
+# ---------------------------------------------------------------------------
+# Fleet heartbeat (Task 0.6)
+# ---------------------------------------------------------------------------
+
+
+def record_heartbeat(session: Session, fields: dict) -> Heartbeat:
+    """Upsert one tenant's latest heartbeat.
+
+    `fields` comes from a validated `HeartbeatRequest`, so every value here is
+    already known to be a bounded int, a bool, or the image reference -- this
+    function never sees free-form input.
+    """
+    tenant_id = fields["tenant_id"]
+    get_tenant(session, tenant_id)  # raises TenantNotFound -> 404
+
+    row = session.get(Heartbeat, tenant_id)
+    if row is None:
+        row = Heartbeat(tenant_id=tenant_id)
+    for name, value in fields.items():
+        if name != "tenant_id":
+            setattr(row, name, value)
+    row.received_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+@dataclass
+class FleetEntry:
+    """One tenant's fleet view: registry row + latest heartbeat, joined."""
+
+    tenant: Tenant
+    heartbeat: Heartbeat | None
+    age_seconds: float | None
+    fresh: bool
+
+
+def fleet_status(session: Session, status: TenantStatus | None = None) -> list[FleetEntry]:
+    """Join every tenant with its latest heartbeat.
+
+    One query per table and a dict join, rather than a SQL outer join: the fleet is
+    tens of rows in Phase 0 and hundreds in Phase 1, and this stays readable and
+    dialect-neutral. Revisit if `/fleet` ever lands on a hot path (it should not --
+    it is an operator/CLI endpoint).
+    """
+    stale_after = get_settings().heartbeat_stale_seconds
+    now = datetime.now(timezone.utc)
+
+    query = select(Tenant).order_by(Tenant.created_at)  # type: ignore[arg-type]
+    if status is not None:
+        query = query.where(Tenant.status == status)
+    tenants = list(session.exec(query))
+
+    beats = {b.tenant_id: b for b in session.exec(select(Heartbeat))}
+
+    entries: list[FleetEntry] = []
+    for tenant in tenants:
+        beat = beats.get(tenant.id)
+        age = None if beat is None else (now - as_aware(beat.received_at)).total_seconds()
+        entries.append(
+            FleetEntry(
+                tenant=tenant,
+                heartbeat=beat,
+                age_seconds=age,
+                fresh=age is not None and age <= stale_after,
+            )
+        )
+    return entries
 
 
 def revoke_trial_key(

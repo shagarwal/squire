@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     tenant_port: int = 8080
     tenant_service_name_prefix: str = "tenant-"
 
+    # -- Fleet heartbeat (Task 0.6) -----------------------------------------
+    # A tenant beats every SQUIRE_HEARTBEAT_INTERVAL seconds (300 in the image).
+    # 900 = three missed beats before `/fleet` calls a tenant stale: long enough to
+    # ride out one redeploy or a sleeping serverless container waking up, short
+    # enough that the upgrade drill notices a canary that never came back.
+    heartbeat_stale_seconds: float = 900.0
+
     # -- Ingress ------------------------------------------------------------
     # Telegram webhooks are registered as `<ingress_public_url>/telegram/<bot_id>`.
     ingress_public_url: str = "http://localhost:8081"

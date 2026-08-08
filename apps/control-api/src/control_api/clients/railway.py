@@ -15,9 +15,10 @@ the fix is confined to a single method + its test.
 Confidence per operation:
   HIGH   -- serviceCreate, volumeCreate, variableCollectionUpsert,
             serviceInstanceDeploy, deployments  (verbatim from Railway's API cookbook)
-  MEDIUM -- serviceInstanceUpdate (documented mutation; the `sleepApplication` field
-            is documented as a serviceInstance setting but the exact input nesting is
-            unverified), serviceDelete, project.services pagination shape
+  MEDIUM -- serviceInstanceUpdate (documented mutation; the `sleepApplication` and
+            `source.image` fields are documented as serviceInstance settings but the
+            exact input nesting is unverified), serviceDelete, project.services
+            pagination shape
   LOW    -- deploymentStop (mutation name from Railway's schema explorer; signature
             `deploymentStop(id: String!): Boolean!` is unverified)
 """
@@ -320,12 +321,24 @@ class RailwayClient:
         sleep_application: bool | None = None,
         region: str | None = None,
         num_replicas: int | None = None,
+        image: str | None = None,
     ) -> None:
         """Per-environment service settings.
 
         The only one that matters in Phase 0 is `sleepApplication` -- Railway's
         scale-to-zero, which is half of the unit-economics bet (implementation-plan
         §2). Everything else is here so Task 0.6's upgrade drill has a hook.
+
+        `image` re-points the service at a different container image and is that
+        hook: it is how `POST /internal/tenants/{id}/redeploy` rolls a tenant onto
+        vN+1 (and, unchanged, back onto vN). Confidence MEDIUM, same as the rest of
+        this mutation: `ServiceInstanceUpdateInput.source` mirrors the
+        `ServiceCreateInput.source` shape that `create_service` already uses and
+        that Railway's cookbook documents, but the nesting under
+        serviceInstanceUpdate is unverified against the live API. If it is wrong,
+        the failure is loud (a `RailwayError` naming the field) and confined to this
+        one argument -- the drill aborts before touching the rest of the fleet,
+        which is exactly what a canary is for.
         """
         mutation = """
         mutation serviceInstanceUpdate(
@@ -343,6 +356,8 @@ class RailwayClient:
             payload["region"] = region
         if num_replicas is not None:
             payload["numReplicas"] = num_replicas
+        if image is not None:
+            payload["source"] = {"image": image}
         if not payload:
             return
         self._gql(

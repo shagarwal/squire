@@ -7,7 +7,9 @@ without coordinating.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_api.models import JobStatus, ProvisionStep, TenantStatus
 
@@ -112,3 +114,130 @@ class RevokeTrialKeyResponse(BaseModel):
     tenant_id: str
     trial_key_active: bool
     revoked: bool
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat / fleet (Task 0.6)
+# ---------------------------------------------------------------------------
+
+#: Sanity ceiling on every counter. Not a security control -- the caller is already
+#: authenticated -- but it stops a wrapped/garbage value from being persisted as
+#: fact, and it makes the "these are small counts" intent explicit.
+_MAX_COUNTER = 10**12
+
+
+class HeartbeatRequest(BaseModel):
+    """POST /internal/heartbeat -- emitted by `tenant-image/bin/squire-heartbeat.py`.
+
+    `extra="forbid"` is the load-bearing line in this file. It is what makes the
+    heartbeat channel structurally counts-only: a future tenant build that tried to
+    attach a chat id, a message preview or an exception string gets a 422 instead of
+    quietly teaching the control plane to hold conversation data (PRD §4).
+
+    Every field except `uptime_seconds` and the two liveness booleans is optional,
+    because each collector on the tenant side can fail independently. A tenant that
+    cannot read its cgroup must still be able to say "I am alive" -- otherwise the
+    first thing to break also removes the signal that something broke.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str = Field(min_length=1, max_length=64)
+    uptime_seconds: int = Field(ge=0, le=_MAX_COUNTER)
+    image_ref: str | None = Field(default=None, max_length=512)
+
+    gateway_up: bool
+    hindsight_up: bool
+
+    memory_rss_mb: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    volume_used_mb: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    volume_total_mb: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+
+    updates_forwarded: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    updates_failed: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    updates_rejected: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+
+    hindsight_ops_pending: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    hindsight_ops_processing: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+    hindsight_ops_failed: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
+
+
+class HeartbeatResponse(BaseModel):
+    """Deliberately tiny: the tenant has no use for a fleet view."""
+
+    tenant_id: str
+    received: bool
+
+
+class FleetTenant(BaseModel):
+    """One row of `GET /internal/fleet`. Status metadata only -- no credentials."""
+
+    tenant_id: str
+    email: str
+    status: TenantStatus
+
+    #: Desired (what control-api last deployed) vs reported (what the tenant says it
+    #: is running). The upgrade drill treats them agreeing, plus a fresh heartbeat,
+    #: as "this tenant converged onto the new image".
+    image_ref: str | None = None
+    reported_image_ref: str | None = None
+
+    last_heartbeat_at: datetime | None = None
+    heartbeat_age_seconds: float | None = None
+    heartbeat_fresh: bool = False
+
+    uptime_seconds: int | None = None
+    gateway_up: bool | None = None
+    hindsight_up: bool | None = None
+    memory_rss_mb: int | None = None
+    volume_used_mb: int | None = None
+    volume_total_mb: int | None = None
+    updates_forwarded: int | None = None
+    updates_failed: int | None = None
+    updates_rejected: int | None = None
+    hindsight_ops_pending: int | None = None
+    hindsight_ops_processing: int | None = None
+    hindsight_ops_failed: int | None = None
+
+
+class FleetSummary(BaseModel):
+    tenants: int
+    running: int
+    heartbeating: int  # fresh beat within the staleness window
+    stale: int  # beat seen once, but not recently
+    never_seen: int  # no beat ever
+
+
+class FleetResponse(BaseModel):
+    summary: FleetSummary
+    tenants: list[FleetTenant]
+
+
+class RedeployRequest(BaseModel):
+    """POST /internal/tenants/{id}/redeploy -- the upgrade drill's only lever.
+
+    `image_tag` accepts either a bare tag (`v2`, resolved against the repository
+    part of `TENANT_IMAGE`) or a full reference (`ghcr.io/org/img:v2`). Operators
+    type the former; automation tends to produce the latter.
+    """
+
+    image_tag: str = Field(min_length=1, max_length=512)
+
+    @field_validator("image_tag")
+    @classmethod
+    def _looks_like_an_image_reference(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("image_tag is empty")
+        # This string ends up in a Railway API payload and in operator logs. It is
+        # never passed to a shell, but rejecting whitespace and control characters
+        # keeps it from *becoming* a shell injection the day someone adds a CLI.
+        if any(c.isspace() or ord(c) < 0x20 for c in value):
+            raise ValueError("image_tag must not contain whitespace or control characters")
+        return value
+
+
+class RedeployResponse(BaseModel):
+    tenant_id: str
+    image_ref: str  # the fully-resolved reference we set on the service
+    deployment_triggered: bool

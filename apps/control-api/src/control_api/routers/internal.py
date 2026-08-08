@@ -1,10 +1,12 @@
 """`/internal/*` -- the service-to-service API.
 
 Consumers:
-  * `ingress`            -> GET /internal/tenants/by-bot/{bot_id}  (every update)
-  * `infra/provision.py` -> POST /internal/tenants, POST .../advance
-  * `infra/load_bots.py` -> POST /internal/bots
-  * tenant runtimes      -> POST /internal/tenants/{id}/revoke-trial-key
+  * `ingress`                -> GET /internal/tenants/by-bot/{bot_id} (every update)
+  * `infra/provision.py`     -> POST /internal/tenants, POST .../advance
+  * `infra/load_bots.py`     -> POST /internal/bots
+  * `infra/upgrade_drill.py` -> POST /internal/tenants/{id}/redeploy, GET /internal/fleet
+  * tenant runtimes          -> POST /internal/tenants/{id}/revoke-trial-key,
+                                POST /internal/heartbeat
 
 Everything here is behind the shared `INTERNAL_API_TOKEN` bearer.
 """
@@ -21,13 +23,20 @@ from control_api.auth import require_internal_token
 from control_api.clients.telegram import TelegramClient, bot_id_from_token
 from control_api.config import get_settings
 from control_api.db import get_session, session_scope
-from control_api.models import Bot, BotStatus, ProvisionJob, Tenant
+from control_api.models import Bot, BotStatus, ProvisionJob, Tenant, TenantStatus
 from control_api.schemas import (
     BotPoolStats,
     CreateTenantRequest,
     CreateTenantResponse,
     FailedBot,
+    FleetResponse,
+    FleetSummary,
+    FleetTenant,
+    HeartbeatRequest,
+    HeartbeatResponse,
     JobResponse,
+    RedeployRequest,
+    RedeployResponse,
     RegisterBotsRequest,
     RegisterBotsResponse,
     RegisteredBot,
@@ -161,6 +170,115 @@ def revoke_trial_key(
     return RevokeTrialKeyResponse(
         tenant_id=tenant_id, trial_key_active=False, revoked=revoked
     )
+
+
+@router.post("/tenants/{tenant_id}/redeploy", response_model=RedeployResponse)
+def redeploy_tenant(
+    tenant_id: str, payload: RedeployRequest, session: Session = Depends(get_session)
+) -> RedeployResponse:
+    """Re-point a tenant at a container image and deploy it.
+
+    The upgrade drill's only lever (`infra/upgrade_drill.py`): canary one tenant,
+    verify via `/fleet`, roll the fleet, and roll back by calling this again with the
+    previous tag. Not idempotent in the "no-op if already there" sense -- calling it
+    twice with the same tag triggers two deploys, which is the correct behaviour for
+    an operator who wants a tenant restarted.
+    """
+    try:
+        _, image_ref = provisioning.redeploy_tenant(
+            session, tenant_id, image_tag=payload.image_tag
+        )
+    except provisioning.TenantNotFound as exc:
+        raise HTTPException(status_code=404, detail="tenant not found") from exc
+    except provisioning.ProvisioningError as exc:
+        # 409, not 500: the tenant exists, it is just not in a state that can be
+        # redeployed (still provisioning, or crypto-shredded).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RedeployResponse(
+        tenant_id=tenant_id, image_ref=image_ref, deployment_triggered=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fleet heartbeat (Task 0.6)
+#
+# `/internal/heartbeat` is written by every tenant container; `/internal/fleet` is
+# read by operators and by infra/upgrade_drill.py. Both sit under /internal because
+# that is where the shared-bearer-token dependency lives -- the plan calls the
+# latter "the /fleet status endpoint", and this is that endpoint, authed like
+# everything else rather than hanging unauthenticated off the root.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/heartbeat", response_model=HeartbeatResponse)
+def heartbeat(
+    payload: HeartbeatRequest, session: Session = Depends(get_session)
+) -> HeartbeatResponse:
+    """Ingest one tenant's counts-only heartbeat.
+
+    `HeartbeatRequest` forbids unknown fields, so this handler cannot be the place
+    conversation content sneaks in: anything not on the whitelist is a 422 before we
+    get here. Storage is latest-per-tenant (`models.Heartbeat`), not a log.
+    """
+    try:
+        provisioning.record_heartbeat(session, payload.model_dump())
+    except provisioning.TenantNotFound as exc:
+        # A container beating for a tenant we do not know about is worth surfacing:
+        # it means a service outlived its deletion, which is a billing leak.
+        log.warning("heartbeat from unknown tenant %s", payload.tenant_id)
+        raise HTTPException(status_code=404, detail="tenant not found") from exc
+    return HeartbeatResponse(tenant_id=payload.tenant_id, received=True)
+
+
+@router.get("/fleet", response_model=FleetResponse)
+def fleet(
+    status: TenantStatus | None = None, session: Session = Depends(get_session)
+) -> FleetResponse:
+    """Per-tenant status, heartbeat freshness and counters.
+
+    `status` filters to one tenant status (the drill asks for `running`). Carries
+    registry metadata and counters only -- no bot token, no webhook secret, no DEK.
+    """
+    entries = provisioning.fleet_status(session, status=status)
+
+    rows: list[FleetTenant] = []
+    for entry in entries:
+        beat = entry.heartbeat
+        rows.append(
+            FleetTenant(
+                tenant_id=entry.tenant.id,
+                email=entry.tenant.email,
+                status=entry.tenant.status,
+                image_ref=entry.tenant.image_ref,
+                reported_image_ref=beat.image_ref if beat else None,
+                last_heartbeat_at=beat.received_at if beat else None,
+                heartbeat_age_seconds=entry.age_seconds,
+                heartbeat_fresh=entry.fresh,
+                # Everything below is None when we have never heard from the tenant.
+                # "no data" and "zero" are different operational states.
+                uptime_seconds=beat.uptime_seconds if beat else None,
+                gateway_up=beat.gateway_up if beat else None,
+                hindsight_up=beat.hindsight_up if beat else None,
+                memory_rss_mb=beat.memory_rss_mb if beat else None,
+                volume_used_mb=beat.volume_used_mb if beat else None,
+                volume_total_mb=beat.volume_total_mb if beat else None,
+                updates_forwarded=beat.updates_forwarded if beat else None,
+                updates_failed=beat.updates_failed if beat else None,
+                updates_rejected=beat.updates_rejected if beat else None,
+                hindsight_ops_pending=beat.hindsight_ops_pending if beat else None,
+                hindsight_ops_processing=beat.hindsight_ops_processing if beat else None,
+                hindsight_ops_failed=beat.hindsight_ops_failed if beat else None,
+            )
+        )
+
+    summary = FleetSummary(
+        tenants=len(rows),
+        running=sum(1 for r in rows if r.status is TenantStatus.RUNNING),
+        heartbeating=sum(1 for r in rows if r.heartbeat_fresh),
+        stale=sum(1 for r in rows if r.last_heartbeat_at and not r.heartbeat_fresh),
+        never_seen=sum(1 for r in rows if r.last_heartbeat_at is None),
+    )
+    return FleetResponse(summary=summary, tenants=rows)
 
 
 # ---------------------------------------------------------------------------

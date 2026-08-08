@@ -36,7 +36,12 @@ FORBIDDEN_COLUMN_SUBSTRINGS = [
 ]
 
 # Tables the control plane is allowed to own at all.
-ALLOWED_TABLES = {"tenant", "bot", "provisionjob"}
+#
+# `heartbeat` was added deliberately in Task 0.6. It is one row per tenant holding
+# counters and gauges -- and note that the fleet metrics are named `updates_*`, not
+# `messages_*`, both because Telegram calls them updates and because the forbidden
+# substring below must keep meaning what it says.
+ALLOWED_TABLES = {"tenant", "bot", "provisionjob", "heartbeat"}
 
 
 def test_only_expected_tables_exist():
@@ -72,12 +77,42 @@ EXPECTED_COLUMNS = {
         "railway_service_name",
         "railway_volume_id",
         "internal_url",
+        # The container image reference we last deployed. A public GHCR coordinate,
+        # not a credential, and the upgrade drill cannot verify a rollout without it.
+        "image_ref",
         "dek_set",
         "trial_key_alias",
         "trial_key_active",
         "webhook_set",
         "created_at",
         "updated_at",
+    },
+    # Task 0.6 fleet heartbeat. EVERY column here is an integer, a boolean, or the
+    # image reference the container was handed -- there is no string column a tenant
+    # could put user text into, and no JSON/blob column at all. That is not an
+    # accident of the current fields: `schemas.HeartbeatRequest` sets
+    # `extra="forbid"`, so a tenant build that tried to send a chat id or a message
+    # preview is rejected with a 422 rather than growing this table.
+    #
+    # If you are adding a column here, the bar is: can a tenant put anything into it
+    # that is derived from what a *user said*? If yes, it does not belong in the
+    # control plane.
+    "heartbeat": {
+        "tenant_id",
+        "received_at",
+        "uptime_seconds",
+        "image_ref",
+        "gateway_up",
+        "hindsight_up",
+        "memory_rss_mb",
+        "volume_used_mb",
+        "volume_total_mb",
+        "updates_forwarded",
+        "updates_failed",
+        "updates_rejected",
+        "hindsight_ops_pending",
+        "hindsight_ops_processing",
+        "hindsight_ops_failed",
     },
     # `token` and `webhook_secret` are OUR pool-bot credentials (BotFather +
     # self-generated), not the user's -- control-api cannot call setWebhook without
