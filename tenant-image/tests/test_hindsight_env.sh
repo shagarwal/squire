@@ -53,6 +53,56 @@ E
 bash "$BIN/squire-hindsight-env.sh" >/dev/null
 ck "openai provider derived" "$(grep -q '^HINDSIGHT_API_LLM_PROVIDER=openai$' "$OUT" && echo 1 || echo 0)"
 
+# --- THE CROSS-PROVIDER TRAP -------------------------------------------------
+# The tenant converts from our Anthropic trial to their own OpenAI key (or
+# ChatGPT/Codex — 2 of the 4 offered paths). .env now holds only their OpenAI
+# key, but the PROCESS env still carries the revoked trial ANTHROPIC_API_KEY
+# until the next redeploy.
+#
+# A per-key "use .env, else process env" rule silently takes the Anthropic
+# branch here and configures Hindsight with the revoked key. Precedence must be
+# per-SOURCE: .env supplies a provider key, therefore .env is the only source.
+#
+# Note the harness deliberately EXPORTS the stale key — the earlier version of
+# this suite passed only because it did not, which is exactly how the bug
+# survived a green test run.
+cat > "$T/shm/.env" <<'E'
+OPENAI_API_KEY=sk-openai-user-own
+E
+export ANTHROPIC_API_KEY=REVOKED-TRIAL-KEY
+export ANTHROPIC_BASE_URL=https://proxy.squire.internal
+bash "$BIN/squire-hindsight-env.sh" >/dev/null
+ck "stale process-env Anthropic key does NOT win" \
+   "$(grep -q '^HINDSIGHT_API_LLM_PROVIDER=openai$' "$OUT" && echo 1 || echo 0)" \
+   "got: $(grep '^HINDSIGHT_API_LLM_PROVIDER=' "$OUT")"
+ck "revoked trial key absent from config" \
+   "$(grep -q 'REVOKED-TRIAL-KEY' "$OUT" && echo 0 || echo 1)"
+ck "user's own OpenAI key is used" \
+   "$(grep -q '^HINDSIGHT_API_LLM_API_KEY=sk-openai-user-own$' "$OUT" && echo 1 || echo 0)"
+ck "our proxy base URL not paired with the user's key" \
+   "$(grep -q 'proxy.squire.internal' "$OUT" && echo 0 || echo 1)"
+
+# --- Claude Max OAuth: no usable credential, but must NOT reuse the trial key --
+cat > "$T/shm/.env" <<'E'
+CLAUDE_CODE_OAUTH_TOKEN=oauth-token-not-an-api-key
+E
+outlog="$(bash "$BIN/squire-hindsight-env.sh" 2>&1)"
+ck "Claude Max OAuth emits no LLM config" \
+   "$(grep -q 'HINDSIGHT_API_LLM_PROVIDER' "$OUT" && echo 0 || echo 1)"
+ck "Claude Max OAuth does not fall back to the trial key" \
+   "$(grep -q 'REVOKED-TRIAL-KEY' "$OUT" && echo 0 || echo 1)"
+ck "Claude Max OAuth idle state is explained in the log" \
+   "$(echo "$outlog" | grep -qi 'idle' && echo 1 || echo 0)"
+
+# --- trial still works when .env has nothing (process env is the source) ---
+: > "$T/shm/.env"
+bash "$BIN/squire-hindsight-env.sh" >/dev/null
+ck "no .env creds -> provisioned trial key IS used" \
+   "$(grep -q '^HINDSIGHT_API_LLM_API_KEY=REVOKED-TRIAL-KEY$' "$OUT" && echo 1 || echo 0)"
+ck "trial proxy base URL used with the trial key" \
+   "$(grep -q '^HINDSIGHT_API_LLM_BASE_URL=https://proxy.squire.internal$' "$OUT" && echo 1 || echo 0)"
+unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
+
 # --- no creds at all ---
 : > "$T/shm/.env"
 bash "$BIN/squire-hindsight-env.sh" >/dev/null

@@ -51,6 +51,10 @@ FAILURES_BEFORE_RESTART = int(os.environ.get("SQUIRE_HINDSIGHT_FAILURE_THRESHOLD
 # Circuit-breaker limits — see the commentary in main().
 MAX_ACTIONS_PER_HOUR = int(os.environ.get("SQUIRE_HINDSIGHT_MAX_ACTIONS_PER_HOUR", "4"))
 MAX_BACKOFF = int(os.environ.get("SQUIRE_HINDSIGHT_MAX_BACKOFF", "1800"))
+# Run the extraction-auth scan on every Nth healthy probe (5 x 120s = ~10 min).
+AUTH_CHECK_EVERY_N_PROBES = int(
+    os.environ.get("SQUIRE_HINDSIGHT_AUTH_CHECK_EVERY_N", "5")
+)
 
 # pg0's fixed-port instance, as configured in the Dockerfile. Credentials are
 # pg0's built-in defaults (hindsight/hindsight) and are only reachable on
@@ -203,6 +207,7 @@ def main() -> int:
     #    and just report, because past that point restarting is not fixing
     #    anything and the queue-clearing is pure data loss.
     ever_healthy = False
+    healthy_probes = 0
     action_times: list[float] = []
     backoff = INTERVAL
 
@@ -215,7 +220,15 @@ def main() -> int:
             ever_healthy = True
             consecutive = 0
             backoff = INTERVAL
-            warn_on_extraction_auth_failures()
+
+            # Every Nth healthy probe, not every one. The check is a DB round
+            # trip through a subprocess; at the 120s poll interval, running it
+            # each time would mean 30 queries an hour to surface a condition
+            # that changes on the timescale of a user connecting a provider.
+            # Once every ~10 minutes is plenty and keeps the janitor cheap.
+            healthy_probes += 1
+            if healthy_probes % AUTH_CHECK_EVERY_N_PROBES == 0:
+                warn_on_extraction_auth_failures()
         else:
             consecutive += 1
             log(f"health check failed ({consecutive}/{FAILURES_BEFORE_RESTART})")

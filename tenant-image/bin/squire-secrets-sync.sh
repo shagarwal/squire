@@ -135,7 +135,15 @@ rewire_hindsight_if_needed() {
     fi
 
     log "LLM credentials changed — restarting the Hindsight daemon to pick them up"
-    if "$SUPERVISORCTL" -c "$SUPERVISORD_CONF" restart "$HINDSIGHT_PROGRAM" >/dev/null 2>&1; then
+    # Backgrounded + `wait`, for the same reason the poll loop does it with
+    # sleep: bash does not run traps while a foreground child is executing.
+    # This restart can take ~105s in the worst case (hindsight's stopwaitsecs 45
+    # + startsecs 60), and a SIGTERM arriving during it would be deferred that
+    # long — blowing straight through supervisord's 20s stopwaitsecs for THIS
+    # program and losing the final re-seal. `wait` is interruptible, so the
+    # shutdown path stays responsive.
+    "$SUPERVISORCTL" -c "$SUPERVISORD_CONF" restart "$HINDSIGHT_PROGRAM" >/dev/null 2>&1 &
+    if wait $!; then
         log "Hindsight restarted"
     else
         # Not fatal: the healthcheck loop will notice an unhealthy daemon, and
