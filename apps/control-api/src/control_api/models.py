@@ -158,8 +158,9 @@ class Heartbeat(SQLModel, table=True):
     # Seconds since the emitter started == roughly the container's age. A value that
     # went backwards is how you tell a tenant restarted between two beats.
     uptime_seconds: int = 0
-    #: What the container says it is running (SQUIRE_IMAGE_REF, set at redeploy).
-    #: None for tenants provisioned before their first drill-driven redeploy.
+    #: What the container says it is running (SQUIRE_IMAGE_REF, set at provision
+    #: time and overwritten on redeploy). Compared against `Tenant.image_ref` to
+    #: tell "we asked for vN+1" apart from "the tenant is running vN+1".
     image_ref: str | None = None
 
     gateway_up: bool = False
@@ -180,6 +181,14 @@ class Heartbeat(SQLModel, table=True):
     hindsight_ops_pending: int | None = None
     hindsight_ops_processing: int | None = None
     hindsight_ops_failed: int | None = None
+
+    # Seconds since the last SUCCESSFUL restic run, from a timestamp file the
+    # backup script writes on the volume. None means "never succeeded, or backups
+    # are not configured" -- which is every tenant today, since no B2 account
+    # exists yet. A backup that quietly stopped working is invisible by nature, so
+    # this is the number that makes it visible: on a healthy tenant it should
+    # never exceed ~a day.
+    backup_last_success_age_seconds: int | None = None
 
 
 class ProvisionJob(SQLModel, table=True):

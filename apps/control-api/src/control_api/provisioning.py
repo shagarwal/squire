@@ -72,6 +72,19 @@ MAX_BACKOFF_SECONDS = 300.0
 #: than a legitimate step means two workers running the same Railway mutation.
 STALE_CLAIM_SECONDS = 300.0
 
+#: Tenant statuses a redeploy is allowed to touch (Task 0.6 upgrade drill).
+#:
+#: PROVISIONING is excluded because the state machine owns that tenant right now;
+#: DELETED because there is nothing there.
+#:
+#: SLEEPING is excluded too, and that IS a gap worth naming: a scale-to-zero
+#: tenant would be woken (and billed) by the deploy, and it emits no heartbeats
+#: while asleep, so the drill could not verify it either. It therefore stays on
+#: the old image until something wakes it. Phase 1 (implementation-plan §4, 1F
+#: fleet automation) needs a wake-then-upgrade or on-wake-check pass; until then
+#: sleeping tenants are a manual follow-up after a fleet roll.
+REDEPLOYABLE_STATUSES = frozenset({TenantStatus.RUNNING, TenantStatus.STOPPED})
+
 #: Shortest string we will treat as a secret worth redacting. Guards against
 #: blanking a whole error message because some config value happened to be "" or
 #: a single character.
@@ -371,10 +384,10 @@ def _step_create_service(session: Session, tenant: Tenant, clients: ProvisionCli
     tenant.railway_service_name = name
     tenant.railway_service_id = service_id
     tenant.internal_url = internal_url_for(tenant.id, settings)
-    # Desired-image bookkeeping for `/fleet` and the upgrade drill. Note this is NOT
-    # also written as a service variable here: the provisioning variable set is an
-    # interface contract with the tenant image, and SQUIRE_IMAGE_REF only starts
-    # being reported back once a redeploy sets it (see `redeploy_tenant`).
+    # Desired-image bookkeeping for `/fleet` and the upgrade drill. The matching
+    # SQUIRE_IMAGE_REF service variable is written by `_step_set_variables`, so a
+    # freshly provisioned tenant reports its image on its very first heartbeat --
+    # no drill required before `/fleet` can tell us what the fleet is running.
     tenant.image_ref = settings.tenant_image
     _touch(session, tenant)
 
@@ -477,6 +490,13 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         "CONTROL_API_URL": settings.control_api_url,
         "INTERNAL_API_TOKEN": settings.internal_api_token,
         "PORT": str(settings.tenant_port),
+        # What image this container is running, echoed back on every heartbeat.
+        # Set HERE and not only at redeploy: otherwise `/fleet` cannot say what the
+        # fleet is actually running until a drill has happened, and the drill's
+        # "already on the target image" check is False for every tenant -- so the
+        # first `--roll` would restart the entire fleet to move it onto the image it
+        # was already provisioned with. `redeploy_tenant` overwrites this.
+        "SQUIRE_IMAGE_REF": tenant.image_ref or settings.tenant_image,
     }
     # 32 random bytes, base64. Generated only if we have not already set one: a
     # retry must not rotate the key out from under a volume already encrypted with
@@ -903,8 +923,15 @@ def resolve_image_ref(image_tag: str, settings: Settings | None = None) -> str:
         return image_tag  # already a full reference
 
     base = settings.tenant_image
-    # Split the tag off only if the colon is in the final path segment; otherwise it
-    # is a registry port (`ghcr.io:443/...`) and the reference carries no tag at all.
+    # A digest pin (`repo@sha256:...`) is a perfectly reasonable TENANT_IMAGE -- it
+    # is the discipline the tenant Dockerfile's own FROM uses. Strip the digest
+    # FIRST: without this, the tag-splitting below would cut at the colon inside
+    # `@sha256:` and produce `ghcr.io/org/img@sha256:v2`, which is not a reference
+    # at all and would fail at deploy time rather than here.
+    base = base.split("@", 1)[0]
+    # Then split the tag off, but only if the colon is in the final path segment;
+    # otherwise it is a registry port (`ghcr.io:443/...`) and the reference carries
+    # no tag at all.
     last_segment = base.rsplit("/", 1)[-1]
     if ":" in last_segment:
         base = base[: len(base) - len(last_segment)] + last_segment.split(":", 1)[0]
@@ -916,7 +943,7 @@ def redeploy_tenant(
     tenant_id: str,
     image_tag: str,
     clients: ProvisionClients | None = None,
-) -> tuple[Tenant, str]:
+) -> tuple[Tenant, str, bool]:
     """Re-point one tenant's Railway service at a new image and deploy it.
 
     This is the whole mechanism behind Task 0.6's upgrade drill: canary one tenant,
@@ -929,14 +956,27 @@ def redeploy_tenant(
     auto-deploy suppressed) so the container that comes up already knows which image
     it is and reports it on its first heartbeat. Verifying convergence any other way
     means trusting that a deploy we asked for is the deploy that happened.
+
+    A STOPPED tenant gets the image update but NOT the deploy, and the returned flag
+    says so. It was halted deliberately (trial expiry, non-payment); starting it
+    again because a fleet upgrade swept past would resurrect a container the product
+    decided to switch off, and bill for it. The new reference is already recorded on
+    the service, so it takes effect whenever the tenant is legitimately resumed.
     """
     tenant = get_tenant(session, tenant_id)
-    if tenant.status is TenantStatus.DELETED:
-        raise ProvisioningError(f"tenant {tenant_id} is deleted")
-    if not tenant.railway_service_id:
+    # Whitelist, not "anything that isn't deleted". A PROVISIONING tenant already
+    # HAS a service id after the first step, so a service-id check alone would let
+    # a redeploy race the state machine: our deploy and `_step_deploy` would fire
+    # against the same service seconds apart, and set_variables could land after
+    # the container it was meant to configure had already started. Wait for
+    # provisioning to finish; the drill skips such tenants and reports them.
+    if tenant.status not in REDEPLOYABLE_STATUSES:
         raise ProvisioningError(
-            f"tenant {tenant_id} has no Railway service to redeploy (still provisioning?)"
+            f"tenant {tenant_id} is {tenant.status.value}, not one of "
+            f"{sorted(s.value for s in REDEPLOYABLE_STATUSES)} -- refusing to redeploy"
         )
+    if not tenant.railway_service_id:
+        raise ProvisioningError(f"tenant {tenant_id} has no Railway service to redeploy")
 
     image_ref = resolve_image_ref(image_tag)
     clients = clients or ProvisionClients.build()
@@ -945,13 +985,21 @@ def redeploy_tenant(
         tenant.railway_service_id, {"SQUIRE_IMAGE_REF": image_ref}
     )
     clients.railway.configure_service_instance(tenant.railway_service_id, image=image_ref)
-    clients.railway.deploy(tenant.railway_service_id)
+
+    deployed = tenant.status is TenantStatus.RUNNING
+    if deployed:
+        clients.railway.deploy(tenant.railway_service_id)
 
     tenant.image_ref = image_ref
     _touch(session, tenant)
     session.refresh(tenant)
-    log.info("tenant %s redeployed onto %s", tenant_id, image_ref)
-    return tenant, image_ref
+    log.info(
+        "tenant %s set to %s (deploy %s)",
+        tenant_id,
+        image_ref,
+        "triggered" if deployed else "skipped -- tenant is stopped",
+    )
+    return tenant, image_ref, deployed
 
 
 # ---------------------------------------------------------------------------

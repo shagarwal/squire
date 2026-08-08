@@ -69,6 +69,7 @@ def heartbeat_payload(tenant_id: str = "t-1", **overrides) -> dict:
         "hindsight_ops_pending": 2,
         "hindsight_ops_processing": 1,
         "hindsight_ops_failed": 0,
+        "backup_last_success_age_seconds": 3600,
     }
     payload.update(overrides)
     return payload
@@ -182,6 +183,8 @@ def test_fleet_reports_status_freshness_and_counters(client, auth):
     assert seen["heartbeat_age_seconds"] is not None
     assert seen["updates_forwarded"] == 12
     assert seen["memory_rss_mb"] == 812
+    # A backup that quietly stopped is invisible unless someone looks at this.
+    assert seen["backup_last_success_age_seconds"] == 3600
 
     # Never heard from: nulls, not zeros. "0 messages" and "no idea" are very
     # different operational states and must not look alike.
@@ -312,16 +315,103 @@ def test_redeploy_404s_for_an_unknown_tenant(client, auth):
 
 
 def test_redeploy_409s_when_the_tenant_has_no_railway_service(client, auth):
-    seed_tenant("t-1", status=TenantStatus.PROVISIONING, service_id=None)
+    seed_tenant("t-1", status=TenantStatus.RUNNING, service_id=None)
     r = client.post("/internal/tenants/t-1/redeploy", json={"image_tag": "v2"}, headers=auth)
     assert r.status_code == 409
     assert "service" in r.json()["detail"].lower()
+
+
+@respx.mock
+def test_redeploy_409s_for_a_tenant_the_state_machine_still_owns(client, auth):
+    """A PROVISIONING tenant already HAS a service id after the first step.
+
+    Redeploying it would race `_step_deploy`: two deploys against one service
+    seconds apart, with `set_variables` possibly landing after the container it was
+    meant to configure had already booted. The status check, not the service-id
+    check, is what prevents that.
+    """
+    fake = FakeRailway()
+    respx.post(GQL_URL).mock(side_effect=fake.handler)
+    seed_tenant("t-1", status=TenantStatus.PROVISIONING, service_id="svc-1")
+
+    r = client.post("/internal/tenants/t-1/redeploy", json={"image_tag": "v2"}, headers=auth)
+    assert r.status_code == 409
+    assert "provisioning" in r.json()["detail"].lower()
+    assert fake.calls == [], "must not touch Railway for a tenant mid-provision"
+
+
+@respx.mock
+def test_redeploy_409s_for_a_sleeping_tenant(client, auth):
+    """Deploying a scale-to-zero tenant would wake it (and bill for it), and it
+    emits no heartbeats while asleep so the drill could not verify it anyway."""
+    fake = FakeRailway()
+    respx.post(GQL_URL).mock(side_effect=fake.handler)
+    seed_tenant("t-1", status=TenantStatus.SLEEPING)
+    r = client.post("/internal/tenants/t-1/redeploy", json={"image_tag": "v2"}, headers=auth)
+    assert r.status_code == 409
+    assert fake.calls == []
+
+
+@respx.mock
+def test_redeploy_of_a_stopped_tenant_updates_the_image_but_does_not_start_it(
+    client, auth
+):
+    """A stopped tenant was halted on purpose (trial expiry, non-payment).
+
+    A fleet upgrade sweeping past must not resurrect it -- that is a container the
+    product decided to switch off, and starting it costs money. It still gets the
+    new image reference, so a legitimate resume lands on the right version.
+    """
+    fake = FakeRailway()
+    respx.post(GQL_URL).mock(side_effect=fake.handler)
+    seed_tenant("t-1", status=TenantStatus.STOPPED)
+
+    r = client.post("/internal/tenants/t-1/redeploy", json={"image_tag": "v2"}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["deployment_triggered"] is False
+    assert "serviceInstanceDeploy" not in fake.operations()
+    assert fake.variables_for("serviceInstanceUpdate")["input"]["source"] == {
+        "image": IMAGE_V2
+    }
+    with db.session_scope() as s:
+        assert s.get(Tenant, "t-1").image_ref == IMAGE_V2
 
 
 def test_redeploy_409s_for_a_deleted_tenant(client, auth):
     seed_tenant("t-1", status=TenantStatus.DELETED, service_id=None)
     r = client.post("/internal/tenants/t-1/redeploy", json={"image_tag": "v2"}, headers=auth)
     assert r.status_code == 409
+
+
+def test_bare_tags_resolve_against_a_digest_pinned_tenant_image(monkeypatch):
+    """TENANT_IMAGE may be digest-pinned -- that is the discipline the tenant
+    Dockerfile's own FROM uses. Splitting the tag off naively would cut inside
+    `@sha256:` and emit `repo@sha256:v2`, which is not a reference at all."""
+    from control_api import config, provisioning
+
+    digest = "a" * 64
+    monkeypatch.setenv("TENANT_IMAGE", f"ghcr.io/shagarwal/squire/hermes-tenant@sha256:{digest}")
+    config.get_settings.cache_clear()
+    try:
+        assert (
+            provisioning.resolve_image_ref("v2")
+            == "ghcr.io/shagarwal/squire/hermes-tenant:v2"
+        )
+    finally:
+        config.get_settings.cache_clear()
+
+
+def test_image_reference_resolution_handles_registry_ports_and_full_refs(monkeypatch):
+    from control_api import config, provisioning
+
+    monkeypatch.setenv("TENANT_IMAGE", "ghcr.io:443/org/img:v0")
+    config.get_settings.cache_clear()
+    try:
+        assert provisioning.resolve_image_ref("v2") == "ghcr.io:443/org/img:v2"
+        # A full reference is passed through untouched, whatever the base is.
+        assert provisioning.resolve_image_ref("other.io/x/y:v9") == "other.io/x/y:v9"
+    finally:
+        config.get_settings.cache_clear()
 
 
 def test_redeploy_rejects_a_malformed_image_reference(client, auth):

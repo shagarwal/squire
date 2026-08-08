@@ -161,6 +161,15 @@ class HeartbeatRequest(BaseModel):
     hindsight_ops_processing: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
     hindsight_ops_failed: int | None = Field(default=None, ge=0, le=_MAX_COUNTER)
 
+    # Age of the last successful restic run. Accepted from day one even though no
+    # tenant can populate it yet (no B2 account): `extra="forbid"` means adding a
+    # field later is a COORDINATED change -- every tenant sending it would 422
+    # until control-api ships and deploys. Reserving the name now costs nothing and
+    # removes that ordering constraint from the day backups are switched on.
+    backup_last_success_age_seconds: int | None = Field(
+        default=None, ge=0, le=_MAX_COUNTER
+    )
+
 
 class HeartbeatResponse(BaseModel):
     """Deliberately tiny: the tenant has no use for a fleet view."""
@@ -198,6 +207,7 @@ class FleetTenant(BaseModel):
     hindsight_ops_pending: int | None = None
     hindsight_ops_processing: int | None = None
     hindsight_ops_failed: int | None = None
+    backup_last_success_age_seconds: int | None = None
 
 
 class FleetSummary(BaseModel):
@@ -240,4 +250,7 @@ class RedeployRequest(BaseModel):
 class RedeployResponse(BaseModel):
     tenant_id: str
     image_ref: str  # the fully-resolved reference we set on the service
+    #: False for a STOPPED tenant: it gets the new image but is deliberately not
+    #: started, because a fleet upgrade must not resurrect a container the product
+    #: switched off (trial expiry, non-payment).
     deployment_triggered: bool

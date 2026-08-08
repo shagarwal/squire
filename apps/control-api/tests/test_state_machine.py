@@ -129,6 +129,10 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         "CONTROL_API_URL",
         "INTERNAL_API_TOKEN",
         "PORT",
+        # Added deliberately in Task 0.6: the tenant echoes this back on every
+        # heartbeat, which is what lets /fleet report the fleet's real image and
+        # lets the upgrade drill skip tenants already on the target.
+        "SQUIRE_IMAGE_REF",
     }
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
@@ -136,6 +140,11 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
     assert sent["CONTROL_API_URL"] == "https://control-api.squire.test"
     assert sent["ANTHROPIC_BASE_URL"] == "https://trial-proxy.squire.test"
     assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
+    # Matches the image the service was created from, and the tenant row's mirror
+    # of it -- /fleet compares the two to spot a tenant that never converged.
+    assert sent["SQUIRE_IMAGE_REF"] == "ghcr.io/shagarwal/squire/hermes-tenant:v0"
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).image_ref == sent["SQUIRE_IMAGE_REF"]
     # DEK is exactly 32 random bytes, base64 encoded.
     assert len(base64.b64decode(sent["SQUIRE_DEK"])) == 32
 

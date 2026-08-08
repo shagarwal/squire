@@ -183,19 +183,24 @@ def redeploy_tenant(
     previous tag. Not idempotent in the "no-op if already there" sense -- calling it
     twice with the same tag triggers two deploys, which is the correct behaviour for
     an operator who wants a tenant restarted.
+
+    409 for any tenant not in `provisioning.REDEPLOYABLE_STATUSES`: still
+    provisioning (the state machine owns it), sleeping, or deleted. A STOPPED tenant
+    is accepted but has its image updated WITHOUT a deploy -- see `redeploy_tenant`
+    -- and reports `deployment_triggered: false`.
     """
     try:
-        _, image_ref = provisioning.redeploy_tenant(
+        _, image_ref, deployed = provisioning.redeploy_tenant(
             session, tenant_id, image_tag=payload.image_tag
         )
     except provisioning.TenantNotFound as exc:
         raise HTTPException(status_code=404, detail="tenant not found") from exc
     except provisioning.ProvisioningError as exc:
         # 409, not 500: the tenant exists, it is just not in a state that can be
-        # redeployed (still provisioning, or crypto-shredded).
+        # redeployed (still provisioning, sleeping, or crypto-shredded).
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RedeployResponse(
-        tenant_id=tenant_id, image_ref=image_ref, deployment_triggered=True
+        tenant_id=tenant_id, image_ref=image_ref, deployment_triggered=deployed
     )
 
 
@@ -268,6 +273,9 @@ def fleet(
                 hindsight_ops_pending=beat.hindsight_ops_pending if beat else None,
                 hindsight_ops_processing=beat.hindsight_ops_processing if beat else None,
                 hindsight_ops_failed=beat.hindsight_ops_failed if beat else None,
+                backup_last_success_age_seconds=(
+                    beat.backup_last_success_age_seconds if beat else None
+                ),
             )
         )
 
