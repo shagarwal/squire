@@ -1,0 +1,104 @@
+# config.yaml — baked Squire tenant configuration for hermes-agent.
+#
+# Seeded onto the volume on FIRST BOOT ONLY (see bin/squire-entrypoint.sh); after
+# that the tenant's copy is authoritative and image upgrades leave it alone.
+# Hermes also rewrites this file in place when a config migration runs, so treat
+# it as a starting point, not a source of truth for a running tenant.
+#
+# Only keys where Squire deliberately differs from upstream's defaults are set.
+# Everything omitted inherits hermes_cli/config_defaults.py, which keeps this
+# file readable and keeps upgrades from silently freezing an old default.
+#
+# Credentials NEVER live here. They live in .env / auth.json, which are symlinks
+# into tmpfs and are DEK-encrypted at rest on the volume.
+
+# --- Model -----------------------------------------------------------------
+# Trial default is Haiku-class: it runs on our metered key against a ~$2 hard
+# budget (PRD §5.3), and it is genuinely good enough to make the product feel
+# real. The concierge's whole job is to get the tenant onto their own provider,
+# at which point `hermes model <provider:model>` (or the connect flow) rewrites
+# this. Provider credentials and ANTHROPIC_BASE_URL (the trial proxy) come from
+# the environment, set per tenant by control-api.
+model: "anthropic:claude-haiku-4-5"
+
+# Fallback ladder. Empty by default: during the trial there is only one key, and
+# a silent fallback to a different provider would quietly bypass the metering
+# proxy. The connect-your-LLM flow populates this when a tenant chooses the
+# Claude Max OAuth path (PRD §6 risk 2 — "unsupported, may break, auto-fallback
+# to API key"), which is precisely the case where a ladder earns its keep.
+fallback_providers: []
+
+# --- Long-term memory ------------------------------------------------------
+# Hindsight is what makes the agent feel like it knows you. It runs as a
+# separate supervised process in this same container and is reached over
+# loopback; connection details live in hindsight/config.json.
+memory:
+  provider: "hindsight"
+  memory_enabled: true
+  user_profile_enabled: true
+  # No approval gate on memory writes: an assistant that asks permission before
+  # remembering your timezone is not the product.
+  write_approval: false
+
+# --- Agent behaviour -------------------------------------------------------
+agent:
+  # Upstream default is 500. A messaging agent that burns 500 turns on one
+  # request is not thinking, it is stuck — and on the trial key it is also
+  # expensive. Cap it well below the point where the user has given up.
+  max_turns: 120
+  # 30 min of *inactivity* (upstream default) is far too long to leave someone
+  # staring at a chat. 10 minutes is still generous for a long tool loop.
+  gateway_timeout: 600
+
+# --- Telegram --------------------------------------------------------------
+# The bot token, webhook URL, secret and allowlist all arrive as environment
+# variables from control-api; gateway/config.py enables the platform as soon as
+# TELEGRAM_BOT_TOKEN is present, so nothing here needs to turn it on.
+telegram:
+  # 👀 / ✅ reactions while a turn is running. Cheap, and it makes a slow tool
+  # loop feel alive instead of ignored — which matters a lot more when the
+  # container may have been asleep a second ago.
+  reactions: true
+
+display:
+  platforms:
+    telegram:
+      # Stream partial replies via message edits. This is the single biggest
+      # perceived-latency win on Telegram.
+      streaming: true
+      # Tool-progress chatter off: "running terminal…" spam reads as noise in a
+      # personal chat. The reactions above already signal "I'm working".
+      tool_progress: "off"
+
+# --- Skills ----------------------------------------------------------------
+skills:
+  external_dirs: []
+  # Lets SKILL.md files reference their own directory via ${HERMES_SKILL_DIR} —
+  # the concierge skill uses it to find its state machine file.
+  template_vars: true
+
+# --- Approvals -------------------------------------------------------------
+# Left at upstream defaults deliberately. The dangerous-action approval flow is
+# one of the things the PRD sells (§2 "cross-chat approvals"), and re-deriving
+# its policy here would fork behaviour we want to inherit from upstream.
+
+# --- Logging ---------------------------------------------------------------
+# The gateway sees every message the user sends. Its stdout is shipped to
+# Railway's log aggregator, which sits OUTSIDE the tenant's isolation boundary
+# and is readable by anyone with project access — so log verbosity is a privacy
+# control here, not an ops preference.
+#
+# Upstream's default is INFO (hermes_cli/config_defaults.py:2379). WARNING keeps
+# errors and genuine operational problems visible while dropping the per-turn
+# chatter. There is no environment-variable equivalent, which is why this lives
+# in config rather than next to the Hindsight log settings in the Dockerfile.
+#
+# Raise to INFO/DEBUG only for a time-boxed, consented debugging session on a
+# specific tenant, and lower it again afterwards.
+logging:
+  level: "WARNING"
+
+# --- Timezone --------------------------------------------------------------
+# UTC until the concierge learns the user's real timezone in the first
+# conversation, at which point it writes the IANA name here.
+timezone: "UTC"

@@ -1,0 +1,31 @@
+# Build context is tenant-image/ (see .github/workflows/tenant-image.yml).
+# Keep it tiny — everything here is COPYed into the image, so anything that
+# sneaks in is shipped to every tenant.
+
+# Never ship secrets, even by accident. The image builds credentials at
+# runtime from SQUIRE_DEK; there is no legitimate reason for any of these to
+# be in the build context.
+.env
+.env.*
+*.pem
+*.key
+auth.json
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Python bytecode from any local test run
+__pycache__/
+*.py[cod]
+
+# Local scratch
+*.log
+.tmp/
+
+# Tests run in CI against the source tree, never inside the image. Keeping them
+# out of the build context also means editing a test cannot bust the build cache.
+tests/

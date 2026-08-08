@@ -1,0 +1,62 @@
+# markers.tsv — the marker greps from docs/reference/hermes-update-plan-v2026.8.3.md
+# §Phase 4, turned into a machine-checkable list.
+#
+# Every row is a string that MUST be present in the built image's hermes tree.
+# verify-markers.sh greps them all and fails the build if any is missing. This
+# is the mechanism that catches, at build time and not on a live tenant:
+#
+#   * an upstream release that silently dropped a fix we rely on (the OAuth
+#     billing lane — see docs/reference/hermes-400-extra-usage-fix.md); and
+#   * a patch that "applied cleanly" into the wrong place after a refactor.
+#
+# Format: 4 TAB-separated columns.
+#   id       short label used in build/CI output
+#   file     path relative to the hermes install root (/opt/hermes)
+#   pattern  fixed string (grep -F) that must appear in that file
+#   required "required" -> missing is a build failure
+#            "optional" -> missing is a warning (use for patches not yet
+#                          vendored into this repo, so the image still builds)
+#
+# Do not use a regex here on purpose: fixed strings survive reformatting, and
+# a marker that quietly stops matching because of an escaping subtlety is worse
+# than no marker at all.
+#
+# id	file	pattern	required
+
+# --- Upstream fixes we depend on -------------------------------------------
+# The OAuth wire-name promotion. If this disappears, Claude Max / subscription
+# OAuth traffic flips from plan-billing to the extra-usage lane and tenants get
+# HTTP 400 "out of extra usage". Update plan §1: "the self-update script's
+# verification markers ... are both still valid".
+upstream-oauth-wire-name	agent/anthropic_adapter.py	_to_oauth_wire_name	required
+# The double-underscore MCP tool prefix constant that the promotion writes to.
+# A single `mcp_` is the exact token that triggers the extra-usage lane.
+upstream-mcp-prefix	agent/anthropic_adapter.py	_MCP_TOOL_PREFIX = "mcp__"	required
+
+# --- Anchors the cross-chat approval patches attach to ----------------------
+# The update plan's file-disjoint rule assigns 002 -> tools/approval.py and
+# 003 -> gateway/slash_commands.py. These rows pin the specific upstream
+# functions those patches hook, so an upstream refactor that renames or removes
+# them fails the build with an obvious reason instead of a mystery patch
+# rejection (or, worse, a patch that still applies to the wrong place).
+#
+# Both strings verified present in the v2026.8.3 tree.
+#
+# 002 hooks the gateway approval-resolution plumbing so an approval raised in
+#     one chat can be resolved from another.
+patch-002-anchor	tools/approval.py	def resolve_gateway_approval(	required
+patch-002-anchor-notify	tools/approval.py	def register_gateway_notify(	required
+# 003 extends the /approve slash command to accept a session key. Update plan
+#     §2: "Native /approve accepts no session-key argument ... patch 003 is
+#     still required for cross-chat approve."
+patch-003-anchor	gateway/slash_commands.py	_handle_approve_command	required
+
+# --- Squire patch markers ---------------------------------------------------
+# These correspond to the founder's patches 001/002/003, which are NOT yet
+# vendored into tenant-image/patches/ (they live on the VPS at
+# ~/.hermes/patches/). They are marked `optional` so the image builds without
+# them; flip each to `required` in the same commit that adds its .patch file.
+#
+# 001 — OAuth system-prompt scrubber. Marker per update plan §Phase 4:
+#       `grep '/home/agent' agent/anthropic_adapter.py`
+squire-001-oauth-scrubber	agent/anthropic_adapter.py	/home/agent	optional

@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+#
+# squire-hindsight-env.sh — derive Hindsight's LLM credentials, once, in one place.
+#
+# WHY THIS EXISTS
+# ---------------
+# Hindsight needs an LLM for extraction and consolidation. Which one changes
+# during a tenant's life, and the change is invisible:
+#
+#   trial      -> our metered proxy key (ANTHROPIC_BASE_URL + trial key)
+#   conversion -> the user's own key, written into .env by the connect flow,
+#                 at which point the TRIAL KEY IS REVOKED.
+#
+# Before this script, the daemon was wired once at boot and never again. So the
+# moment a user converted — the single most valuable event in the product — the
+# daemon kept calling a revoked key, every extraction 401'd, and memory silently
+# stopped accumulating for exactly the customers who had just paid. Nothing
+# crashed; the agent simply, gradually, stopped remembering.
+#
+# So: the derivation lives here, both the entrypoint (boot) and
+# squire-secrets-sync.sh (on every .env change) call it, and the daemon reads
+# the result through squire-hindsight-run.sh. supervisord programs inherit
+# supervisord's environment at start, so a plain `restart` would NOT pick up new
+# values — the wrapper re-sourcing this file is what makes a restart effective.
+#
+# Usage: squire-hindsight-env.sh [--quiet]
+# Exit:  0 unchanged · 10 changed (caller should restart the daemon) · 1 error
+
+set -uo pipefail
+
+TMPFS_DIR="${SQUIRE_SECRETS_TMPFS:-/dev/shm/squire}"
+ENV_FILE="$TMPFS_DIR/.env"
+OUT_FILE="${SQUIRE_HINDSIGHT_ENV_FILE:-$TMPFS_DIR/hindsight-llm.env}"
+
+quiet=false
+[ "${1:-}" = "--quiet" ] && quiet=true
+log() { [ "$quiet" = true ] || printf '[squire-hindsight-env] %s\n' "$*"; }
+
+# PRECEDENCE IS PER-SOURCE, NOT PER-KEY. This is the whole correctness argument.
+# -----------------------------------------------------------------------------
+# The obvious implementation — "for each key, take .env if present, else the
+# process env" — is wrong, and wrong in a way that silently breaks half the
+# conversion paths:
+#
+#   Trial:      process env has ANTHROPIC_API_KEY (trial) + ANTHROPIC_BASE_URL
+#               (our metering proxy). .env has no provider key.
+#   User connects OpenAI (or ChatGPT/Codex — 2 of the 4 offered paths):
+#               .env now holds OPENAI_API_KEY. The process env STILL holds the
+#               trial ANTHROPIC_API_KEY until the next redeploy.
+#
+# Per-key fallback would then find an Anthropic key (from the stale process env),
+# take the Anthropic branch, and configure Hindsight with the REVOKED trial key
+# — the exact failure this script was written to fix, reintroduced through the
+# back door. A per-key rule would also happily pair the user's own key with our
+# proxy's base URL, routing their traffic back through our infrastructure after
+# we told them it never would again.
+#
+# So: .env and the process env are treated as two whole, mutually exclusive
+# configurations. If .env supplies ANY provider credential, the tenant has
+# connected their own LLM and .env is the ONLY source consulted — keys and base
+# URLs together. Otherwise we are still on the provisioned trial config.
+file_get() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1; }
+
+# CLAUDE_CODE_OAUTH_TOKEN counts as "the tenant has connected something" even
+# though Hindsight cannot use it (see below). Without it in this list, a Claude
+# Max tenant would fall through to the process env and land right back on the
+# revoked trial key.
+CONNECTED_MARKERS="ANTHROPIC_API_KEY OPENAI_API_KEY CLAUDE_CODE_OAUTH_TOKEN"
+
+tenant_connected=false
+for marker in $CONNECTED_MARKERS; do
+    if [ -n "$(file_get "$marker")" ]; then
+        tenant_connected=true
+        break
+    fi
+done
+
+if [ "$tenant_connected" = true ]; then
+    source_label=".env (tenant's own provider)"
+    ANTHROPIC_KEY="$(file_get ANTHROPIC_API_KEY)"
+    ANTHROPIC_BASE="$(file_get ANTHROPIC_BASE_URL)"
+    OPENAI_KEY="$(file_get OPENAI_API_KEY)"
+    OPENAI_BASE="$(file_get OPENAI_BASE_URL)"
+    OAUTH_ONLY_TOKEN="$(file_get CLAUDE_CODE_OAUTH_TOKEN)"
+else
+    source_label="process env (provisioned trial)"
+    ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
+    ANTHROPIC_BASE="${ANTHROPIC_BASE_URL:-}"
+    OPENAI_KEY="${OPENAI_API_KEY:-}"
+    OPENAI_BASE="${OPENAI_BASE_URL:-}"
+    OAUTH_ONLY_TOKEN=""
+fi
+
+provider=""; model=""; key=""; base=""
+
+if [ -n "$ANTHROPIC_KEY" ]; then
+    provider="anthropic"
+    # Haiku-class on purpose: this runs on EVERY retained turn in the
+    # background. Using the conversation model here would multiply the tenant's
+    # bill for work the user never sees.
+    model="${HINDSIGHT_LLM_MODEL_ANTHROPIC:-claude-haiku-4-5}"
+    key="$ANTHROPIC_KEY"
+    base="$ANTHROPIC_BASE"
+elif [ -n "$OPENAI_KEY" ]; then
+    provider="openai"
+    model="${HINDSIGHT_LLM_MODEL_OPENAI:-gpt-4.1-mini}"
+    key="$OPENAI_KEY"
+    base="$OPENAI_BASE"
+fi
+
+tmp="$(mktemp "${OUT_FILE}.XXXXXX")" || exit 1
+chmod 0600 "$tmp"
+{
+    echo "# Generated by squire-hindsight-env.sh — do not edit."
+    if [ -n "$provider" ]; then
+        echo "HINDSIGHT_API_LLM_PROVIDER=$provider"
+        echo "HINDSIGHT_API_LLM_MODEL=$model"
+        echo "HINDSIGHT_API_LLM_API_KEY=$key"
+        [ -n "$base" ] && echo "HINDSIGHT_API_LLM_BASE_URL=$base"
+    fi
+} > "$tmp"
+
+# Compare before replacing so an unchanged pass is a genuine no-op and cannot
+# trigger a pointless daemon restart (which would discard in-flight extraction).
+if [ -f "$OUT_FILE" ] && cmp -s "$tmp" "$OUT_FILE"; then
+    rm -f "$tmp"
+    exit 0
+fi
+
+mv "$tmp" "$OUT_FILE"
+chmod 0600 "$OUT_FILE"
+
+if [ -n "$provider" ]; then
+    # Never log the key. Provider/model/base/source only — enough to debug a
+    # misconfiguration, useless to anyone reading the log aggregator.
+    log "LLM config changed: provider=$provider model=$model base=${base:-<default>} source=$source_label"
+elif [ -n "$OAUTH_ONLY_TOKEN" ]; then
+    # Known, honest limitation. Two of the four connect paths hand us an OAuth
+    # token rather than an API key. Codex is fine — it exposes an
+    # OpenAI-compatible endpoint, so it arrives as OPENAI_API_KEY +
+    # OPENAI_BASE_URL and takes the openai branch above. Claude Max does not:
+    # CLAUDE_CODE_OAUTH_TOKEN is not an Anthropic API key and hindsight-api has
+    # no OAuth path for it.
+    #
+    # The important part is what we do NOT do: fall back to the trial key. It is
+    # revoked, so that would mean an hour of 401s instead of a clear idle state.
+    # Extraction pauses, recall of existing memories keeps working, and the
+    # concierge's fallback ladder can ask for an API key.
+    log "tenant connected via Claude Max OAuth only — Hindsight has no usable credential."
+    log "  Extraction is IDLE (recall of existing memories still works). Deliberate:"
+    log "  falling back to the revoked trial key would 401 on every turn instead."
+else
+    log "no LLM credentials available ($source_label) — Hindsight extraction idle until one is connected"
+fi
+exit 10
