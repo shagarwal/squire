@@ -15,6 +15,8 @@
 #                            the volume whenever the agent rewrites them
 #   6. squire-hindsight-healthcheck — the wedge/OOM auto-recovery loop from
 #                            docs/reference/hindsight-optimization-guide.md §4
+#   7. squire-heartbeat    — counts-only fleet telemetry to control-api
+#   8. squire-backup       — nightly restic snapshot of the volume to B2
 #
 # WHY WE BUILD *FROM* THE PUBLISHED UPSTREAM IMAGE
 # ------------------------------------------------
@@ -74,6 +76,22 @@ ARG HINDSIGHT_VERSION=0.9.0
 ARG TORCH_VERSION=2.9.1
 ARG SUPERVISOR_VERSION=4.3.0
 ARG CRYPTOGRAPHY_VERSION=49.0.0
+
+# restic — nightly volume backups (bin/squire-backup.sh, Task 0.6). Pinned by
+# version AND by the SHA-256 of the exact release artifact, taken from restic's
+# published SHA256SUMS for v0.19.1 on 2026-08-08. The checksum is what makes the
+# pin real: a version tag alone still trusts whatever bytes the CDN serves today,
+# and this binary is handed the tenant's data and a derived key.
+#
+# Installed from the release binary rather than Debian's `restic` package because
+# the distro version floats with the base image's apt state — the same mutable-input
+# problem the FROM digest exists to solve.
+#
+# To bump: pick the new version, take its line from
+# https://github.com/restic/restic/releases/download/v<NEW>/SHA256SUMS, update both
+# ARGs together. A mismatch fails the build loudly.
+ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
 
 # Everything below runs as root (build time). Runtime drops to the `hermes`
 # user (uid 10000) via upstream's main-wrapper.sh — see the CMD note at the
@@ -158,6 +176,53 @@ RUN uv venv --python 3.13 /opt/squire/hindsight-venv \
  && /opt/squire/hindsight-venv/bin/hindsight-api --help > /dev/null
 
 # ---------------------------------------------------------------------------
+# 2b. restic (nightly volume backups)
+# ---------------------------------------------------------------------------
+# Downloaded and verified with the Squire venv's own Python rather than
+# curl+sha256sum: neither curl nor bzip2 is a declared dependency of the upstream
+# image, and `apt-get install` would drag apt state (and its own floating versions)
+# into an image whose whole discipline is pinned inputs. The interpreter is already
+# here and its stdlib does all three jobs — fetch, verify, decompress.
+#
+# The verification is a hard gate: a mismatched digest fails the BUILD. This binary
+# is handed the tenant's entire volume and a DEK-derived key, so "probably the right
+# bytes" is not a standard it gets to meet.
+RUN RESTIC_VERSION="${RESTIC_VERSION}" RESTIC_SHA256="${RESTIC_SHA256}" \
+    /opt/squire/venv/bin/python <<'PY'
+import bz2
+import hashlib
+import os
+import urllib.request
+
+version = os.environ["RESTIC_VERSION"]
+expected = os.environ["RESTIC_SHA256"]
+url = (
+    "https://github.com/restic/restic/releases/download/"
+    f"v{version}/restic_{version}_linux_amd64.bz2"
+)
+with urllib.request.urlopen(url, timeout=180) as response:
+    blob = response.read()
+
+# The checksum is over the published .bz2 artifact, exactly as restic's own
+# SHA256SUMS lists it -- so this verifies the bytes that crossed the network,
+# not the bytes after our own decompression.
+digest = hashlib.sha256(blob).hexdigest()
+if digest != expected:
+    raise SystemExit(f"restic {version}: sha256 {digest} != expected {expected}")
+
+path = "/usr/local/bin/restic"
+with open(path, "wb") as fh:
+    fh.write(bz2.decompress(blob))
+os.chmod(path, 0o755)
+print(f"restic {version} installed (sha256 verified)")
+PY
+
+# Separate layer so the binary being runnable is asserted independently of the
+# download step -- and so a `restic` that cannot exec fails the build here rather
+# than at 03:00 UTC on a tenant.
+RUN /usr/local/bin/restic version
+
+# ---------------------------------------------------------------------------
 # 3. Patch overlay
 # ---------------------------------------------------------------------------
 # The three-tier fork discipline from docs/reference/git-strategy.md, moved into
@@ -231,6 +296,7 @@ RUN /opt/squire/venv/bin/python -m py_compile \
         /opt/squire/bin/squire_secrets.py \
         /opt/squire/bin/squire-webhook-shim.py \
         /opt/squire/bin/squire-hindsight-healthcheck.py \
+        /opt/squire/bin/squire-heartbeat.py \
  && chmod -R a+rX /opt/squire \
  && mkdir -p /opt/squire/run \
  && chown hermes:hermes /opt/squire/run
@@ -381,6 +447,27 @@ ENV HINDSIGHT_API_HOST=127.0.0.1 \
 # test_boot_path.sh asserts that no plaintext secret reaches captured output.
 ENV HINDSIGHT_API_LOG_LEVEL=warning \
     HINDSIGHT_API_ACCESS_LOG=false
+
+# --- Fleet heartbeat + backups (Task 0.6) ----------------------------------
+# The heartbeat emitter posts counts-only telemetry to control-api every
+# SQUIRE_HEARTBEAT_INTERVAL seconds. 300s (5 min) against control-api's 900s
+# staleness window means a tenant has to miss three beats before /fleet calls it
+# stale — one missed beat is a redeploy, three is a problem.
+#
+# Supplied per tenant by control-api, NOT baked here:
+#   CONTROL_API_URL, INTERNAL_API_TOKEN, TENANT_ID  (provisioning contract)
+#   SQUIRE_IMAGE_REF   set by POST /internal/tenants/{id}/redeploy; this is what
+#                      the upgrade drill checks to prove a canary converged
+#
+# Backups are OFF until a B2 account exists: with RESTIC_REPOSITORY and the
+# B2_*/AWS_* credentials unset, squire-backup.sh logs one line and exits 0. The
+# schedule knobs are baked so the behaviour is visible in the repo rather than
+# hidden in a Railway variable nobody remembers setting.
+ENV SQUIRE_HEARTBEAT_INTERVAL=300 \
+    SQUIRE_BACKUP_HOUR_UTC=3 \
+    SQUIRE_BACKUP_JITTER_SECONDS=3600 \
+    SQUIRE_BACKUP_KEEP_DAILY=7 \
+    SQUIRE_BACKUP_KEEP_WEEKLY=4
 
 # --- Gateway supervision opt-out -------------------------------------------
 # CRITICAL, and non-obvious: upstream's `hermes gateway run` detects that it is

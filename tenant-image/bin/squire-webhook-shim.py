@@ -17,7 +17,8 @@ this is that shim. ~150 lines of stdlib, no hermes source touched.
 It also buys three things worth having on their own:
 
   * a stable /health endpoint that answers during a cold start, before the
-    gateway (which takes tens of seconds) is listening;
+    gateway (which takes tens of seconds) is listening, plus a /metrics endpoint
+    carrying counts-by-outcome for the Task 0.6 fleet heartbeat;
   * the X-Telegram-Bot-Api-Secret-Token header is stamped on the forwarded
     request, so python-telegram-bot's mandatory secret check passes regardless
     of whether our ingress preserves inbound headers; and
@@ -82,6 +83,33 @@ def log(msg: str) -> None:
     # (PRD §4) and the tenant must not become the place where message content
     # leaks into a platform log aggregator.
     print(f"[squire-webhook] {msg}", flush=True)
+
+
+# --- Outcome counters (Task 0.6 heartbeat) ----------------------------------
+# The shim is the only place in the container that sees every inbound Telegram
+# update, so it is where "how is this tenant actually doing" is countable. Three
+# COUNTS, by outcome, and nothing else: no chat ids, no per-user breakdown, no
+# timing histogram keyed by anything identifying. squire-heartbeat.py scrapes
+# GET /metrics and forwards these to control-api.
+#
+# In memory only, cumulative since this process started. They reset on every
+# restart, which is why the heartbeat sends uptime alongside them.
+_COUNTERS = {
+    "updates_forwarded": 0,  # delivered to the gateway, which accepted it
+    "updates_failed": 0,  # we tried and could not deliver (gateway down, 5xx, polling)
+    "updates_rejected": 0,  # refused before delivery (bad auth, malformed request)
+}
+_COUNTERS_LOCK = threading.Lock()
+
+
+def count(name: str) -> None:
+    with _COUNTERS_LOCK:
+        _COUNTERS[name] += 1
+
+
+def counters_snapshot() -> dict:
+    with _COUNTERS_LOCK:
+        return dict(_COUNTERS)
 
 
 def _authorised(headers) -> bool:
@@ -152,6 +180,12 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path.split("?", 1)[0] == "/metrics":
+            # Counts only, scraped over loopback by squire-heartbeat.py. Left
+            # unauthenticated for the same reason /health is: it exposes nothing
+            # a caller could not infer from whether the tenant answers at all.
+            self._respond(200, counters_snapshot())
+            return
         self._respond(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802 - stdlib naming
@@ -162,11 +196,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if REQUIRE_AUTH and not _authorised(self.headers):
             log("rejected unauthenticated webhook POST")
+            count("updates_rejected")
             self._respond(401, {"error": "unauthorised"})
             return
 
         if not UPSTREAM_PATH:
             # Adapter is in polling mode — there is nothing to forward to.
+            count("updates_failed")
             self._respond(
                 503,
                 {"error": "tenant is not in webhook mode (TELEGRAM_WEBHOOK_URL unset)"},
@@ -177,9 +213,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            count("updates_rejected")
             self._respond(400, {"error": "bad Content-Length"})
             return
         if length <= 0 or length > MAX_BODY:
+            count("updates_rejected")
             self._respond(413, {"error": "body missing or too large"})
             return
 
@@ -208,6 +246,7 @@ class Handler(BaseHTTPRequestHandler):
             # Retry-After lets the caller (ingress, or Telegram itself) redeliver
             # rather than dropping the user's message on the floor.
             log(f"upstream unavailable: {exc.__class__.__name__}: {exc}")
+            count("updates_failed")
             self._respond(
                 503,
                 {"error": "gateway not ready"},
@@ -228,6 +267,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if status >= 400:
             log(f"upstream returned {status}")
+            count("updates_failed")
+        else:
+            count("updates_forwarded")
         self._respond(200 if status < 400 else status, {"ok": status < 400})
 
 

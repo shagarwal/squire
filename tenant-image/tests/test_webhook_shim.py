@@ -149,6 +149,19 @@ try:
         check("secret-token header stamped", r["secret"] == SECRET, r["secret"])
         check("content-type preserved", r["ctype"] == "application/json", r["ctype"])
 
+    # Counts-by-outcome for the Task 0.6 heartbeat. Counts only -- no chat ids, no
+    # per-user breakdown; squire-heartbeat.py scrapes this and forwards it verbatim.
+    status, metrics = get("/metrics")
+    check("GET /metrics -> 200", status == 200, (status, metrics))
+    check("counts the forwarded update", metrics.get("updates_forwarded") == 1, metrics)
+    check("no failures counted", metrics.get("updates_failed") == 0, metrics)
+    check("no rejections counted", metrics.get("updates_rejected") == 0, metrics)
+    check(
+        "metrics expose counts and nothing else",
+        set(metrics) == {"updates_forwarded", "updates_failed", "updates_rejected"},
+        metrics,
+    )
+
     status, _ = post("/wrong/path", update)
     check("unknown path -> 404", status == 404, status)
 
@@ -183,6 +196,9 @@ try:
     )
     check("internal token accepted", status == 200, status)
     check("both authorised posts forwarded", len(received) == 2, len(received))
+    _, metrics = get("/metrics")
+    check("the 401 is counted as a rejection", metrics.get("updates_rejected") == 1, metrics)
+    check("rejections are not counted as forwarded", metrics.get("updates_forwarded") == 2, metrics)
 finally:
     proc.terminate()
     proc.wait(timeout=10)
@@ -209,6 +225,10 @@ try:
     check("health reports gateway not listening", body.get("gateway_listening") is False, body)
     status, body = post("/webhook/telegram", {"update_id": 10})
     check("webhook POST -> retryable 503", status == 503, (status, body))
+    _, metrics = get("/metrics")
+    # This is the counter that tells the fleet a tenant is dropping messages while
+    # still answering health checks -- the failure mode nothing else would catch.
+    check("an undeliverable update is counted as failed", metrics.get("updates_failed") == 1, metrics)
 finally:
     proc.terminate()
     proc.wait(timeout=10)

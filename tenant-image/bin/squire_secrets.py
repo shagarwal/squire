@@ -24,6 +24,7 @@ Usage
     squire_secrets.py seal   <plaintext-path> <enc-path> <aad-name>
     squire_secrets.py unseal <enc-path> <plaintext-path> <aad-name>
     squire_secrets.py check                 # DEK present and well-formed?
+    squire_secrets.py derive <label>        # HMAC-SHA256(DEK, label), hex
     squire_secrets.py selftest              # round-trip, no filesystem state
 
 Exit codes: 0 ok · 2 bad/missing DEK · 3 corrupt or wrong-key ciphertext ·
@@ -33,6 +34,8 @@ Exit codes: 0 ok · 2 bad/missing DEK · 3 corrupt or wrong-key ciphertext ·
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import os
 import sys
 import tempfile
@@ -161,6 +164,31 @@ def cmd_check(_argv: list[str]) -> int:
     return 0
 
 
+def cmd_derive(argv: list[str]) -> int:
+    """Print HMAC-SHA256(DEK, label) as hex -- a purpose-bound subkey of the DEK.
+
+    Used by squire-backup.sh for the restic repository password. Two properties
+    matter, and both come from using an HMAC rather than the DEK itself:
+
+      * Possession of the B2 credentials alone reveals nothing. The repository
+        password never leaves this container and only exists while the backup runs.
+      * The backup password is not the DEK. If it leaked (a stray `ps`, a crash
+        dump, an operator pasting it into a ticket) it would let someone read the
+        restic repository -- but the files INSIDE that repository are the same
+        DEK-sealed blobs as on the volume, so the tenant's credentials stay
+        encrypted, and the leak does not extend to the volume itself. One-way
+        derivation is what keeps those two blast radii separate.
+
+    Crypto-shredding still works exactly as before: destroy the DEK and both the
+    volume and every backup snapshot become permanently unreadable, because this
+    password cannot be recovered without it either.
+    """
+    (label,) = argv
+    key = load_dek()
+    print(hmac.new(key, label.encode("utf-8"), hashlib.sha256).hexdigest())
+    return 0
+
+
 def cmd_selftest(_argv: list[str]) -> int:
     """Round-trip against a throwaway key. Used by CI; touches no tenant state."""
     key = os.urandom(KEY_LEN)
@@ -188,6 +216,16 @@ def cmd_selftest(_argv: list[str]) -> int:
     # Ciphertext must not contain the plaintext anywhere.
     assert b"sk-test" not in blob, "plaintext leaked into ciphertext"
 
+    # Derived subkeys (the restic repository password) must be deterministic,
+    # label-separated, and must not be the DEK itself.
+    def derived(k: bytes, label: str) -> str:
+        return hmac.new(k, label.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert derived(key, "restic-repo") == derived(key, "restic-repo"), "derive is not stable"
+    assert derived(key, "restic-repo") != derived(key, "other"), "labels are not separated"
+    assert derived(key, "restic-repo") != base64.b64encode(key).decode(), "derived == DEK"
+    assert derived(key, "restic-repo") != derived(os.urandom(KEY_LEN), "restic-repo")
+
     print("squire_secrets: selftest ok")
     return 0
 
@@ -196,6 +234,7 @@ COMMANDS = {
     "seal": (cmd_seal, 3),
     "unseal": (cmd_unseal, 3),
     "check": (cmd_check, 0),
+    "derive": (cmd_derive, 1),
     "selftest": (cmd_selftest, 0),
 }
 

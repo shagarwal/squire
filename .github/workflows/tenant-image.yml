@@ -285,8 +285,22 @@ jobs:
 
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
-        # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s.
+        # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,
+        # and the /metrics counts the fleet heartbeat is built on.
         run: python3 tenant-image/tests/test_webhook_shim.py
+
+      - name: Fleet heartbeat is counts-only
+        if: steps.present.outputs.exists == 'true'
+        # The emitter is the only process that talks to the control plane on a
+        # timer, so it is the one place conversation data could leak out of the
+        # tenant's isolation boundary. The test pins the payload to a whitelist.
+        run: python3 tenant-image/tests/test_heartbeat.py
+
+      - name: Backups never touch plaintext (and are inert until configured)
+        if: steps.present.outputs.exists == 'true'
+        # Asserts on the exact argv restic receives: no tmpfs path is ever a
+        # backup source, and the repository password is HMAC(DEK), not the DEK.
+        run: bash tenant-image/tests/test_backup.sh
 
       - name: Container contract constants
         if: steps.present.outputs.exists == 'true'
@@ -308,6 +322,22 @@ jobs:
           check tenant-image/Dockerfile 'SQUIRE_WEBHOOK_PATH=/webhook/telegram'
           check tenant-image/Dockerfile 'SQUIRE_VOLUME=/opt/data'
           check tenant-image/bin/squire-webhook-shim.py '"SQUIRE_WEBHOOK_PATH", "/webhook/telegram"'
+
+          # Task 0.6: control-api's /internal/heartbeat and the upgrade drill's
+          # convergence check both depend on these two names existing on the
+          # tenant side. Renaming either silently blinds the fleet view.
+          check tenant-image/bin/squire-heartbeat.py '/internal/heartbeat'
+          check tenant-image/bin/squire-heartbeat.py 'SQUIRE_IMAGE_REF'
+
+          # restic must be pinned by BOTH version and checksum. A version-only
+          # pin still trusts whatever bytes the CDN serves, for a binary handed
+          # the tenant's whole volume and a DEK-derived key.
+          if grep -qE '^ARG RESTIC_SHA256=[0-9a-f]{64}$' tenant-image/Dockerfile; then
+            echo "ok   restic is checksum-pinned"
+          else
+            echo "::error::tenant-image/Dockerfile must pin RESTIC_SHA256 to a 64-hex digest"
+            fail=1
+          fi
 
           # HOME is what decides whether pg0 puts the tenant's Postgres cluster
           # on the volume or on ephemeral container storage. A redeploy with the
@@ -337,3 +367,41 @@ jobs:
           fi
 
           exit "$fail"
+
+      - name: supervisord.conf is coherent
+        if: steps.present.outputs.exists == 'true'
+        # Parses the process table and checks the one config pairing whose failure
+        # is silent and fleet-wide: a program that is ALLOWED to exit cleanly
+        # (exitcodes=0 + autorestart=unexpected -- the heartbeat and backup
+        # programs, which no-op when unconfigured) must also have startsecs=0.
+        # With any non-zero startsecs, supervisord treats that intentional exit as
+        # a failed start and drives the program to FATAL on every container.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import configparser, sys
+
+          parser = configparser.ConfigParser(strict=False)
+          parser.read("tenant-image/supervisord.conf")
+
+          programs = [s for s in parser.sections() if s.startswith("program:")]
+          if not programs:
+              sys.exit("supervisord.conf declares no programs")
+
+          errors = []
+          for section in programs:
+              cfg = parser[section]
+              may_exit = cfg.get("autorestart", "") == "unexpected"
+              startsecs = cfg.get("startsecs", "1")
+              if may_exit and startsecs != "0":
+                  errors.append(
+                      f"{section}: autorestart=unexpected needs startsecs=0, got {startsecs}"
+                  )
+              if not cfg.get("command"):
+                  errors.append(f"{section}: no command")
+              print(f"ok  {section} (priority {cfg.get('priority', '?')})")
+
+          if errors:
+              print("\n".join(f"FAIL {e}" for e in errors), file=sys.stderr)
+              sys.exit(1)
+          PY
