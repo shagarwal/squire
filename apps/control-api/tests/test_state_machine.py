@@ -121,6 +121,8 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
     assert set(sent) == {
         "TENANT_ID",
         "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_URL",
+        "TELEGRAM_WEBHOOK_SECRET",
         "SQUIRE_DEK",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_API_KEY",
@@ -136,6 +138,33 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
     assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
     # DEK is exactly 32 random bytes, base64 encoded.
     assert len(base64.b64decode(sent["SQUIRE_DEK"])) == 32
+
+
+@respx.mock
+def test_tenant_webhook_vars_match_what_we_register_with_telegram(pool_bot, fake_railway):
+    """The tenant image self-registers its webhook on boot. If the url or secret we
+    hand it differed by even a character, its setWebhook would overwrite ours and
+    ingress would start rejecting updates on a stale secret."""
+    mock_all(fake_railway)
+    route = respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    import json
+
+    registered = json.loads(route.calls.last.request.read())
+    sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+
+    assert sent["TELEGRAM_WEBHOOK_URL"] == registered["url"]
+    assert sent["TELEGRAM_WEBHOOK_SECRET"] == registered["secret_token"]
+    # And both agree with what ingress will be told via the by-bot lookup.
+    assert sent["TELEGRAM_WEBHOOK_URL"] == f"https://ingress.squire.test/telegram/{BOT_ID}"
+    assert sent["TELEGRAM_WEBHOOK_SECRET"] == "whsec-abc"
 
 
 @respx.mock
@@ -607,7 +636,12 @@ def test_last_error_never_leaks_secrets_from_the_variables_payload(pool_bot, fak
         error = job.last_error or ""
 
     assert "Problem processing request" in error, "the useful part must survive"
-    for name in ("SQUIRE_DEK", "TELEGRAM_BOT_TOKEN", "INTERNAL_API_TOKEN"):
+    for name in (
+        "SQUIRE_DEK",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "INTERNAL_API_TOKEN",
+    ):
         assert captured[name] not in error, f"{name} value leaked into last_error"
     assert "[REDACTED]" in error
 

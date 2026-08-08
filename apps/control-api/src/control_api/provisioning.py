@@ -439,6 +439,13 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
     variables = {
         "TENANT_ID": tenant.id,
         "TELEGRAM_BOT_TOKEN": bot.token,
+        # The tenant image's PTB adapter self-registers its webhook on boot. Handing
+        # it the exact url+secret control-api registers below makes that call a
+        # harmless re-register instead of a fight: identical arguments, so
+        # last-writer-wins is a no-op and ingress's cached secret stays valid.
+        # control-api remains the authoritative registrar (see _step_set_webhook).
+        "TELEGRAM_WEBHOOK_URL": telegram_webhook_url(bot.id, settings),
+        "TELEGRAM_WEBHOOK_SECRET": bot.webhook_secret,
         "ANTHROPIC_BASE_URL": settings.effective_trial_base_url,
         "ANTHROPIC_API_KEY": trial_key or "",
         "CONTROL_API_URL": settings.control_api_url,
@@ -455,7 +462,15 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         assert tenant.dek_set, "SQUIRE_DEK may only be omitted once a DEK is set"
 
     # Keep every credential in this payload out of any error message we persist.
-    for secret in (dek, bot.token, trial_key, settings.internal_api_token):
+    # The webhook secret is included now that it travels as a Railway variable --
+    # a leaked one lets anyone forge Telegram updates into a tenant.
+    for secret in (
+        dek,
+        bot.token,
+        bot.webhook_secret,
+        trial_key,
+        settings.internal_api_token,
+    ):
         register_step_secret(secret)
 
     clients.railway.set_variables(tenant.railway_service_id, variables)
