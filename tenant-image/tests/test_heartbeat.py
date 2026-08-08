@@ -17,7 +17,9 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IMAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -50,6 +52,7 @@ ALLOWED_FIELDS = {
     "hindsight_ops_pending",
     "hindsight_ops_processing",
     "hindsight_ops_failed",
+    "backup_last_success_age_seconds",
 }
 
 received = []
@@ -211,6 +214,34 @@ if received:
         "hindsight_ops_pending" not in payload,
         payload,
     )
+
+print("== backup age is reported when a backup has succeeded ==")
+received.clear()
+with tempfile.TemporaryDirectory() as state_dir:
+    success_file = os.path.join(state_dir, "last-backup-success")
+    with open(success_file, "w", encoding="utf-8") as fh:
+        fh.write(str(int(time.time()) - 7200))  # two hours ago
+    rc, out = run_once(SQUIRE_BACKUP_SUCCESS_FILE=success_file)
+    check("beat sent with a backup timestamp present", rc == 0 and len(received) == 1, rc)
+    if received:
+        age = received[0]["payload"].get("backup_last_success_age_seconds")
+        # A backup that quietly stops working produces no error anywhere; this is
+        # the only number that would surface it.
+        check("reports the backup age", isinstance(age, int) and 7100 < age < 7300, age)
+
+    # A corrupt timestamp must omit the field, not send garbage or crash the beat.
+    received.clear()
+    with open(success_file, "w", encoding="utf-8") as fh:
+        fh.write("not-a-timestamp")
+    rc, _ = run_once(SQUIRE_BACKUP_SUCCESS_FILE=success_file)
+    omitted = received and "backup_last_success_age_seconds" not in received[0]["payload"]
+    check("a corrupt timestamp omits the field", rc == 0 and omitted, received)
+
+print("== malformed numeric env falls back instead of crash-looping ==")
+received.clear()
+rc, out = run_once(SQUIRE_HEARTBEAT_INTERVAL="not-a-number", PORT="80 80")
+check("still beats with garbage numeric env", rc == 0 and len(received) == 1, (rc, out))
+check("warns about the bad value", "is not a number" in out, out)
 
 print("== secrets are never logged ==")
 check("DEK absent from emitter output", DEK not in out)

@@ -12,6 +12,7 @@ Exit:  0 all assertions pass · 1 otherwise
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import threading
@@ -71,12 +72,31 @@ def post(path, payload, port=SHIM_PORT, headers=None):
         return e.code, json.loads(e.read() or b"{}")
 
 
-def get(path, port=SHIM_PORT):
+def get(path, port=SHIM_PORT, host="127.0.0.1"):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as r:
+        with urllib.request.urlopen(f"http://{host}:{port}{path}", timeout=10) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
+
+
+def own_non_loopback_ip():
+    """This host's own routable IP, or None if it only has loopback.
+
+    The shim binds 0.0.0.0, so connecting to this address reaches the same server
+    but arrives with a NON-loopback client address -- which is how a request from
+    another tenant on Railway's shared private network would look.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # TEST-NET-1. UDP "connect" sends nothing; it only picks a source address.
+        sock.connect(("192.0.2.1", 1))
+        ip = sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    return None if ip.startswith("127.") else ip
 
 
 def wait_ready(port, tries=60):
@@ -162,6 +182,22 @@ try:
         metrics,
     )
 
+    # CROSS-TENANT LEAK GUARD. This listener is on 0.0.0.0 and every tenant shares
+    # one Railway private network, so an open /metrics would let tenant B read
+    # tenant A's message volume and activity pattern. Loopback (or an
+    # authenticated caller) only.
+    peer = own_non_loopback_ip()
+    if peer:
+        status, body = get("/metrics", host=peer)
+        check("non-loopback /metrics -> 403", status == 403, (status, body))
+        check("denied response carries no counters", "updates_forwarded" not in body, body)
+        # /health must stay open on the same interface: a platform probe may come
+        # from anywhere, and it carries no per-tenant activity.
+        status, _ = get("/health", host=peer)
+        check("non-loopback /health still 200", status == 200, status)
+    else:
+        print("  SKIP  non-loopback /metrics (host has no routable address)")
+
     status, _ = post("/wrong/path", update)
     check("unknown path -> 404", status == 404, status)
 
@@ -199,6 +235,17 @@ try:
     _, metrics = get("/metrics")
     check("the 401 is counted as a rejection", metrics.get("updates_rejected") == 1, metrics)
     check("rejections are not counted as forwarded", metrics.get("updates_forwarded") == 2, metrics)
+
+    # With REQUIRE_AUTH on, an authenticated caller may scrape from off-box --
+    # that is the escape hatch for an operator or a future central collector.
+    peer = own_non_loopback_ip()
+    if peer:
+        req = urllib.request.Request(
+            f"http://{peer}:{SHIM_PORT}/metrics",
+            headers={"X-Squire-Internal-Token": "internal-tok"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            check("authenticated non-loopback /metrics allowed", r.status == 200, r.status)
 finally:
     proc.terminate()
     proc.wait(timeout=10)

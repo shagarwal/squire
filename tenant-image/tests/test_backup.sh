@@ -52,8 +52,14 @@ cat > "$STUB_DIR/restic" <<STUB
 printf '%s\n' "\$*" >> "$ARGV_LOG"
 printf 'RESTIC_PASSWORD=%s\n' "\${RESTIC_PASSWORD:-}" >> "$ENV_LOG"
 case "\$1" in
-  "cat")  exit 1 ;;   # "repository does not exist yet" -> forces the init path
-  *)      exit 0 ;;
+  "cat")
+    # \$SQUIRE_TEST_PROBE_ERROR lets a case choose which failure the probe
+    # reports: unset = "does not exist" (init path), set = that message.
+    if [ -n "\${SQUIRE_TEST_PROBE_ERROR:-}" ]; then
+      printf '%s\n' "\$SQUIRE_TEST_PROBE_ERROR" >&2
+    fi
+    exit 1 ;;
+  *) exit 0 ;;
 esac
 STUB
 chmod +x "$STUB_DIR/restic"
@@ -104,6 +110,16 @@ check "applied retention"             "$(says "$argv" '^forget')"
 check "retention keeps dailies"       "$(says "$argv" 'keep-daily 7')"
 check "retention prunes"              "$(says "$argv" 'prune')"
 check "backed up the volume"          "$(says "$argv" "backup $VOL")"
+# A container SIGKILLed mid-prune leaves an exclusive lock; without this every
+# subsequent night fails with "repository is already locked" and nobody notices.
+check "clears a stale lock before backing up" "$(says "$argv" '^unlock')"
+
+# The fleet heartbeat reports the age of this timestamp. A backup that quietly
+# stops working produces no error anywhere else.
+check "recorded the successful run" "$(yn test -f "$VOL/.squire/last-backup-success")"
+check "timestamp is a unix time" \
+    "$(yn grep -Eq '^[0-9]{10,}$' "$VOL/.squire/last-backup-success")" \
+    "$(cat "$VOL/.squire/last-backup-success" 2>/dev/null)"
 
 echo "  -- the assertion this file exists for --"
 # Every argument restic ever received, checked against the plaintext locations.
@@ -145,7 +161,28 @@ check "says why it refused"           "$(says "$out" 'plaintext')"
 check "restic not invoked on the refusal path" \
     "$([ ! -f "$ARGV_LOG" ] && echo 1 || echo 0)" "$(cat "$ARGV_LOG" 2>/dev/null)"
 
-echo "== 5. --check reports configuration without backing up =="
+echo "== 5. a wrong-password probe must NOT be treated as 'not initialised' =="
+# Both failures look identical to `restic cat config`, and the responses are
+# opposite: init a fresh repository, or stop and tell a human the DEK does not
+# match. Getting this wrong sends an operator hunting a B2 permissions problem
+# that does not exist, while the real cause is a re-provisioned DEK.
+rm -f "$ARGV_LOG" "$VOL/.squire/last-backup-success"
+out="$(run_backup \
+    RESTIC_REPOSITORY="$REPO" \
+    AWS_ACCESS_KEY_ID=k \
+    AWS_SECRET_ACCESS_KEY=s \
+    SQUIRE_TEST_PROBE_ERROR="Fatal: wrong password or no key found")"; rc=$?
+argv="$(cat "$ARGV_LOG" 2>/dev/null)"
+check "wrong password is a failure"    "$([ "$rc" -ne 0 ] && echo 1 || echo 0)" "rc=$rc"
+check "does NOT re-initialise the repository" \
+    "$([ "$(says "$argv" '^init')" = 0 ] && echo 1 || echo 0)" "$argv"
+check "does not back up over a mismatched repository" \
+    "$([ "$(says "$argv" '^backup')" = 0 ] && echo 1 || echo 0)" "$argv"
+check "names the real cause (DEK mismatch)" "$(says "$out" 'SQUIRE_DEK does not match')"
+check "no success timestamp on a failed run" \
+    "$(yn bash -c "! test -f '$VOL/.squire/last-backup-success'")"
+
+echo "== 6. --check reports configuration without backing up =="
 rm -f "$ARGV_LOG"
 out="$(env -i PATH="$PATH" HERMES_HOME="$VOL" SQUIRE_VOLUME="$VOL" \
     SQUIRE_SECRETS_TMPFS="$TMPFS" SQUIRE_PYTHON="$(command -v python3)" \

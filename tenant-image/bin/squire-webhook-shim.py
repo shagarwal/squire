@@ -17,8 +17,8 @@ this is that shim. ~150 lines of stdlib, no hermes source touched.
 It also buys three things worth having on their own:
 
   * a stable /health endpoint that answers during a cold start, before the
-    gateway (which takes tens of seconds) is listening, plus a /metrics endpoint
-    carrying counts-by-outcome for the Task 0.6 fleet heartbeat;
+    gateway (which takes tens of seconds) is listening, plus a loopback-only
+    /metrics endpoint carrying counts-by-outcome for the Task 0.6 heartbeat;
   * the X-Telegram-Bot-Api-Secret-Token header is stamped on the forwarded
     request, so python-telegram-bot's mandatory secret check passes regardless
     of whether our ingress preserves inbound headers; and
@@ -40,6 +40,7 @@ INTERNAL_API_TOKEN              shared secret with ingress, if it sends one
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import os
 import socket
@@ -127,6 +128,23 @@ def _authorised(headers) -> bool:
     return False
 
 
+def _is_loopback(client_address) -> bool:
+    """True when the peer is this container itself.
+
+    Covers all of 127.0.0.0/8, ::1 and the IPv4-mapped ::ffff:127.0.0.1 form a
+    dual-stack listener reports. Anything unparseable is treated as NOT loopback:
+    the safe default for an access check is to deny.
+    """
+    try:
+        host = ipaddress.ip_address(client_address[0])
+    except (ValueError, IndexError, TypeError):
+        return False
+    if host.is_loopback:
+        return True
+    mapped = getattr(host, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
 def _gateway_listening() -> bool:
     """Cheap TCP probe of the adapter's webhook listener."""
     try:
@@ -181,9 +199,21 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if self.path.split("?", 1)[0] == "/metrics":
-            # Counts only, scraped over loopback by squire-heartbeat.py. Left
-            # unauthenticated for the same reason /health is: it exposes nothing
-            # a caller could not infer from whether the tenant answers at all.
+            # LOOPBACK (or an authenticated caller) ONLY.
+            #
+            # This listener is bound to 0.0.0.0, and every tenant in the project
+            # shares one Railway private network — so an unauthenticated /metrics
+            # here would let tenant B read tenant A's message volume and activity
+            # pattern. That is a cross-tenant leak of behavioural data, and the
+            # fact that it is "only counts" does not make it theirs to read.
+            #
+            # /health stays open because a platform probe may reach it from
+            # anywhere and it carries no per-tenant activity. /metrics has no
+            # such requirement: squire-heartbeat.py scrapes it over 127.0.0.1.
+            if not (_is_loopback(self.client_address) or _authorised(self.headers)):
+                log("rejected non-loopback /metrics request")
+                self._respond(403, {"error": "forbidden"})
+                return
             self._respond(200, counters_snapshot())
             return
         self._respond(404, {"error": "not found"})

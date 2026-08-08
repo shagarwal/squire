@@ -42,6 +42,11 @@ SQUIRE_HEARTBEAT_INTERVAL    seconds between beats (default 300)
 PORT                         webhook shim's port, scraped for update counters
 HINDSIGHT_API_PORT           memory daemon health port (default 9177)
 SQUIRE_VOLUME                mounted volume, for the disk gauge (default /opt/data)
+SQUIRE_STATE_DIR             where squire-backup.sh records its last success
+
+Malformed numeric values fall back to the defaults with a warning rather than
+raising at import: a crash here is a supervisord restart loop, and telemetry is
+the last thing that should be able to cause one.
 
 Usage: squire-heartbeat.py [--once]
 """
@@ -60,19 +65,49 @@ import time
 import urllib.error
 import urllib.request
 
+def log(msg: str) -> None:
+    print(f"[squire-heartbeat] {msg}", flush=True)
+
+
+def _env_number(name: str, default, cast):
+    """Read a numeric environment variable, falling back loudly on garbage.
+
+    A typo'd `PORT=80 80` used to be a ValueError at import time -- which, under
+    supervisord, is a program that dies before it can log anything useful and then
+    restarts forever. Telemetry is the last thing that should be able to do that,
+    so a malformed value logs once and uses the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        log(f"warning: {name}={raw!r} is not a number — using {default}")
+        return default
+    if value <= 0:
+        log(f"warning: {name}={raw!r} must be positive — using {default}")
+        return default
+    return value
+
+
 CONTROL_API_URL = os.environ.get("CONTROL_API_URL", "").rstrip("/")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "")
 TENANT_ID = os.environ.get("TENANT_ID", "")
 IMAGE_REF = os.environ.get("SQUIRE_IMAGE_REF", "")
 
-INTERVAL = int(os.environ.get("SQUIRE_HEARTBEAT_INTERVAL", "300"))
-HTTP_TIMEOUT = float(os.environ.get("SQUIRE_HEARTBEAT_TIMEOUT", "15"))
+INTERVAL = _env_number("SQUIRE_HEARTBEAT_INTERVAL", 300, int)
+HTTP_TIMEOUT = _env_number("SQUIRE_HEARTBEAT_TIMEOUT", 15.0, float)
 
-SHIM_PORT = int(os.environ.get("PORT", "8080"))
+SHIM_PORT = _env_number("PORT", 8080, int)
 SHIM_HOST = os.environ.get("SQUIRE_HEARTBEAT_SHIM_HOST", "127.0.0.1")
-HINDSIGHT_PORT = int(os.environ.get("HINDSIGHT_API_PORT", "9177"))
-GATEWAY_PORT = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
+HINDSIGHT_PORT = _env_number("HINDSIGHT_API_PORT", 9177, int)
+GATEWAY_PORT = _env_number("TELEGRAM_WEBHOOK_PORT", 8443, int)
 VOLUME = os.environ.get("SQUIRE_VOLUME", "/opt/data")
+STATE_DIR = os.environ.get("SQUIRE_STATE_DIR", f"{VOLUME}/.squire")
+BACKUP_SUCCESS_FILE = os.environ.get(
+    "SQUIRE_BACKUP_SUCCESS_FILE", f"{STATE_DIR}/last-backup-success"
+)
 
 HINDSIGHT_PY = os.environ.get(
     "SQUIRE_HINDSIGHT_PYTHON", "/opt/squire/hindsight-venv/bin/python"
@@ -100,13 +135,10 @@ PAYLOAD_FIELDS = {
     "hindsight_ops_pending",
     "hindsight_ops_processing",
     "hindsight_ops_failed",
+    "backup_last_success_age_seconds",
 }
 
 START_MONOTONIC = time.monotonic()
-
-
-def log(msg: str) -> None:
-    print(f"[squire-heartbeat] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +222,30 @@ def volume_mb() -> dict:
     }
 
 
+def backup_age_seconds() -> int | None:
+    """Seconds since the last SUCCESSFUL restic run, or None if there has not been
+    one (which is every tenant today -- no B2 account exists yet).
+
+    squire-backup.sh writes a unix timestamp to this file after each successful
+    backup. A backup that quietly stops working produces no error anywhere; this
+    number is the only thing that would show it, and it belongs on the heartbeat
+    rather than in a log nobody reads.
+
+    Wall clock, not monotonic: the timestamp is written by a different process and
+    has to survive restarts. A clock step therefore moves this number, which is an
+    acceptable trade for a value read at day-scale.
+    """
+    try:
+        with open(BACKUP_SUCCESS_FILE, "r", encoding="utf-8") as fh:
+            written = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    # Clamp at zero rather than sending a negative age: control-api's schema
+    # rejects negatives (ge=0), and a clock skew of a few seconds must not cost us
+    # the whole heartbeat.
+    return max(0, int(time.time()) - written)
+
+
 def hindsight_ops() -> dict:
     """Queue depth in Hindsight's `async_operations`, by status.
 
@@ -259,6 +315,10 @@ def build_payload() -> dict:
     payload.update(volume_mb())
     payload.update(shim_counters())
     payload.update(hindsight_ops())
+
+    backup_age = backup_age_seconds()
+    if backup_age is not None:
+        payload["backup_last_success_age_seconds"] = backup_age
 
     # Belt and braces against a future collector returning a surprise key: the
     # whitelist, not the collectors, decides what leaves this container.

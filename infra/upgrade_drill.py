@@ -101,6 +101,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if not (args.canary or args.roll or args.rollback):
         parser.error("nothing to do: pass --canary, --roll and/or --rollback")
+    # Both must be strictly positive. `--poll-interval 0` turns the convergence
+    # wait into a busy loop hammering /fleet for the whole timeout, and
+    # `--timeout 0` makes every tenant fail verification instantly, which on a
+    # roll reads as "the new image is broken" when in fact nothing was waited for.
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be greater than zero")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
     return args
 
 
@@ -171,12 +179,19 @@ def wait_for(
                 f"(reported={reported!r} want={image_ref!r} heartbeat_age={age})"
             )
             return False
-        if poll_interval:
-            time.sleep(poll_interval)
+        time.sleep(poll_interval)  # parse_args guarantees this is > 0
 
 
 def roll_one(api: ControlAPI, tenant_id: str, args) -> bool:
-    """Redeploy + verify one tenant. Returns True when it converged."""
+    """Redeploy + verify one tenant. Returns True when it converged.
+
+    Never raises. A control-api failure -- at redeploy time OR during the minutes
+    of polling that follow -- is reported as "this tenant did not converge" and
+    handed back to the caller, which owns the abort decision. Letting a transient
+    error escape here would end the process mid-roll and throw away both the
+    failure list and the count of tenants still untouched, which is precisely the
+    information an operator needs after an aborted upgrade.
+    """
     if args.dry_run:
         print(f"  {tenant_id}: would redeploy onto {args.image_tag}")
         return True
@@ -185,8 +200,17 @@ def roll_one(api: ControlAPI, tenant_id: str, args) -> bool:
     except ControlAPIError as exc:
         print(f"  {tenant_id}: FAILED to redeploy -- {exc}")
         return False
+
     print(f"  {tenant_id}: redeployed onto {image_ref}, waiting for a heartbeat...")
-    if wait_for(api, tenant_id, image_ref, args.timeout, args.poll_interval):
+    try:
+        ok = wait_for(api, tenant_id, image_ref, args.timeout, args.poll_interval)
+    except ControlAPIError as exc:
+        # The deploy was already triggered, so this tenant is in an unknown state:
+        # count it as not-converged and let the threshold logic stop the roll.
+        print(f"  {tenant_id}: FAILED to verify -- {exc}")
+        return False
+
+    if ok:
         print(f"  {tenant_id}: OK")
         return True
     return False

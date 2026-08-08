@@ -36,13 +36,30 @@ class ControlAPI:
         self.timeout = timeout
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        with httpx.Client(timeout=self.timeout) as client:
-            return client.request(
-                method,
-                f"{self.base_url}{path}",
-                headers={"Authorization": f"Bearer {self.token}"},
-                **kwargs,
-            )
+        """Perform one authenticated request.
+
+        Transport failures are re-raised as `ControlAPIError` rather than escaping
+        as raw httpx exceptions. The CLIs poll for minutes at a time (the upgrade
+        drill waits up to 600s per tenant), so a single transient ConnectError or
+        ReadTimeout is close to expected -- and letting it propagate would kill the
+        process mid-roll with a traceback, discarding the drill's failure list and
+        its accounting of which tenants were left untouched. Callers already handle
+        `ControlAPIError`; they cannot handle a stack unwind.
+        """
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                return client.request(
+                    method,
+                    f"{self.base_url}{path}",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    **kwargs,
+                )
+        except httpx.HTTPError as exc:
+            # `type(exc).__name__` because httpx's message for a timeout is often
+            # empty, and "ReadTimeout" alone is the useful half of the diagnosis.
+            raise ControlAPIError(
+                f"{method} {path} failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def post(self, path: str, json: dict | None = None) -> httpx.Response:
         return self._request("POST", path, json=json)

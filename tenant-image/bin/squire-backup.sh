@@ -91,6 +91,13 @@ JITTER_SECONDS="${SQUIRE_BACKUP_JITTER_SECONDS:-3600}"
 KEEP_DAILY="${SQUIRE_BACKUP_KEEP_DAILY:-7}"
 KEEP_WEEKLY="${SQUIRE_BACKUP_KEEP_WEEKLY:-4}"
 
+# Timestamp of the last SUCCESSFUL run, read by squire-heartbeat.py and reported
+# to control-api as an age. On the VOLUME, not tmpfs: a tmpfs copy would reset on
+# every redeploy and the fleet view would claim "never backed up" for tenants that
+# are backing up fine. It is a unix timestamp — nothing secret-derived — so it is
+# one of the few things that may sit on the volume in the clear.
+SUCCESS_FILE="${SQUIRE_BACKUP_SUCCESS_FILE:-$STATE_DIR/last-backup-success}"
+
 log() { printf '[squire-backup] %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
@@ -173,22 +180,53 @@ EXCLUDES=(
     --exclude "*.pid"
     --exclude "postmaster.pid"
 )
-for name in $SECRETS; do
+# `read -ra` into an array rather than `for name in $SECRETS`: the split is
+# deliberate (SQUIRE_SECRET_FILES is a space-separated list), but an unquoted
+# expansion also glob-expands, so a file named `.env` next to a stray `*` in the
+# variable would quietly turn into a different exclude list.
+read -ra SECRET_NAMES <<< "$SECRETS"
+for name in "${SECRET_NAMES[@]}"; do
     EXCLUDES+=(--exclude "$HERMES_HOME/$name")
 done
 
 run_backup() {
-    local started rc
+    local started rc probe_err init_err
     started="$(date -u +%s)"
 
-    # `cat config` is restic's cheapest "does this repository exist" probe.
-    if ! "$RESTIC" cat config >/dev/null 2>&1; then
+    # `cat config` is restic's cheapest "does this repository exist" probe. Its
+    # STDERR is kept, because two very different situations both fail it and the
+    # right response is opposite in each:
+    #
+    #   * repository does not exist yet          -> init it (first run, normal)
+    #   * repository exists, password is wrong   -> DO NOT init. This means the
+    #     DEK does not match the one that created the repository, i.e. the tenant
+    #     was re-provisioned with a new DEK, or SQUIRE_DEK is wrong. Initialising
+    #     would fail anyway, but the *log* would say "init failed" and send an
+    #     operator hunting a B2 permissions problem that does not exist.
+    if ! probe_err="$("$RESTIC" cat config 2>&1 >/dev/null)"; then
+        if printf '%s' "$probe_err" | grep -qiE 'wrong password|invalid password|decrypt|no key found'; then
+            log "FATAL: the repository exists but our derived password does not open it."
+            log "       SQUIRE_DEK does not match the DEK that created this repository."
+            log "       Refusing to re-initialise — that would orphan every existing snapshot."
+            return 1
+        fi
         log "initialising repository"
-        if ! "$RESTIC" init; then
-            log "ERROR: repository init failed — skipping this run"
+        if ! init_err="$("$RESTIC" init 2>&1)"; then
+            log "ERROR: repository init failed — skipping this run: ${init_err:0:300}"
             return 1
         fi
     fi
+
+    # A container SIGKILLed mid-prune (Railway redeploys are not gentle) leaves an
+    # exclusive lock behind, and every subsequent night would then fail with
+    # "repository is already locked" until someone noticed. Best effort, and only
+    # once the repository is known to exist — running it before the probe would
+    # just print "repository does not exist" on every first run.
+    #
+    # NOTE: this is safe only because exactly one process backs up this repository
+    # (one repository per tenant, one backup program per container). Do not copy
+    # this into anything with concurrent writers.
+    "$RESTIC" unlock >/dev/null 2>&1 || true
 
     log "backing up $VOLUME"
     "$RESTIC" backup "$VOLUME" \
@@ -204,14 +242,29 @@ run_backup() {
         return "$rc"
     fi
 
+    # Record success BEFORE retention. The snapshot is already durable at this
+    # point; a prune failure is an operational annoyance, not a lost backup, and
+    # letting it suppress the timestamp would make the fleet view report a backup
+    # gap that does not exist.
+    if ! printf '%s\n' "$(date -u +%s)" > "$SUCCESS_FILE" 2>/dev/null; then
+        log "warning: could not write $SUCCESS_FILE — the fleet view will under-report backups"
+    fi
+
     # Retention runs after a SUCCESSFUL backup only. Forgetting snapshots on a
     # night when the new one failed is how you end up with no snapshots at all.
-    "$RESTIC" forget \
-        --tag squire \
-        --keep-daily "$KEEP_DAILY" \
-        --keep-weekly "$KEEP_WEEKLY" \
-        --prune >/dev/null 2>&1 \
-        || log "warning: retention/prune pass failed (snapshot itself is safe)"
+    #
+    # stderr is captured rather than discarded: a prune that fails every night
+    # (stale lock, B2 permissions, a repository slowly filling with data we are
+    # paying to keep) is exactly the kind of thing that stays invisible when its
+    # only output goes to /dev/null.
+    local forget_err
+    if ! forget_err="$("$RESTIC" forget \
+            --tag squire \
+            --keep-daily "$KEEP_DAILY" \
+            --keep-weekly "$KEEP_WEEKLY" \
+            --prune 2>&1 >/dev/null)"; then
+        log "warning: retention/prune failed (the new snapshot is safe): ${forget_err:0:300}"
+    fi
 
     log "backup complete in $(( $(date -u +%s) - started ))s"
     return 0
@@ -239,6 +292,10 @@ seconds_until_window() {
         return
     fi
     [ "$target" -le "$now" ] && target=$(( target + 86400 ))
+    # $RANDOM is 0..32767, so the effective jitter ceiling is 32767s (~9h) no
+    # matter how large SQUIRE_BACKUP_JITTER_SECONDS is set. Fine at the 3600s
+    # default; if a much wider spread is ever wanted, this needs two $RANDOMs
+    # combined rather than a bigger modulus that silently does nothing.
     jitter=0
     [ "$JITTER_SECONDS" -gt 0 ] && jitter=$(( RANDOM % JITTER_SECONDS ))
     echo $(( target - now + jitter ))

@@ -93,7 +93,11 @@ def mock_redeploy(
     )
 
 
-ARGS = ["--poll-interval", "0"]
+#: A poll interval small enough to keep the suite fast, but non-zero -- zero is
+#: rejected by parse_args precisely because it turns the wait into a busy loop.
+ARGS = ["--poll-interval", "0.01"]
+#: Forces one poll and then a timeout, for the "never converges" cases.
+IMPATIENT = ["--timeout", "0.01"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +135,7 @@ def test_a_failing_canary_leaves_the_fleet_untouched(capsys):
     mock_fleet(*[fleet_response(row("t-1"), row("t-2")) for _ in range(6)])
 
     code = upgrade_drill.main(
-        [*ARGS, "--image-tag", "v2", "--canary", "t-1", "--roll", "--timeout", "0"]
+        [*ARGS, *IMPATIENT, "--image-tag", "v2", "--canary", "t-1", "--roll"]
     )
     assert code == 2
     assert not t2.called, "the roll must not start when the canary failed"
@@ -246,6 +250,71 @@ def test_requires_something_to_do():
 def test_image_tag_is_required():
     with pytest.raises(SystemExit):
         upgrade_drill.parse_args(["--canary", "t-1"])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        ["--poll-interval", "0"],
+        ["--poll-interval", "-1"],
+        ["--timeout", "0"],
+        ["--timeout", "-5"],
+    ],
+)
+def test_non_positive_timing_arguments_are_rejected(bad):
+    """`--poll-interval 0` busy-loops on /fleet for the whole timeout, and
+    `--timeout 0` fails every tenant instantly -- which during a roll reads as
+    "the new image is broken" when in fact nothing was ever waited for."""
+    with pytest.raises(SystemExit):
+        upgrade_drill.parse_args(["--image-tag", "v2", "--canary", "t-1", *bad])
+
+
+# ---------------------------------------------------------------------------
+# Transport failures
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_dropped_connection_mid_poll_counts_as_a_failure_not_a_crash(capsys):
+    """The drill polls for up to 600s per tenant, so a transient ConnectError or
+    ReadTimeout is close to expected. It must be absorbed into the failure
+    accounting -- a traceback here would discard both the failure list and the
+    count of tenants left untouched, which is exactly what an operator needs
+    after an aborted roll."""
+    mock_redeploy("t-1")
+    t2 = mock_redeploy("t-2")
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the initial fleet listing succeeds
+            return fleet_response(row("t-1"), row("t-2"))
+        raise httpx.ReadTimeout("control-api went away", request=request)
+
+    respx.get(url__startswith=f"{API}/internal/fleet").mock(side_effect=handler)
+
+    code = upgrade_drill.main(
+        [*ARGS, "--image-tag", "v2", "--canary", "t-1", "--roll", "--max-failures", "1"]
+    )
+    assert code == 2
+    assert not t2.called, "the roll must not continue past an unverifiable canary"
+    out = capsys.readouterr().out
+    assert "FAILED to verify" in out
+    assert "ReadTimeout" in out
+    assert "Traceback" not in out
+
+
+@respx.mock
+def test_an_unreachable_control_api_is_a_clean_error(capsys):
+    respx.get(url__startswith=f"{API}/internal/fleet").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    code = upgrade_drill.main([*ARGS, "--image-tag", "v2", "--roll"])
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "ConnectError" in out
+    assert "Traceback" not in out
 
 
 @respx.mock

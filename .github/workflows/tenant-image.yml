@@ -381,7 +381,11 @@ jobs:
           python3 - <<'PY'
           import configparser, sys
 
-          parser = configparser.ConfigParser(strict=False)
+          # interpolation=None: supervisord's own format uses %(...)s expansions
+          # (and a bare % is legal in a command line). ConfigParser's default
+          # BasicInterpolation would raise on those, failing this check for a
+          # config supervisord itself reads perfectly well.
+          parser = configparser.ConfigParser(strict=False, interpolation=None)
           parser.read("tenant-image/supervisord.conf")
 
           programs = [s for s in parser.sections() if s.startswith("program:")]
