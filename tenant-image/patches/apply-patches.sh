@@ -31,6 +31,28 @@ if [ ! -d "$INSTALL_DIR" ]; then
     exit 1
 fi
 
+# Check the tool BEFORE using it. Without this the missing-binary case is
+# indistinguishable from a genuine rejection: every `patch` invocation below is
+# wrapped in `if !` with output redirected, so a "command not found" exit status
+# reads as "the patch does not apply". That is precisely what happened on the
+# second CI build — the upstream image ships no patch(1), and the resulting
+# "001 does not apply to /opt/hermes" sent us hunting a source-tree drift that
+# did not exist. A missing dependency must announce itself as a missing
+# dependency.
+if ! command -v patch > /dev/null 2>&1; then
+    cat >&2 <<'EOF'
+apply-patches: FATAL — patch(1) is not installed.
+
+This is a MISSING DEPENDENCY, not a rejected patch. The upstream hermes-agent
+image does not ship patch(1); the Dockerfile installs it before this script
+runs. If you are seeing this, that apt layer was removed, reordered after this
+step, or this script is being run somewhere it was not expected to run.
+
+Install it (Debian/Ubuntu):  apt-get install -y --no-install-recommends patch
+EOF
+    exit 1
+fi
+
 # Nullglob so an empty patches/ directory yields an empty list rather than the
 # literal string "*.patch".
 shopt -s nullglob

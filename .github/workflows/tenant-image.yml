@@ -173,6 +173,31 @@ jobs:
           # depends on them — a clearer failure than a traceback 200 lines later.
           python3 -c "import yaml, cryptography; print('deps ok:', yaml.__version__, cryptography.__version__)"
 
+      # Guards the exact bug that failed CI run 2. Every script here is invoked as
+      # an executable (supervisord `command=`, the entrypoint shelling out to its
+      # helpers), so a missing exec bit is Permission denied at runtime — but the
+      # repo is authored on WSL, where drvfs reports every file as 777 and
+      # `chmod +x` changes nothing git records. The bug is therefore invisible
+      # locally and only appears on a Linux checkout. Assert on git's index, not
+      # the working tree, because the index is what CI and the image actually get.
+      - name: Executable bits are recorded in git
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          fail=0
+          # Anything with a shebang is meant to be runnable; data files are not.
+          while IFS= read -r f; do
+            head -c2 "$f" | grep -q '#!' || continue
+            mode=$(git ls-files -s -- "$f" | awk '{print $1}')
+            if [ "$mode" = "100755" ]; then
+              echo "ok   $mode $f"
+            else
+              echo "::error::$f has a shebang but is mode $mode in git — run: git update-index --chmod=+x $f"
+              fail=1
+            fi
+          done < <(git ls-files 'tenant-image/*')
+          exit "$fail"
+
       - name: Shell syntax
         if: steps.present.outputs.exists == 'true'
         run: |
