@@ -60,24 +60,42 @@ Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive
 
 Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
 
-> ### ▶ NEXT-SESSION START HERE (updated 2026-08-08 late night)
+> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-09, end of second session)
 >
-> **Phase 0 code is complete, reviewed, merged to `main`, and LIVE on Railway staging.** All six tasks' code shipped through implementer + spec + quality reviews. One tenant was provisioned end-to-end tonight and reached a running/heartbeating state; the first live conversation exposed the fixes queued below. `main` HEAD at handoff: see `git log` (last clean commit `8da0f4a`; autopair work lands on top).
+> **Phase 0 code is complete and LIVE. A real tenant was provisioned end-to-end and held a real conversation.** All six tasks merged to `main` through implementer + spec + quality review. What remains is (a) three UX/security fixes discovered by live use, (b) Gate G1 measurement + tuning, (c) real alpha users.
 >
-> **Live staging** (details in memory `staging-deployment.md`): project `squire-staging` (`ddbcfda7-…`), env `production` (`0923ea14-…`). Services: `control-api` (`https://control-api-production-588b.up.railway.app`, /healthz ok), `ingress` (`https://ingress-production-6c96.up.railway.app`), `trial-proxy` (internal), `control-db`, `litellm-db`. Bot pool: 5 bots loaded (`squire_alpha_01..05_bot`). First tenant: `38c2ebc966c30509` (shaurya123@gmail.com) on `@squire_alpha_01_bot`.
+> **Live staging** (see memory `staging-deployment.md`): project `squire-staging` `ddbcfda7-e6f6-47a9-87cd-903b6efeb8c6`, env `production` `0923ea14-9a5e-4d87-990b-be31e5bc76ed`. Services: `control-api` (https://control-api-production-588b.up.railway.app, /healthz ok), `ingress` (https://ingress-production-6c96.up.railway.app), `trial-proxy` (internal :4000), `control-db`, `litellm-db`. Images `hermes-tenant:0.1.0/0.1.1/0.1.2` on GHCR (public). Bot pool: 5 bots (`squire_alpha_01..05_bot`), 4 free. Live tenant: `86b245e9cc9c5a4d` on `@squire_alpha_02_bot`. Tenant `38c2ebc966c30509` was crypto-shredded to verify deprovisioning (volume marked pending-delete, service gone, bot released — all correct).
 >
-> **Deploy quirk:** `railway up` from inside the repo dir fails (`exclude-patterns` non-printable-ASCII builder error, never fully root-caused). Deploy by copying the service dir to a clean dir OUTSIDE the repo (`tar --exclude=.venv…`) then `railway up . --path-as-root -s <svc> -p <proj> -e production`; CI `deploy.yml` (fresh checkout) is unaffected. Local CLI is 5.34.2 at `~/.local/bin/railway`.
+> **Trial config as of now:** model `anthropic:claude-sonnet-5` (raised from Haiku), budget `$10` hard cap (raised from $2 so the advertised 75 msgs/day is actually reachable), PRD §4/§5.3/§6 + CAC line updated to match.
 >
-> **IMMEDIATE NEXT STEP — finish the autopair security fix** (branch `fix/first-contact-autopair`, worktree `/tmp/squire-autopair`): first-contact must auto-pair the owner + fire the concierge greeting on `/start` (Telegram forbids true bot-initiated first contact; the Start button is the mechanism). Security re-review found the binding gate still accepts the FLEET-WIDE `INTERNAL_API_TOKEN` (every trial tenant's agent can read it → permanent unrecoverable tenant takeover); the fix is: bind ONLY on the per-bot `X-Telegram-Bot-Api-Secret-Token` (dedicated `_authorised_for_binding`, hmac compare), with ingress stamping that secret on forwards + through the retry buffer. Must pass security re-review (mutant that binds with the fleet token must die). THEN: merge → tag `tenant-image-v0.1.1` → deploy updated `ingress` → redeploy the tenant on the new image → tap Start → expect instant greeting.
+> #### 1. FIRST: finish the in-flight branch `fix/deterministic-onboarding-followups` (pushed; check `git branch -r`)
+> The deterministic-onboarding work SHIPPED as v0.1.2 and **works** — founder tapped Start and got the intended greeting (identity, three concrete capabilities, trial + connect-your-LLM, one question). Mechanism: entrypoint seeds `.squire/concierge-state.json`, a `pre_llm_call` shell hook restates the current step until `complete`, patch 005 suppresses upstream's competing "one or two sentences max" note, SOUL.md mandate is section 1. Verify a fresh tenant with `hermes hooks list` → `pre_llm_call ... ✓ allowed`.
+> Three defects found in live use, being fixed on that branch — read its final agent report (or the commits) for exact state:
+> - **(a) Double reply.** The hook fires per LLM CALL, not per USER TURN; the agent's state-file tool call creates a continuation turn, so the next step gets emitted as a second standalone message. Fix = inject at most once per user turn (dedupe on turn id). NOT an ingress retry — ingress logged exactly one forward.
+> - **(b) "No home channel is set for Telegram" notice** fires before the greeting and advertises `/sethome`, a surface Squire doesn't sell. Preferred fix: when autopair binds the owner, persist that DM as the home channel (upstream `gateway/config.py:466 persist_home_channel`) so the notice never fires AND cron briefings work by default. Fallback: suppress via patch.
+> - **(c) Deep-link nonce binding (SECURITY).** Bots are recycled between tenants, and the previous owner keeps the chat forever. Autopair binds "first human when the store is empty", so a previous owner can silently become owner of the NEXT tenant on that bot. Fix: `t.me/<bot>?start=<nonce>`; bind only on a matching one-time nonce. **Needs a control-api contract change** (new tenant env var e.g. `SQUIRE_BIND_NONCE` set at provision, exact-set env test updated, `provision.py` prints the nonce link) — that side is NOT yet briefed or built. Must degrade safely when the var is absent, and the nonce must be stripped before the message reaches memory.
 >
-> **Then, to actually finish Phase 0's exit criteria:**
-> - **G1 tuning + measurement (the big one):** first tenant idle RSS measured at **~1.3GB vs the 512MB target** (2.6×). Levers both un-pulled: set `HINDSIGHT_API_EMBEDDINGS_PROVIDER` to a cloud embedder (biggest chunk — local sentence-transformers), and confirm Railway serverless sleep actually engages (interacts with the 300s heartbeat — a tenant that beats every 5 min may never sleep; see risk §2 / `staging-deployment.md`). Then measure real $/mo + wake latency across the fleet → the G1 pass/fail gate.
-> - Onboard the remaining alpha tenants (provision more via `infra/provision.py`), run the upgrade drill for real (`infra/upgrade_drill.py` against the live fleet), verify nightly restic→B2 once a B2 bucket exists.
+> #### 2. THEN: Gate G1 — the architectural decision Phase 0 exists to make
+> Measured idle RSS on a live tenant: **~1.3GB vs the 512MB target** (Hindsight local embeddings + CPU torch + embedded PG + gateway). Both levers are built but unpulled:
+> - Point `HINDSIGHT_API_EMBEDDINGS_PROVIDER` at a cloud embedder (knob exposed in the image, currently unset) — biggest single win.
+> - Confirm Railway serverless sleep actually engages. **Suspicion worth testing first:** our own 300s heartbeat may keep every tenant permanently awake, which would nullify the sleep half of the cost model entirely. `SQUIRE_HEARTBEAT_INTERVAL` is the knob; `HEARTBEAT_STALE_SECONDS` must move with it.
+> Then measure real $/tenant/mo and p95 wake latency across tenants. **Pass = ≤$3/tenant AND p95 wake ≤8s → stay on Railway. Fail → tenant data plane moves to Hetzner.**
 >
-> **Shaurya one-offs still outstanding:** Stripe acct, AWS/KMS acct (G2), Backblaze B2 bucket, more Telegram accounts if scaling past ~15 bots. (Railway Pro ✅, tenant image public on GHCR ✅, tokens ✅, bots ✅ all done.)
+> #### 3. THEN: the rest of Phase 0's exit criteria
+> - Run `infra/upgrade_drill.py` for real (canary → roll → rollback) — tooling is live-verified but the drill has never driven an actual fleet; needs ≥2 tenants.
+> - Onboard 10 alpha users (needs ~7 more BotFather bots, or see workstream **1H** below).
+> - Backups: code ships but is inert until a **Backblaze B2** account exists. Do not claim backups work until a real restore has been performed.
 >
-> **Deferred follow-ups (tracked, non-blocking):** hindsight `claude-code` provider for Claude Max tenants + auth.json markers revisit at 1C; Gate G2 secrets hardening (fleet-wide INTERNAL_API_TOKEN blast radius is the motivating example — the autopair takeover was one symptom); the em-dash/`.dockerignore` and matrix-`if` CI gotchas are fixed but worth remembering.
-
+> #### Known gaps / decisions parked
+> - **No template-migration path.** `seed_template` is keep-existing, so EXISTING tenants get none of a new image's config/skills/SOUL.md — only a re-provision does. This bit us twice tonight. A baked `template-version` marker that refreshes image-managed files while leaving agent-owned ones alone would fix it.
+> - **Workstream 1H (added tonight)**: shared bots + an `egress` service, so tenants stop holding `TELEGRAM_BOT_TOKEN` and one bot can serve unlimited users. Decide before investing in more Telegram accounts.
+> - Gate G2 secrets hardening (fleet-wide `INTERNAL_API_TOKEN` blast radius — the autopair takeover was one symptom).
+> - Follow-up: hindsight `claude-code` provider for Claude Max tenants; `CONNECTED_MARKERS` only inspects `.env` and needs revisiting when 1C writes `auth.json`.
+> - Deploy quirk: `railway up` from inside the repo dir fails (`exclude-patterns` non-printable-ASCII); deploy from a clean copy outside the repo, or rely on CI `deploy.yml`. Local CLI 5.34.2.
+>
+> #### Shaurya one-offs still open
+> Backblaze B2 bucket (blocks backups), more Telegram accounts (blocks 10 users, unless 1H). Stripe + AWS/KMS are Phase 1, not needed yet. Railway Pro ✅, tokens ✅, bots ✅, GHCR public ✅.
+>
 ### Task 0.1 — Repos & CI skeleton
 - [x] GitHub repo `squire` created and linked to this folder (2026-08-07); grow into monorepo layout: `apps/web`, `apps/control-api`, `apps/ingress`, `tenant-image/`, `infra/`, `docs/`.
 - [x] Create Railway projects `squire-staging`, `squire-prod` — created 2026-08-08 via `railway init` (no services yet; RAILWAY_TOKEN_* GitHub secrets still to set).
