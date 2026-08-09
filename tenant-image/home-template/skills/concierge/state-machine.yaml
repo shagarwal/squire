@@ -30,16 +30,18 @@ facts:
   # restates these numbers. The hook points the agent at this key by absolute
   # path instead of inlining it, so changing the allowance is a one-line edit
   # here that cannot leave a stale copy behind saying something different.
-  # (That matters right now: the trial model is moving Haiku -> Sonnet, which
-  # changes how far the spend cap stretches.)
+  # That design earned itself within a day: the trial moved Haiku/$2 ->
+  # Sonnet/$10 on 2026-08-09 and this is the only line of copy that changed.
   #
-  # Both halves are load-bearing and prd.md:118 lists them together: the
-  # per-day message count AND the hard spend cap, which can end the trial
-  # sooner. Quoting only the message count implies 75/day is reachable when it
-  # may not be — and a user who stops at far fewer has been misled by us.
+  # Both halves are load-bearing and PRD §5.3 lists them together: the per-day
+  # message count AND the hard spend cap. They are now consistent with each
+  # other — 75/day over 3 days is ~225 turns, at Sonnet ~$0.04/turn ~= $9, so
+  # $10 has headroom and the advertised allowance is genuinely reachable. That
+  # consistency is why this can be stated plainly with no "whichever runs out
+  # first" hedge: under the old $2 cap the message count was NOT reachable, and
+  # quoting it alone would have misled people.
   trial_limits: >
-    75 messages a day, and a $2 total AI-usage budget for the whole trial —
-    whichever runs out first.
+    75 messages a day, within a $10 total AI-usage budget for the whole trial.
   trial_end_behaviour: >
     At 72 hours the agent stops answering and replies only with a link to
     subscribe. The tenant's data is kept for 14 days and then permanently

@@ -98,7 +98,7 @@ def payload(**over) -> str:
     extra = {
         "user_message": "hey",
         "is_first_turn": True,
-        "model": "anthropic:claude-haiku-4-5",
+        "model": "anthropic:claude-sonnet-5",
         "platform": "telegram",
     }
     extra.update(over.pop("extra", {}))
@@ -695,10 +695,10 @@ check(
 # The trial numbers the injected directives repeat must match the facts block —
 # the hook is allowed to inline them, but not to invent them.
 check("trial length agrees with the facts block", "3 days" in facts["trial_length"])
-# The message-count figure must live in ONE place. The trial model is moving
-# Haiku -> Sonnet, which changes how far the $2 cap stretches, so this number is
-# about to be edited — and a second copy inlined in the hook would silently keep
-# telling users the old figure.
+# The message-count figure must live in ONE place. This design paid for itself
+# within a day: the trial moved Haiku/$2 -> Sonnet/$10 and facts.trial_limits
+# was the only line of copy that had to change. A second copy inlined in the
+# hook would have gone on telling users the old figure.
 check(
     "the per-day message count lives in the facts block",
     "75 messages a day" in facts["trial_limits"],
@@ -724,8 +724,16 @@ check(
 # far sooner — that is us misleading the user, not the user misusing it.
 check(
     "the trial's spend cap is stated alongside the message count",
-    "$2" in facts["trial_limits"],
+    "$10" in facts["trial_limits"],
     facts["trial_limits"],
+)
+# The two numbers must stay mutually consistent. 75/day x 3 days ~= 225 turns;
+# at Sonnet ~$0.04/turn that is ~$9, so $10 is reachable. If the model is
+# upgraded again without raising the cap, the advertised allowance silently
+# stops being achievable and the copy starts misleading people.
+check(
+    "no stale $2 cap survives anywhere in the copy",
+    "$2 " not in facts["trial_limits"] and not any("$2" in d for d in hook._DIRECTIVES.values()),
 )
 check(
     "no directive quotes a price (prices are answer-only, from facts)",
@@ -874,10 +882,32 @@ check(
     (CONFIG_YAML.get("telegram") or {}).get("reactions") is False,
 )
 
+# The model and the advertised budget are one decision, changed together on
+# 2026-08-09. Pinning them in the same assertion is what stops a future model
+# bump from quietly leaving the copy describing the old economics.
+_model = str(CONFIG_YAML.get("model", ""))
 check(
-    "the trial model is still Haiku-class (directives are written for it)",
-    "haiku" in str(CONFIG_YAML.get("model", "")).lower(),
+    "the trial model is the Sonnet-class default the budget was sized for",
+    "sonnet" in _model.lower(),
+    _model,
 )
+check(
+    "the model string carries its provider prefix (hermes sends it verbatim)",
+    _model.startswith("anthropic:"),
+    _model,
+)
+# The exact string must be exposed by the trial proxy or every trial message
+# 400s — observed live 2026-08-09. apps/trial-proxy/tests/test_config.py owns
+# this contract; assert it from the tenant side too, since this file is the
+# half that changes.
+_proxy_cfg = IMAGE_ROOT.parent / "apps" / "trial-proxy" / "config.yaml"
+if _proxy_cfg.is_file():
+    _names = {m["model_name"] for m in yaml.safe_load(_proxy_cfg.read_text())["model_list"]}
+    check(
+        "the tenant's model string is exposed verbatim by the trial proxy",
+        _model in _names,
+        f"{_model!r} not in {sorted(_names)}",
+    )
 
 
 print()

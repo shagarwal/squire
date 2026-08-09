@@ -121,9 +121,16 @@ MAX_INJECTED_TURNS_PER_STATE = 8
 # test-enforced: tests/test_concierge_onboarding.py asserts these keys and the
 # YAML's states are the same set, and that every `then:` target resolves.
 #
-# Style rules baked into the copy below, because the trial model is Haiku-class:
-# imperative mood, numbered concrete steps, no conditionals the model has to
-# evaluate, and an explicit literal command for the state write.
+# Style rules baked into the copy below: imperative mood, numbered concrete
+# steps, no conditionals the model has to evaluate, and an explicit literal
+# command for the state write.
+#
+# These were written for the Haiku-class trial model that shipped first, and
+# they are KEPT now that the trial runs Sonnet-class. The whole thesis of this
+# hook is that the first impression must not depend on the model being clever
+# enough to infer what to do — trading that back for shorter copy would
+# reintroduce exactly the failure it was built to remove, and the trial model
+# can change again without anyone revisiting this file.
 
 _DIRECTIVES = {
     "greet": """This person has just signed up and this is the very first message they have

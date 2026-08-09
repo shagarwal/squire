@@ -13,13 +13,25 @@
 # into tmpfs and are DEK-encrypted at rest on the volume.
 
 # --- Model -----------------------------------------------------------------
-# Trial default is Haiku-class: it runs on our metered key against a ~$2 hard
-# budget (PRD §5.3), and it is genuinely good enough to make the product feel
-# real. The concierge's whole job is to get the tenant onto their own provider,
-# at which point `hermes model <provider:model>` (or the connect flow) rewrites
+# Trial default is Sonnet-class, on our metered key against a ~$10 hard budget
+# (PRD §5.3). Raised from Haiku/$2 on 2026-08-09 for two reasons that turned
+# out to be the same reason: the first live tenant showed a Haiku-class model
+# ignoring the concierge script outright, and onboarding and everyday
+# usefulness are both instruction-following. $2 at Sonnet prices buys ~50
+# turns, well under the advertised 75/day, so the cap was resized to the
+# promise rather than the promise to the cap.
+#
+# This string is sent VERBATIM as the request's `model` field — hermes does not
+# strip the provider prefix — so it must appear exactly in the trial proxy's
+# model_list. apps/trial-proxy/tests/test_config.py asserts both ends of that
+# contract; a mismatch 400s every trial message and looks to the user like an
+# agent that never worked at all.
+#
+# The concierge's whole job is to get the tenant onto their own provider, at
+# which point `hermes model <provider:model>` (or the connect flow) rewrites
 # this. Provider credentials and ANTHROPIC_BASE_URL (the trial proxy) come from
 # the environment, set per tenant by control-api.
-model: "anthropic:claude-haiku-4-5"
+model: "anthropic:claude-sonnet-5"
 
 # Fallback ladder. Empty by default: during the trial there is only one key, and
 # a silent fallback to a different provider would quietly bypass the metering
