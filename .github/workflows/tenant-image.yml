@@ -1,0 +1,430 @@
+name: tenant-image
+
+# Builds the hermes-tenant OCI image from tenant-image/.
+#
+# - On a pull_request touching tenant-image/**: build only (no push). Sanity-checks
+#   that the Dockerfile still builds before merge.
+# - On push of a tag matching tenant-image-v* (e.g. tenant-image-v0.1.0): build AND
+#   push to GHCR, tagged with the version from the git tag plus `latest`.
+#
+# NOTE (Task 0.1, Phase 0): tenant-image/ is currently an empty placeholder
+# (tenant-image/Dockerfile does not exist yet — it lands in Task 0.2). Every job
+# below starts with a "Dockerfile exists?" check step and skips the remaining
+# steps gracefully if it's missing, so this workflow does not fail/block the repo
+# in the meantime. Once Task 0.2 adds tenant-image/Dockerfile, the checks below
+# will start actually building the image with no further changes needed here.
+
+on:
+  push:
+    tags:
+      - "tenant-image-v*"
+  pull_request:
+    paths:
+      - "tenant-image/**"
+      # A PR that only edits this workflow must still run it, or a broken check
+      # merges green and first fails on someone else's unrelated change.
+      - ".github/workflows/tenant-image.yml"
+      # The container-contract job asserts a cross-service constant that lives in
+      # control-api's config (the tenant volume mount path). Changing it there
+      # must re-run this workflow -- that drift is what made every provisioned
+      # tenant undeployable once already.
+      - "apps/control-api/src/control_api/config.py"
+
+env:
+  # ghcr.io/<org>/<repo>/<image-name>
+  IMAGE_NAME: ghcr.io/shagarwal/squire/hermes-tenant
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Graceful-skip guard: tenant-image/Dockerfile doesn't exist until Task 0.2.
+      # Rather than letting docker/build-push-action fail the job (and show the
+      # workflow as red on every PR/tag in the meantime), we detect this here and
+      # skip the build/push steps via each subsequent step's `if:` condition.
+      # The job itself still runs (rather than being gated off entirely) so this
+      # "Dockerfile exists?" step can short-circuit with a clear log message,
+      # instead of the workflow silently not appearing at all.
+      - name: Check tenant-image/Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f "tenant-image/Dockerfile" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tenant-image/Dockerfile not found yet (lands in Task 0.2) — skipping build."
+          fi
+
+      - name: Determine image tags
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # Strip the "tenant-image-v" prefix to get the bare version, e.g.
+            # tenant-image-v0.1.0 -> 0.1.0
+            VERSION="${GITHUB_REF_NAME#tenant-image-v}"
+            echo "tags=${IMAGE_NAME}:${VERSION},${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            # pull_request build: no registry push, just prove it builds.
+            echo "tags=${IMAGE_NAME}:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.dockerfile-check.outputs.exists == 'true' && steps.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on tag)
+        if: steps.dockerfile-check.outputs.exists == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: tenant-image/
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ==========================================================================
+  # Patch-overlay + container-contract checks (added in Task 0.2)
+  # ==========================================================================
+  # Static counterpart to the patch discipline in
+  # docs/reference/hermes-update-plan-v2026.8.3.md §Phase 4 ("apply-patches.sh
+  # then grep the markers").
+  #
+  # The *semantic* marker enforcement — do the markers actually appear in the
+  # pinned upstream tree — happens inside the Docker build itself: the
+  # Dockerfile runs patches/verify-markers.sh right after applying the overlay,
+  # so a missing required marker fails the `build` job above and no bad image is
+  # ever published. That is the hard gate.
+  #
+  # This job is the fast, container-free half: it catches the mistakes that
+  # would otherwise only surface after a 20-minute image build — a malformed
+  # markers.tsv, a marker row pointing at a .patch file nobody committed, a
+  # shell script with a syntax error, a YAML/JSON template that does not parse.
+  # It runs independently of `build` (no `needs:`) so the existing build/push
+  # behaviour is completely unchanged.
+  patch-overlay-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Explicit interpreter + venv-free installs. `python3 -m pip install` into
+      # the runner's system Python fails on PEP 668 images ("externally-managed
+      # environment"), and PyYAML's presence on the runner is an assumption that
+      # has no business being load-bearing for a privacy-critical test suite.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same graceful-skip contract as the build job: this workflow must not go
+      # red on a branch where tenant-image/ is still a placeholder.
+      - name: Check tenant-image/ is populated
+        id: present
+        run: |
+          if [ -f "tenant-image/patches/markers.tsv" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tenant-image/patches/markers.tsv not found — skipping patch-overlay checks."
+          fi
+
+      - name: Shell syntax
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' f; do
+            echo "bash -n $f"
+            bash -n "$f"
+            found=$((found + 1))
+          done < <(find tenant-image -type f -name '*.sh' -print0)
+          echo "checked $found shell script(s)"
+          # A tenant-image with no shell scripts means the entrypoint or the
+          # patch overlay was deleted, which is never intentional.
+          test "$found" -gt 0
+
+      - name: Python syntax
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q tenant-image/bin tenant-image/tests
+          echo "python sources compile"
+
+      - name: Templates parse (YAML / JSON)
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, sys
+          import yaml  # PyYAML ships on ubuntu-latest runners
+
+          failures = []
+          root = pathlib.Path("tenant-image")
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              try:
+                  if path.suffix in (".yaml", ".yml"):
+                      yaml.safe_load(path.read_text())
+                  elif path.suffix == ".json":
+                      json.loads(path.read_text())
+                  else:
+                      continue
+              except Exception as exc:
+                  failures.append(f"{path}: {exc}")
+              else:
+                  print(f"ok  {path}")
+          if failures:
+              print("\n".join(f"FAIL {f}" for f in failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: markers.tsv is well formed
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys
+
+          patch_dir = pathlib.Path("tenant-image/patches")
+          markers = patch_dir / "markers.tsv"
+          errors, rows = [], 0
+          seen_ids = set()
+
+          for lineno, raw in enumerate(markers.read_text().splitlines(), 1):
+              line = raw.rstrip("\n")
+              if not line.strip() or line.lstrip().startswith("#"):
+                  continue
+              parts = line.split("\t")
+              if len(parts) != 4:
+                  errors.append(f"line {lineno}: expected 4 tab-separated columns, got {len(parts)}")
+                  continue
+              marker_id, target, pattern, required = (p.strip() for p in parts)
+              rows += 1
+              if not marker_id or not target or not pattern:
+                  errors.append(f"line {lineno}: empty id/file/pattern")
+              if marker_id in seen_ids:
+                  errors.append(f"line {lineno}: duplicate marker id {marker_id!r}")
+              seen_ids.add(marker_id)
+              if required not in ("required", "optional"):
+                  errors.append(
+                      f"line {lineno}: 4th column must be 'required' or 'optional', got {required!r}"
+                  )
+
+          if rows == 0:
+              errors.append("markers.tsv declares no markers — the upstream regression guard is disabled")
+
+          # Every committed .patch must have at least one marker row, or a patch
+          # can rot into a silent no-op after an upstream refactor. This is the
+          # file-disjoint / marker discipline from the update plan, enforced.
+          patches = sorted(p.name for p in patch_dir.glob("*.patch"))
+          for name in patches:
+              stem = name.split("-", 1)[0]
+              if not any(stem in m for m in seen_ids):
+                  errors.append(
+                      f"patch {name} has no corresponding marker row in markers.tsv "
+                      "(add one so an upstream refactor cannot silently void it)"
+                  )
+          print(f"{rows} marker row(s), {len(patches)} patch file(s): {patches or 'none (empty overlay)'}")
+
+          if errors:
+              print("\n".join(f"FAIL {e}" for e in errors), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      # ----------------------------------------------------------------------
+      # Behavioural test suites (tenant-image/tests/)
+      # ----------------------------------------------------------------------
+      # All three run WITHOUT Docker, by design: the image takes tens of minutes
+      # to build and needs no daemon for any of this. They are the regression
+      # protection for the parts of the image whose failures are SILENT — a
+      # credential written in plaintext to the volume, a Postgres cluster landing
+      # on ephemeral storage, a marker guard that no longer fails closed. None of
+      # those show up as a crash, so none of them would be caught by a build.
+      - name: Install test dependencies
+        if: steps.present.outputs.exists == 'true'
+        # cryptography: AES-256-GCM for the secrets selftest.
+        # pyyaml: the template-parse step; not guaranteed present on a runner.
+        # Deliberately unpinned floors rather than the image's exact pins — the
+        # tests exercise long-stable APIs, and pinning here would mean a
+        # dependency bump in the image silently red-lining CI.
+        run: python3 -m pip install --quiet "cryptography>=41" "pyyaml>=6"
+
+      - name: Secrets crypto selftest
+        if: steps.present.outputs.exists == 'true'
+        # Round-trips AES-256-GCM and asserts that a wrong key and a wrong AAD
+        # (the file-rename guard) both fail.
+        run: python3 tenant-image/bin/squire_secrets.py selftest
+
+      - name: Patch-marker guard fails closed
+        if: steps.present.outputs.exists == 'true'
+        run: bash tenant-image/tests/test_patch_markers.sh
+
+      - name: Boot path (first boot, restart, rotation, wrong DEK, durability)
+        if: steps.present.outputs.exists == 'true'
+        # Includes the assertion that no plaintext secret ever appears on the
+        # volume, and that pg0's data root is on the mount.
+        run: bash tenant-image/tests/test_boot_path.sh
+
+      - name: Hindsight LLM re-wiring (the conversion moment)
+        if: steps.present.outputs.exists == 'true'
+        # Trial key -> user's own key. If this regresses, memory extraction dies
+        # silently for exactly the tenants who just paid us.
+        run: bash tenant-image/tests/test_hindsight_env.sh
+
+      - name: Webhook shim contract
+        if: steps.present.outputs.exists == 'true'
+        # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,
+        # and the /metrics counts the fleet heartbeat is built on.
+        run: python3 tenant-image/tests/test_webhook_shim.py
+
+      - name: Fleet heartbeat is counts-only
+        if: steps.present.outputs.exists == 'true'
+        # The emitter is the only process that talks to the control plane on a
+        # timer, so it is the one place conversation data could leak out of the
+        # tenant's isolation boundary. The test pins the payload to a whitelist.
+        run: python3 tenant-image/tests/test_heartbeat.py
+
+      - name: Backups never touch plaintext (and are inert until configured)
+        if: steps.present.outputs.exists == 'true'
+        # Asserts on the exact argv restic receives: no tmpfs path is ever a
+        # backup source, and the repository password is HMAC(DEK), not the DEK.
+        run: bash tenant-image/tests/test_backup.sh
+
+      - name: Container contract constants
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          # ingress, control-api and the tenant image are built in parallel
+          # against a fixed contract. Changing any of these is a breaking change
+          # for another service, so make it impossible to do by accident.
+          fail=0
+          check() {
+            if grep -qF -- "$2" "$1"; then
+              echo "ok   $2"
+            else
+              echo "::error::container contract violated — '$2' missing from $1"
+              fail=1
+            fi
+          }
+          check tenant-image/Dockerfile 'PORT=8080'
+          check tenant-image/Dockerfile 'SQUIRE_WEBHOOK_PATH=/webhook/telegram'
+          check tenant-image/Dockerfile 'SQUIRE_VOLUME=/opt/data'
+          check tenant-image/bin/squire-webhook-shim.py '"SQUIRE_WEBHOOK_PATH", "/webhook/telegram"'
+
+          # Task 0.6: control-api's /internal/heartbeat and the upgrade drill's
+          # convergence check both depend on these two names existing on the
+          # tenant side. Renaming either silently blinds the fleet view.
+          check tenant-image/bin/squire-heartbeat.py '/internal/heartbeat'
+          check tenant-image/bin/squire-heartbeat.py 'SQUIRE_IMAGE_REF'
+
+          # restic must be pinned by BOTH version and checksum. A version-only
+          # pin still trusts whatever bytes the CDN serves, for a binary handed
+          # the tenant's whole volume and a DEK-derived key.
+          if grep -qE '^ARG RESTIC_SHA256=[0-9a-f]{64}$' tenant-image/Dockerfile; then
+            echo "ok   restic is checksum-pinned"
+          else
+            echo "::error::tenant-image/Dockerfile must pin RESTIC_SHA256 to a 64-hex digest"
+            fail=1
+          fi
+
+          # HOME is what decides whether pg0 puts the tenant's Postgres cluster
+          # on the volume or on ephemeral container storage. A redeploy with the
+          # wrong value destroys every memory the tenant has, silently.
+          check tenant-image/Dockerfile 'ENV HOME=/opt/data'
+          check tenant-image/Dockerfile 'HERMES_HOME=/opt/data'
+
+          # /opt/data is a CROSS-SERVICE CONSTANT, not just an image detail:
+          # control-api tells Railway to mount the tenant's volume at
+          # TENANT_VOLUME_MOUNT_PATH, and this image expects to find it there.
+          # They drifted once (control-api defaulted to /root/.hermes) and the
+          # result is not a degradation — the entrypoint's durability gate
+          # refuses to boot, so EVERY provisioned tenant would be dead on
+          # arrival. Pinned on both sides: here, and in control-api's
+          # tests/test_cross_service_contracts.py, which parses this file.
+          check apps/control-api/src/control_api/config.py 'tenant_volume_mount_path: str = "/opt/data"'
+
+          # The base must be digest-pinned. A floating tag means upstream can
+          # change what every tenant runs — and what the patch overlay is
+          # applied to — without a commit here.
+          if grep -qE '^FROM .*@sha256:[0-9a-f]{64}' tenant-image/Dockerfile; then
+            echo "ok   base image is digest-pinned"
+          else
+            echo "::error::tenant-image/Dockerfile FROM is not pinned by digest"
+            fail=1
+          fi
+
+          # secrets-sync must start before, and therefore stop after, the
+          # gateway; otherwise credentials written during the gateway's drain
+          # are never sealed. supervisord stops in descending priority.
+          sync_prio=$(awk '/^\[program:secrets-sync\]/{f=1} f&&/^priority=/{print $0; exit}' tenant-image/supervisord.conf | cut -d= -f2)
+          gw_prio=$(awk '/^\[program:gateway\]/{f=1} f&&/^priority=/{print $0; exit}' tenant-image/supervisord.conf | cut -d= -f2)
+          if [ "${sync_prio:-999}" -lt "${gw_prio:-0}" ]; then
+            echo "ok   secrets-sync (priority $sync_prio) outlives gateway (priority $gw_prio)"
+          else
+            echo "::error::secrets-sync priority ($sync_prio) must be LOWER than gateway ($gw_prio) so it stops last"
+            fail=1
+          fi
+
+          exit "$fail"
+
+      - name: supervisord.conf is coherent
+        if: steps.present.outputs.exists == 'true'
+        # Parses the process table and checks the one config pairing whose failure
+        # is silent and fleet-wide: a program that is ALLOWED to exit cleanly
+        # (exitcodes=0 + autorestart=unexpected -- the heartbeat and backup
+        # programs, which no-op when unconfigured) must also have startsecs=0.
+        # With any non-zero startsecs, supervisord treats that intentional exit as
+        # a failed start and drives the program to FATAL on every container.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import configparser, sys
+
+          # interpolation=None: supervisord's own format uses %(...)s expansions
+          # (and a bare % is legal in a command line). ConfigParser's default
+          # BasicInterpolation would raise on those, failing this check for a
+          # config supervisord itself reads perfectly well.
+          parser = configparser.ConfigParser(strict=False, interpolation=None)
+          parser.read("tenant-image/supervisord.conf")
+
+          programs = [s for s in parser.sections() if s.startswith("program:")]
+          if not programs:
+              sys.exit("supervisord.conf declares no programs")
+
+          errors = []
+          for section in programs:
+              cfg = parser[section]
+              may_exit = cfg.get("autorestart", "") == "unexpected"
+              startsecs = cfg.get("startsecs", "1")
+              if may_exit and startsecs != "0":
+                  errors.append(
+                      f"{section}: autorestart=unexpected needs startsecs=0, got {startsecs}"
+                  )
+              if not cfg.get("command"):
+                  errors.append(f"{section}: no command")
+              print(f"ok  {section} (priority {cfg.get('priority', '?')})")
+
+          if errors:
+              print("\n".join(f"FAIL {e}" for e in errors), file=sys.stderr)
+              sys.exit(1)
+          PY

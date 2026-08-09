@@ -1,0 +1,130 @@
+name: test
+
+# Runs each Python service's pytest suite. Companion to deploy.yml: this gates
+# merges, deploy.yml ships what merged.
+#
+# Every suite mocks its external HTTP (respx / httpx.MockTransport), so no job
+# needs network access, secrets, or a database service container.
+#
+# Path-filtered per service: touching apps/ingress does not re-run control-api's
+# suite. Filter/output keys use underscores rather than the hyphenated directory
+# names for the same reason deploy.yml does -- Actions expression dot-notation
+# parses `-` as subtraction.
+
+on:
+  pull_request:
+    paths:
+      - "apps/control-api/**"
+      - "apps/ingress/**"
+      - "apps/trial-proxy/**"
+      - "infra/**"
+      - ".github/workflows/test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/control-api/**"
+      - "apps/ingress/**"
+      - "apps/trial-proxy/**"
+      - "infra/**"
+      - ".github/workflows/test.yml"
+
+# Only ever reads the repository; no packages, no deployments, no token writes.
+permissions:
+  contents: read
+
+# A newer push to the same PR/branch makes the in-flight run obsolete.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      control_api: ${{ steps.filter.outputs.control_api }}
+      ingress: ${{ steps.filter.outputs.ingress }}
+      trial_proxy: ${{ steps.filter.outputs.trial_proxy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # On push, paths-filter needs an explicit base to diff against;
+          # for pull_request it defaults to the target branch.
+          base: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          filters: |
+            control_api:
+              - 'apps/control-api/**'
+              - 'infra/**'
+              - '.github/workflows/test.yml'
+            ingress:
+              - 'apps/ingress/**'
+              - '.github/workflows/test.yml'
+            trial_proxy:
+              - 'apps/trial-proxy/**'
+              # The proxy's suite asserts a cross-service contract: the model id
+              # the tenant template requests must be a model_name this proxy
+              # exposes, or LiteLLM 400s every trial message. Changing the tenant
+              # template must therefore re-run this suite.
+              - 'tenant-image/home-template/config.yaml'
+              - '.github/workflows/test.yml'
+
+  # control-api's suite also covers the infra/ CLIs (its pyproject puts
+  # ../../infra on pythonpath), which is why infra/** feeds this filter.
+  control-api:
+    needs: changes
+    if: needs.changes.outputs.control_api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install
+        working-directory: apps/control-api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: pytest
+        working-directory: apps/control-api
+        run: pytest -q
+
+  ingress:
+    needs: changes
+    if: needs.changes.outputs.ingress == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install
+        working-directory: apps/ingress
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: pytest
+        working-directory: apps/ingress
+        run: pytest -q
+
+  # trial-proxy is a LiteLLM config, not a Python package: its suite is a static
+  # config-validation test with no pyproject to install from.
+  trial-proxy:
+    needs: changes
+    if: needs.changes.outputs.trial_proxy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pyyaml
+      - name: pytest
+        working-directory: apps/trial-proxy
+        run: pytest -q

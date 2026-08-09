@@ -1,0 +1,14 @@
+# Keep the build context small and never ship local state into the image.
+#
+# This service's image is LiteLLM's published one plus config.yaml (see
+# Dockerfile) -- the tests and pytest cache have no business in the build
+# context, and .env must never be able to reach an image layer.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.env
+Dockerfile
+.dockerignore
+.gitignore

@@ -1,0 +1,31 @@
+diff --git a/scripts/whatsapp-bridge/bridge.native.test.mjs b/scripts/whatsapp-bridge/bridge.native.test.mjs
+index b4e123a26..7c6acd77a 100644
+--- a/scripts/whatsapp-bridge/bridge.native.test.mjs
++++ b/scripts/whatsapp-bridge/bridge.native.test.mjs
+@@ -121,7 +121,8 @@ import {
+   assert.deepEqual(event.readReceiptKey, {
+     id: 'incoming-1',
+     remoteJid: '15551234567@s.whatsapp.net',
+-    participant: '15550001111@s.whatsapp.net',
++    // (patch 004) DM keys must NOT carry participant — WhatsApp ignores
++    // group-shaped receipts on DMs. Groups still include it (test below).
+     fromMe: false,
+   });
+   assert.equal(event.hasQuotedMessage, true);
+diff --git a/scripts/whatsapp-bridge/bridge_helpers.js b/scripts/whatsapp-bridge/bridge_helpers.js
+index 398521fee..25c8f5eb3 100644
+--- a/scripts/whatsapp-bridge/bridge_helpers.js
++++ b/scripts/whatsapp-bridge/bridge_helpers.js
+@@ -486,7 +486,11 @@ export async function extractBridgeEvent({
+     readReceiptKey: {
+       remoteJid: msg.key.remoteJid || chatId,
+       id: msg.key.id,
+-      participant: msg.key.participant || senderId,
++      // (patch 004) participant only for group keys: WhatsApp silently
++      // ignores DM read receipts when a participant is present (the key
++      // looks group-shaped). Live-verified 2026-08-04: same DM key with
++      // participant -> no blue ticks; without -> ticks turn blue.
++      ...(isGroup ? { participant: msg.key.participant || senderId } : {}),
+       fromMe: Boolean(msg.key.fromMe),
+     },
+     timestamp: msg.messageTimestamp,

@@ -1,0 +1,251 @@
+# state-machine.yaml — the Squire concierge conversation, v1.
+#
+# Config-adjacent by design (Task 0.2): the onboarding *script* lives here as
+# data, next to SKILL.md, so it can be tuned, A/B'd and reviewed without editing
+# the agent's instructions or rebuilding intent into prose. SKILL.md says how to
+# drive this file; this file says what to say.
+#
+# `say` entries are INTENT, not a script to read aloud. The agent writes the
+# actual words in its own voice (SOUL.md). The only things that must survive
+# verbatim are the numbers and the honesty labels under `facts` and
+# `providers` — those are contractual, not stylistic.
+#
+# Runtime state lives at ${HERMES_HOME}/.squire/concierge-state.json.
+
+version: 1
+initial: greet
+completion_state: complete
+
+# ---------------------------------------------------------------------------
+# Facts the agent is allowed to state. Nothing outside this block may be
+# asserted about price, limits, or provider policy. Keep in sync with
+# docs/prd.md §5.3 / §5.4 — if these drift, the agent lies to customers.
+# ---------------------------------------------------------------------------
+facts:
+  trial_length: "3 days (72 hours) from signup"
+  trial_cost: "free, no card"
+  trial_model: "a fast, capable model on Squire's account"
+  trial_limits: "75 messages a day during the trial"
+  trial_end_behaviour: >
+    At 72 hours the agent stops answering and replies only with a link to
+    subscribe. The tenant's data is kept for 14 days and then permanently
+    destroyed unless they subscribe.
+  price_starter: "$5/month — early-bird pricing, Telegram, the full agent"
+  price_pro: "$10/month — adds WhatsApp, voice notes, extra personas and cron"
+  price_note: >
+    Early-bird pricing. Say so if asked — it is expected to rise later, and
+    saying it now is the reason raising it later is not a betrayal.
+  privacy_claim: >
+    Squire is designed so we cannot casually or silently read your
+    conversations or credentials: you get your own isolated runtime and your own
+    encryption key. It is not a mathematical guarantee — our hosting provider
+    can technically reach the machine — and we say so on the privacy page.
+    Never upgrade this into "nobody can ever see your data".
+
+# ---------------------------------------------------------------------------
+# States
+# ---------------------------------------------------------------------------
+states:
+
+  greet:
+    goal: Make the first thirty seconds feel like a person, not a product tour.
+    say:
+      - Say hello and who you are in one or two lines. Warm, brief, no feature list.
+      - Make it obvious this thread is theirs and you will remember it.
+    ask: null
+    then: ask_name
+    notes: >
+      Do not explain the trial here, do not ask anything yet, do not list what
+      you can do. One short message. The next message asks their name.
+
+  ask_name:
+    goal: Learn what to call them.
+    ask: What should I call you?
+    capture:
+      - name
+    on_capture:
+      - Save the name to long-term memory with hindsight_retain.
+      - Write it into concierge-state.json.
+      - Use it naturally from here on — not in every message, that reads as sales.
+    then: ask_timezone
+    notes: >
+      If they give a full name, use the short form unless they signalled
+      otherwise. If they dodge the question, move on — you can ask again later.
+
+  ask_timezone:
+    goal: Be able to say "tomorrow morning" and mean it.
+    ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
+    capture:
+      - timezone
+    on_capture:
+      - Resolve to an IANA name (e.g. Europe/London, America/Los_Angeles).
+      - Write it to the `timezone:` key in ${HERMES_HOME}/config.yaml.
+      - Save to memory and to concierge-state.json.
+    then: ask_first_job
+    notes: >
+      A city is a fine answer; convert it yourself rather than making them look
+      up a timezone name. If it is ambiguous, pick the obvious one and say which.
+
+  ask_first_job:
+    goal: >
+      Get one real thing to help with this week. This is the highest-value
+      question in the whole flow — it seeds memory with something you can follow
+      up on unprompted tomorrow, which is what makes the agent feel alive.
+    ask: What's one thing you'd want me to take off your plate this week?
+    capture:
+      - first_job
+    on_capture:
+      - Save it to memory with enough context to act on it later.
+      - If it is something you can start right now, start it. Do not defer real
+        work to finish an onboarding flow.
+    then: trial_explainer
+    notes: >
+      If they answer with an actual task, DO THE TASK. Then continue. The flow
+      serves them, not the other way round.
+
+  trial_explainer:
+    goal: Explain the trial honestly, once, in under five lines.
+    say:
+      - You are on the free trial — state trial_length and trial_cost.
+      - State trial_limits plainly.
+      - State trial_end_behaviour, including the 14-day data note.
+      - Do not pitch. Do not list prices unless they ask.
+    ask: null
+    then: connect_llm
+    notes: >
+      Skip this state entirely if they already subscribed (no trial). If they
+      ask about price, answer with price_starter / price_pro and price_note,
+      then return here.
+
+  connect_llm:
+    goal: >
+      Get them onto their own LLM account. Pitch it as unlocking the agent's
+      full brain — which is true — not as a billing chore. This is also the
+      single highest-signal conversion step (PRD §5.3), so it belongs early in
+      session one, not at the end of the trial.
+    say:
+      - >-
+        Frame it. Right now they are running on Squire's shared trial brain,
+        which is capped. Connecting their own account lifts the caps and
+        upgrades the model.
+      - Be explicit that their AI costs then go to their own provider account and
+        that their conversations stop touching Squire's LLM infrastructure
+        entirely.
+    ask: Which of these do you already have?
+    options_from: providers
+    then: awaiting_credential
+    notes: >
+      Present the four options as a short list with the honest label attached —
+      see `providers` below. Do NOT hide the Claude Max warning to make the
+      option look better. If they say "not now", accept it immediately, set
+      state to complete, and mention it again only when the trial is nearly up.
+
+  awaiting_credential:
+    goal: Get the credential in without it travelling through chat.
+    say:
+      - Send the one-time link. It is served by their own container, so the
+        credential goes browser -> their agent and never through Squire's shared
+        services.
+      - Tell them the link is single-use and short-lived.
+    ask: null
+    then: connected
+    on_paste_in_chat:
+      - Store the key, then delete their Telegram message immediately.
+      - Tell them once, plainly, that a pasted key did transit Telegram and our
+        relay, and that they can rotate it if they want to be careful.
+    on_failure:
+      - If the credential is rejected, say what the provider said, in one line.
+      - Offer the next-best path for that provider (see providers[].fallback).
+      - Never loop more than twice; offer to come back to it later instead.
+    notes: >
+      The link is minted by the tenant runtime, not by the agent inventing a
+      URL. Phase 1 workstream 1C (docs/implementation-plan.md §4) builds the
+      `GET /connect/<nonce>` endpoint; until it ships, this state falls back to
+      the paste-in-chat path above, with the deletion and the honesty note.
+
+  connected:
+    goal: Confirm and get out of the way.
+    say:
+      - Confirm which provider is now live, in one line.
+      - Note that their own key is in use from now on, so the trial's caps no
+        longer apply to them.
+      - Offer one concrete thing you can now do better. Then stop talking.
+    notes: >
+      DO NOT say the trial key "has been revoked" or that their traffic "now goes
+      direct". Neither is true yet: nothing calls
+      `POST /internal/tenants/<id>/revoke-trial-key` until Phase 1 workstream 1C
+      (docs/implementation-plan.md §4) builds the connect flow, so at this point
+      our trial key still exists on the proxy — it is simply no longer the
+      credential this tenant uses.
+
+      The wording above is the honest version of the same good news: their key is
+      live, our caps stop applying. It stays true both before and after 1C ships,
+      so this line does not need revisiting then.
+
+      This matters more than it looks. "Your traffic never touches our
+      infrastructure" is a load-bearing product promise (PRD §2), and an agent
+      that announces it a release early is not a copy problem — it is the product
+      telling a user something false about where their data goes.
+    then: complete
+
+  complete:
+    goal: Onboarding is done. Be an assistant.
+    notes: >
+      Never re-run the greeting. Re-enter `connect_llm` only if they ask to
+      change or add a provider, or if the trial is within ~12 hours of expiring
+      and they still have not connected one — and in that case, ask once.
+
+# ---------------------------------------------------------------------------
+# The four LLM options. Labels are contractual (PRD §2). Present them with the
+# caveats attached — the Claude Max warning in particular is not marketing copy
+# we get to soften; it is the reason we are allowed to offer that path at all.
+# See docs/reference/hermes-400-extra-usage-fix.md for the underlying breakage.
+# ---------------------------------------------------------------------------
+providers:
+
+  - id: openai_api_key
+    label: OpenAI API key
+    blurb: Paste a key from platform.openai.com. Pay-as-you-go on your own account.
+    honest_label: Fully supported.
+    credential: api_key
+    env: OPENAI_API_KEY
+    fallback: null
+
+  - id: openai_codex_oauth
+    label: OpenAI ChatGPT subscription (via Codex)
+    blurb: >
+      Sign in with your existing ChatGPT account. Uses your subscription instead
+      of metered API billing.
+    honest_label: >
+      Supported — OpenAI explicitly sanctions using a ChatGPT subscription this
+      way for agents.
+    credential: oauth_device_code
+    fallback: openai_api_key
+    notes: >
+      This is the recommended path for anyone who already pays for ChatGPT: no
+      extra bill, and it is the one subscription route the provider blesses.
+
+  - id: anthropic_api_key
+    label: Anthropic API key
+    blurb: Paste a key from console.anthropic.com. Pay-as-you-go on your own account.
+    honest_label: Fully supported.
+    credential: api_key
+    env: ANTHROPIC_API_KEY
+    fallback: null
+
+  - id: claude_max_oauth
+    label: Claude Max subscription
+    blurb: Sign in with your existing Claude account and use your Max subscription.
+    honest_label: >
+      ⚠ Not supported by Anthropic. It works today, but it is not a sanctioned
+      integration and it may break without warning. If it breaks we fall back to
+      an API key automatically — we will ask you for one then.
+    credential: oauth_token
+    env: CLAUDE_CODE_OAUTH_TOKEN
+    fallback: anthropic_api_key
+    notes: >
+      Say the warning out loud when you offer it. Do not bury it, do not put it
+      last in a long sentence, and do not answer "is this allowed?" with
+      anything softer than the honest_label above. If it starts failing, tell
+      them what happened rather than silently degrading — a mysterious quality
+      drop is worse than a clear "this broke, paste a key".
