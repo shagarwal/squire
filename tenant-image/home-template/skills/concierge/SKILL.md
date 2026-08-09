@@ -35,14 +35,29 @@ Track progress in `${HERMES_HOME}/.squire/concierge-state.json`:
 {"state": "ask_name", "name": null, "timezone": null, "llm": "trial", "updated": "2026-08-07T12:00:00Z"}
 ```
 
-- Read it at the start of any onboarding-ish turn. No file, or unreadable →
-  you are at the `greet` state and this is message one.
+- The Squire runtime seeds this file with `{"state": "greet"}` on the tenant's
+  first boot, so it is there before the first message arrives. If it is somehow
+  missing or unreadable, you are at `greet` and this is message one.
 - Write it after **every** state transition, with the `terminal` tool. A
   container restart mid-onboarding must not make you start over and re-ask
   their name — that is the exact failure that makes an assistant feel fake.
 - `state: complete` means onboarding is done. Do not run this skill again for
   greetings; do still use the `connect_llm` section verbatim if they later ask
   to change or connect a provider.
+
+**You will usually be told which state you are in.** While this file is not
+`complete`, the runtime injects the current step and what to do about it into
+every turn (`bin/squire-concierge-hook.py`, wired as a `pre_llm_call` hook).
+That injected instruction is authoritative and is the short version of the same
+script. When it is present, follow it; read `state-machine.yaml` for the detail
+it points at — the `facts` block and the provider labels in particular, which
+you must never paraphrase from memory.
+
+This belt-and-braces exists because relying on the agent to *notice* it should
+onboard failed on the first real tenant: the pointer was a conditional buried in
+SOUL.md, there was no state file to read, and upstream was injecting a competing
+"introduce yourself in one or two sentences" note into the same slot. Three
+independent things now have to fail before a user gets no onboarding.
 
 ## Rules that override everything else here
 

@@ -142,6 +142,23 @@ check "hindsight config seeded"      "$(yn test -f "$VOL/hindsight/config.json")
 check "concierge skill seeded"       "$(yn test -f "$VOL/skills/concierge/SKILL.md")"
 check "state machine seeded"         "$(yn test -f "$VOL/skills/concierge/state-machine.yaml")"
 check "init marker written"          "$(yn test -f "$VOL/.squire/initialized")"
+
+# Onboarding state must EXIST after the first boot, and must say `greet`.
+# The original design left this file absent and asked the agent to infer
+# onboarding from its absence; that shipped, and the first live tenant got no
+# onboarding at all. A present file IS the mechanism — squire-concierge-hook.py
+# has nothing to inject without it.
+check "concierge state seeded"       "$(yn test -f "$VOL/.squire/concierge-state.json")"
+check "concierge state is greet" \
+    "$(yn python3 -c "import json,sys; sys.exit(0 if json.load(open('$VOL/.squire/concierge-state.json'))['state']=='greet' else 1)")" \
+    "$(cat "$VOL/.squire/concierge-state.json" 2>/dev/null)"
+check "concierge state carries the documented keys" \
+    "$(yn python3 -c "import json; d=json.load(open('$VOL/.squire/concierge-state.json')); assert {'state','name','timezone','llm','updated'} <= set(d)")"
+check "concierge state seeding was logged" "$(says "$out" 'seeded concierge onboarding state')"
+check "concierge state is 0600" \
+    "$([ "$(stat -c %a "$VOL/.squire/concierge-state.json" 2>/dev/null)" = 600 ] && echo 1 || echo 0)" \
+    "$(stat -c %a "$VOL/.squire/concierge-state.json" 2>/dev/null)"
+
 check ".env is a symlink"            "$(yn test -L "$VOL/.env")"
 check "auth.json is a symlink"       "$(yn test -L "$VOL/auth.json")"
 check ".env resolves into tmpfs"     "$([ "$(readlink "$VOL/.env")" = "$TMPFS/.env" ] && echo 1 || echo 0)" "$(readlink "$VOL/.env")"
@@ -198,6 +215,45 @@ rm -rf "${TMPFS:?}"/*
 out="$(boot "$URL")"
 check "customised SOUL.md preserved" "$(yn grep -q 'MY CUSTOM PERSONA' "$VOL/SOUL.md")"
 check "missing baked file re-seeded"  "$(yn test -f "$VOL/skills/concierge/SKILL.md")"
+
+echo "== 3b. onboarding state survives, and never restarts, across boots =="
+# Onboarding that resets on redeploy would re-ask someone's name after they had
+# already given it — the exact "this thing is fake" moment the concierge exists
+# to prevent. And onboarding that re-fires after `complete` would greet a
+# week-old user as a stranger, which is worse. Both directions are asserted.
+
+# Mid-flow: the agent has banked a name and moved to ask_timezone.
+printf '{"state":"ask_timezone","name":"Ada","timezone":null,"llm":"trial"}' \
+    > "$VOL/.squire/concierge-state.json"
+rm -rf "${TMPFS:?}"/*
+out="$(boot "$URL")"
+check "mid-flow state survives a restart" \
+    "$(yn python3 -c "import json,sys; d=json.load(open('$VOL/.squire/concierge-state.json')); sys.exit(0 if d['state']=='ask_timezone' and d['name']=='Ada' else 1)")" \
+    "$(cat "$VOL/.squire/concierge-state.json")"
+check "restart did not log a re-seed" \
+    "$([ "$(says "$out" 'seeded concierge onboarding state')" = 0 ] && echo 1 || echo 0)"
+
+# Finished: a completed tenant must never be dragged back through onboarding.
+printf '{"state":"complete","name":"Ada","timezone":"Europe/London","llm":"anthropic_api_key"}' \
+    > "$VOL/.squire/concierge-state.json"
+rm -rf "${TMPFS:?}"/*
+out="$(boot "$URL")"
+check "completed state is not re-seeded" \
+    "$(yn python3 -c "import json,sys; sys.exit(0 if json.load(open('$VOL/.squire/concierge-state.json'))['state']=='complete' else 1)")" \
+    "$(cat "$VOL/.squire/concierge-state.json")"
+
+# The nastiest case: a restored-from-backup or rolled-back volume that lost its
+# init marker. seed_template correctly treats that as a first boot — but the
+# tenant is emphatically NOT new, and re-greeting them would be a visible bug.
+# This is what the second `-f` guard in the entrypoint buys.
+rm -f "$VOL/.squire/initialized"
+rm -rf "${TMPFS:?}"/*
+out="$(boot "$URL")"
+check "lost init marker still does not reset a completed tenant" \
+    "$(yn python3 -c "import json,sys; sys.exit(0 if json.load(open('$VOL/.squire/concierge-state.json'))['state']=='complete' else 1)")" \
+    "$(cat "$VOL/.squire/concierge-state.json")"
+check "first-boot path really did re-run (guard was load-bearing)" \
+    "$(says "$out" 'first boot')"
 
 echo "== 4. agent writes a credential; sync re-seals it =="
 echo 'ANTHROPIC_API_KEY=sk-ant-user-supplied' >> "$TMPFS/.env"

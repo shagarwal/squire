@@ -189,6 +189,34 @@ mkdir -p "$HERMES_HOME/logs" "$HERMES_HOME/sessions" "$HERMES_HOME/skills" \
          "$HERMES_HOME/hindsight" "$HERMES_HOME/cron"
 
 # ---------------------------------------------------------------------------
+# 3b. Concierge onboarding state
+# ---------------------------------------------------------------------------
+# Seed POSITIVE state for the first conversation. The original design left this
+# file absent and asked the agent to infer "the file is missing, therefore I
+# have not onboarded anyone yet" — an absence is the single hardest signal for a
+# model to act on, and on the first live tenant it duly did nothing at all.
+#
+# With the file present and saying `greet`, squire-concierge-hook.py has
+# something concrete to read on every turn, and the agent is *told* which step
+# it is on instead of being asked to deduce that it is on one.
+#
+# FIRST BOOT ONLY, and the -f guard is doubled deliberately:
+#   * the first_boot test means an image upgrade never restarts onboarding for
+#     an existing tenant, and
+#   * the -f test means that even a lost or rolled-back init marker cannot reset
+#     a tenant who has already finished — re-onboarding someone who has used the
+#     product for a week is a worse bug than never onboarding them at all.
+CONCIERGE_STATE="$STATE_DIR/concierge-state.json"
+if [ "$first_boot" = true ] && [ ! -f "$CONCIERGE_STATE" ]; then
+    # Written with printf rather than through the control venv: onboarding state
+    # must not depend on a Python interpreter being importable this early.
+    printf '{"state":"greet","name":null,"timezone":null,"llm":"trial","updated":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CONCIERGE_STATE"
+    chmod 0600 "$CONCIERGE_STATE"
+    log "seeded concierge onboarding state (greet)"
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Secrets: volume (sealed) <-> tmpfs (plaintext)
 # ---------------------------------------------------------------------------
 # Each managed file lives on tmpfs and is symlinked into $HERMES_HOME, so every

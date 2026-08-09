@@ -13,13 +13,25 @@
 # into tmpfs and are DEK-encrypted at rest on the volume.
 
 # --- Model -----------------------------------------------------------------
-# Trial default is Haiku-class: it runs on our metered key against a ~$2 hard
-# budget (PRD §5.3), and it is genuinely good enough to make the product feel
-# real. The concierge's whole job is to get the tenant onto their own provider,
-# at which point `hermes model <provider:model>` (or the connect flow) rewrites
+# Trial default is Sonnet-class, on our metered key against a ~$10 hard budget
+# (PRD §5.3). Raised from Haiku/$2 on 2026-08-09 for two reasons that turned
+# out to be the same reason: the first live tenant showed a Haiku-class model
+# ignoring the concierge script outright, and onboarding and everyday
+# usefulness are both instruction-following. $2 at Sonnet prices buys ~50
+# turns, well under the advertised 75/day, so the cap was resized to the
+# promise rather than the promise to the cap.
+#
+# This string is sent VERBATIM as the request's `model` field — hermes does not
+# strip the provider prefix — so it must appear exactly in the trial proxy's
+# model_list. apps/trial-proxy/tests/test_config.py asserts both ends of that
+# contract; a mismatch 400s every trial message and looks to the user like an
+# agent that never worked at all.
+#
+# The concierge's whole job is to get the tenant onto their own provider, at
+# which point `hermes model <provider:model>` (or the connect flow) rewrites
 # this. Provider credentials and ANTHROPIC_BASE_URL (the trial proxy) come from
 # the environment, set per tenant by control-api.
-model: "anthropic:claude-haiku-4-5"
+model: "anthropic:claude-sonnet-5"
 
 # Fallback ladder. Empty by default: during the trial there is only one key, and
 # a silent fallback to a different provider would quietly bypass the metering
@@ -78,6 +90,68 @@ skills:
   # Lets SKILL.md files reference their own directory via ${HERMES_SKILL_DIR} —
   # the concierge skill uses it to find its state machine file.
   template_vars: true
+
+# --- Onboarding ------------------------------------------------------------
+# Squire runs its OWN first conversation (the `concierge` skill). Upstream runs
+# one too, and it was winning.
+#
+# On the very first message ever, gateway/run.py injects a note into the user
+# message telling the agent to introduce itself in "one or two sentences max"
+# and to mention /help — or, by default (`profile_build: ask`), an even stronger
+# directive to offer to build a user profile. Both land in the same
+# high-salience slot our concierge directive uses, and both are shorter and more
+# concrete than a pointer buried in SOUL.md. On a Haiku-class trial model the
+# short concrete instruction wins every time, which is exactly why the first
+# live tenant got a two-line hello and no onboarding at all.
+#
+# `off` stops the profile-build directive. Patch 005 suppresses the remaining
+# plain intro note while concierge state is not `complete`. Together they leave
+# exactly one voice giving the agent instructions on message one.
+onboarding:
+  profile_build: "off"
+
+# --- Hooks -----------------------------------------------------------------
+# The deterministic half of onboarding. hermes runs `pre_llm_call` hooks once
+# per turn and appends whatever they print to the USER message, which is the
+# highest-salience position in the prompt — better than the system prompt for a
+# small model, and the same channel upstream uses for its own must-deliver
+# notes.
+#
+# squire-concierge-hook.py reads .squire/concierge-state.json and, while that
+# state is not `complete`, states the current step and exactly what to do about
+# it. That is the whole point: the agent is TOLD it is onboarding rather than
+# being asked to notice that it should be. It goes silent the moment onboarding
+# completes, so it costs nothing for the rest of a tenant's life.
+#
+# The hook is fail-open by construction (see its module docstring): any error
+# prints nothing and exits 0, and hermes treats a failed hook as a no-op. It can
+# never be the reason a message goes unanswered.
+hooks:
+  pre_llm_call:
+    # 10s is generous for a file read; the script normally finishes in tens of
+    # milliseconds. The timeout exists so a pathological filesystem stall cannot
+    # hold up a user's reply.
+    - command: "/opt/squire/bin/squire-concierge-hook.py"
+      timeout: 10
+
+# Shell hooks normally require an interactive consent prompt on first use, and
+# the gateway has no TTY — so without an opt-in the hook above silently never
+# registers, a failure that looks exactly like the bug we are fixing.
+#
+# That opt-in is HERMES_ACCEPT_HOOKS=1, set in the Dockerfile rather than as
+# `hooks_auto_accept: true` here. This file is NOT image-managed: it is seeded
+# once and thereafter owned by the tenant (0644, hermes-owned, later boots only
+# top up files it lacks), hermes rewrites it during config migrations and via
+# upstream's onboarding `mark_seen`, and the agent itself edits `timezone:`. An
+# env var survives all of that; a config key does not.
+#
+# What auto-accept actually costs, stated plainly: first-use consent is skipped
+# for EVERY hook in this file, not only ours; those hooks persist across
+# restarts; and they execute outside the tool-approval path the user sees. It
+# is not a privilege escalation — the agent already has the `terminal` tool, so
+# arbitrary execution was always available — but it is a real widening of what
+# runs without anyone being asked, which is why the `hooks:` block above should
+# stay short and reviewed.
 
 # --- Approvals -------------------------------------------------------------
 # Left at upstream defaults deliberately. The dangerous-action approval flow is

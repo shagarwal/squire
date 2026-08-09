@@ -369,6 +369,7 @@ RUN /opt/squire/venv/bin/python -m py_compile \
         /opt/squire/bin/squire-webhook-shim.py \
         /opt/squire/bin/squire-hindsight-healthcheck.py \
         /opt/squire/bin/squire-heartbeat.py \
+        /opt/squire/bin/squire-concierge-hook.py \
  && chmod -R a+rX /opt/squire \
  && mkdir -p /opt/squire/run \
  && chown hermes:hermes /opt/squire/run
@@ -416,6 +417,23 @@ ENV PORT=8080 \
 # to boot, because pg0 would put the tenant's memory on ephemeral storage.
 ENV HOME=/opt/data \
     HERMES_HOME=/opt/data
+
+# --- Shell hooks -----------------------------------------------------------
+# Registers the pre_llm_call concierge hook (home-template/config.yaml) without
+# a TTY consent prompt. The gateway has no TTY, so without this the hook never
+# registers and onboarding silently reverts to the bug it was built to fix.
+#
+# Deliberately an env var and NOT `hooks_auto_accept: true` in config.yaml:
+# config.yaml is seeded once and then owned by the tenant — hermes rewrites it
+# on config migrations and via upstream's onboarding mark_seen, and the agent
+# edits `timezone:` itself. An env var is genuinely image-managed; a config key
+# there only looks like it is.
+#
+# Cost, stated plainly: first-use consent is skipped for EVERY hook in the
+# tenant's config.yaml, those hooks persist across restarts, and they run
+# outside the tool-approval path. Not an escalation (the agent has `terminal`
+# already), but a real widening — keep the hooks block short and reviewed.
+ENV HERMES_ACCEPT_HOOKS=1
 
 # --- Secrets ---------------------------------------------------------------
 # Plaintext credentials live ONLY here, and this is a tmpfs. /dev/shm is a
