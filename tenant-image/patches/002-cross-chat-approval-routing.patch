@@ -1,0 +1,17 @@
+diff --git a/tools/approval.py b/tools/approval.py
+index d2d50a19a..a443ea008 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -290,6 +290,12 @@ def has_blocking_approval(session_key: str) -> bool:
+         return bool(_gateway_queues.get(session_key))
+ 
+ 
++def get_all_blocking_sessions() -> list[str]:
++    """Return all session keys that currently have blocking approvals waiting."""
++    with _lock:
++        return [k for k, v in _gateway_queues.items() if v]
++
++
+ def submit_pending(session_key: str, approval: dict):
+     """Store a pending approval request for a session."""
+     with _lock:

@@ -33,30 +33,78 @@ upstream-oauth-wire-name	agent/anthropic_adapter.py	_to_oauth_wire_name	required
 # A single `mcp_` is the exact token that triggers the extra-usage lane.
 upstream-mcp-prefix	agent/anthropic_adapter.py	_MCP_TOOL_PREFIX = "mcp__"	required
 
-# --- Anchors the cross-chat approval patches attach to ----------------------
-# The update plan's file-disjoint rule assigns 002 -> tools/approval.py and
-# 003 -> gateway/slash_commands.py. These rows pin the specific upstream
-# functions those patches hook, so an upstream refactor that renames or removes
-# them fails the build with an obvious reason instead of a mystery patch
-# rejection (or, worse, a patch that still applies to the wrong place).
+# --- UPSTREAM anchors the patches attach to ---------------------------------
+# These prove the upstream code our patches hook still EXISTS. They are NOT
+# evidence that a patch applied — an unpatched tree satisfies every one of them.
+# That distinction matters: these rows catch "upstream refactored the thing we
+# depend on", while the post-apply rows below catch "the patch did not land".
+# Both are real failure modes and they need separate markers.
 #
-# Both strings verified present in the v2026.8.3 tree.
-#
-# 002 hooks the gateway approval-resolution plumbing so an approval raised in
-#     one chat can be resolved from another.
+# All verified present in the v2026.8.3 tree.
 patch-002-anchor	tools/approval.py	def resolve_gateway_approval(	required
 patch-002-anchor-notify	tools/approval.py	def register_gateway_notify(	required
-# 003 extends the /approve slash command to accept a session key. Update plan
-#     §2: "Native /approve accepts no session-key argument ... patch 003 is
-#     still required for cross-chat approve."
 patch-003-anchor	gateway/slash_commands.py	_handle_approve_command	required
 
-# --- Squire patch markers ---------------------------------------------------
-# These correspond to the founder's patches 001/002/003, which are NOT yet
-# vendored into tenant-image/patches/ (they live on the VPS at
-# ~/.hermes/patches/). They are marked `optional` so the image builds without
-# them; flip each to `required` in the same commit that adds its .patch file.
+# --- POST-APPLY markers: proof each vendored patch actually landed ----------
+# Every string below exists ONLY after its patch is applied, so verify-markers
+# — which the Dockerfile runs immediately after apply-patches.sh — becomes a
+# genuine check that the overlay took effect, not merely that upstream still
+# looks familiar.
 #
-# 001 — OAuth system-prompt scrubber. Marker per update plan §Phase 4:
-#       `grep '/home/agent' agent/anthropic_adapter.py`
-squire-001-oauth-scrubber	agent/anthropic_adapter.py	/home/agent	optional
+# This matters more than usual here: all four patches applied with large line
+# OFFSETS against v2026.8.3 (001 +549, 002 +2087, 003 +1620). `patch` found the
+# right context and reported no fuzz, but "applied at an offset of 2087 lines"
+# is exactly the situation where a human should want independent confirmation
+# that the change landed somewhere meaningful.
+#
+# All four dry-run and applied cleanly against a real v2026.8.3 checkout on
+# 2026-08-08, and every marker below was confirmed present in the result.
+
+# 001 — OAuth system-prompt scrubber (agent/anthropic_adapter.py).
+#       TWO markers, because the patch carries two independently load-bearing
+#       fixes and losing either silently reintroduces HTTP 400 "out of extra
+#       usage" on Claude Max / subscription OAuth:
+#
+#   /home/agent              the fingerprint scrub. This is a REPLACEMENT string
+#                            ("/home/hermes" -> "/home/agent"), so it cannot
+#                            appear in an unpatched tree. It is the exact grep
+#                            named in hermes-update-plan-v2026.8.3.md §Phase 4.
+#   _promote_bare_tool_refs  the 2026-06-19 "part 2" fix. Per the VPS patches
+#                            README, bare compound tool tokens left in system
+#                            prompt prose (session_search, skill_manage, …) plus
+#                            the MEDIA: marker were themselves sufficient to
+#                            trigger the 400 — A/B-proven against a live Max
+#                            token. The fingerprint scrub does NOT cover that,
+#                            so the first marker passing is not sufficient
+#                            evidence that billing is safe.
+squire-001-oauth-scrubber	agent/anthropic_adapter.py	/home/agent	required
+squire-001-bare-tool-promotion	agent/anthropic_adapter.py	_promote_bare_tool_refs	required
+
+# 002 — cross-chat approval routing (tools/approval.py). Adds the helper that
+#       lists sessions with pending approvals.
+squire-002-blocking-sessions	tools/approval.py	def get_all_blocking_sessions(	required
+
+# 003 — cross-chat approval session key (gateway/slash_commands.py). Lets
+#       `/approve <platform:chat_id>` and `/deny <key>` target the originating
+#       session from the home chat. Upstream's own /approve still accepts no
+#       session-key argument (update plan §2), so this stays ours to carry.
+squire-003-xchat-sessionkey	gateway/slash_commands.py	_xchat_key	required
+
+# 004 — DM read receipts (scripts/whatsapp-bridge/bridge_helpers.js), added
+#       2026-08-04, i.e. AFTER the update plan's "001-003" was written.
+#       Upstream forces `participant` into the DM readReceiptKey, making the key
+#       look group-shaped; WhatsApp then silently drops the receipt and blue
+#       ticks never appear. The fix spreads `participant` only when isGroup.
+#
+#       INERT IN THIS IMAGE, carried deliberately. Squire is Telegram-only and
+#       prd.md §1 names "no Baileys/unofficial WhatsApp" as an explicit v1
+#       non-goal; the upstream image also never runs `npm install` in
+#       scripts/whatsapp-bridge, so that bridge has no node_modules and cannot
+#       execute here. We carry it anyway so our overlay stays identical to the
+#       founder's VPS set — a divergent overlay is how rebases start costing
+#       hours. Retire when upstream merges PR #79122.
+#
+#       Marked required on purpose: if a future size optimisation strips the
+#       WhatsApp bridge from the image, this row fails the build and forces that
+#       to be a deliberate decision instead of a silent one.
+squire-004-dm-read-receipt	scripts/whatsapp-bridge/bridge_helpers.js	isGroup ? { participant	required
