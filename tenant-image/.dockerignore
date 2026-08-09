@@ -1,5 +1,5 @@
 # Build context is tenant-image/ (see .github/workflows/tenant-image.yml).
-# Keep it tiny — everything here is COPYed into the image, so anything that
+# Keep it tiny -- everything here is COPYed into the image, so anything that
 # sneaks in is shipped to every tenant.
 
 # Never ship secrets, even by accident. The image builds credentials at
