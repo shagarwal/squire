@@ -68,7 +68,7 @@ HERMES_HOME="${HERMES_HOME:-/opt/data}"
 VOLUME="${SQUIRE_VOLUME:-$HERMES_HOME}"
 STATE_DIR="${SQUIRE_STATE_DIR:-$HERMES_HOME/.squire}"
 TMPFS_DIR="${SQUIRE_SECRETS_TMPFS:-/dev/shm/squire}"
-SECRETS="${SQUIRE_SECRET_FILES:-.env auth.json}"
+SECRETS="${SQUIRE_SEALED_FILE_NAMES:-.env auth.json}"
 
 # Same overridable interpreter/bin pair as the other scripts, so this can be
 # exercised outside a container (tests/test_backup.sh does exactly that).
@@ -181,7 +181,7 @@ EXCLUDES=(
     --exclude "postmaster.pid"
 )
 # `read -ra` into an array rather than `for name in $SECRETS`: the split is
-# deliberate (SQUIRE_SECRET_FILES is a space-separated list), but an unquoted
+# deliberate (SQUIRE_SEALED_FILE_NAMES is a space-separated list), but an unquoted
 # expansion also glob-expands, so a file named `.env` next to a stray `*` in the
 # variable would quietly turn into a different exclude list.
 read -ra SECRET_NAMES <<< "$SECRETS"

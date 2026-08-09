@@ -26,7 +26,7 @@ STATE_DIR="${SQUIRE_STATE_DIR:-$HERMES_HOME/.squire}"
 SECRETS_ENC_DIR="$STATE_DIR/secrets"
 TMPFS_DIR="${SQUIRE_SECRETS_TMPFS:-/dev/shm/squire}"
 TEMPLATE_DIR="${SQUIRE_HOME_TEMPLATE:-/opt/squire/home-template}"
-SECRETS="${SQUIRE_SECRET_FILES:-.env auth.json}"
+SECRETS="${SQUIRE_SEALED_FILE_NAMES:-.env auth.json}"
 INIT_MARKER="$STATE_DIR/initialized"
 
 # The control venv's interpreter and our bin dir, in one place. Overridable so

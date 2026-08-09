@@ -73,7 +73,8 @@ ARG HERMES_VERSION=v2026.8.3
 # the same mutable-input problem in a different coat. Every version below was
 # resolved against the real index on 2026-08-08; bump deliberately.
 ARG HINDSIGHT_VERSION=0.9.0
-ARG TORCH_VERSION=2.9.1
+# `+cpu` is the local version the PyTorch CPU index uses for its Linux wheels.
+ARG TORCH_VERSION=2.9.1+cpu
 ARG SUPERVISOR_VERSION=4.3.0
 ARG CRYPTOGRAPHY_VERSION=49.0.0
 
@@ -112,6 +113,49 @@ LABEL org.opencontainers.image.title="squire-hermes-tenant" \
 # Squire scripts change on almost every commit. Building in this order means an
 # ordinary edit to a shell script or a patch re-runs seconds of work instead of
 # re-resolving and re-downloading the whole ML stack.
+#
+# ---------------------------------------------------------------------------
+# EVERY uv COMMAND BELOW PASSES --no-config. THIS IS LOAD-BEARING.
+# ---------------------------------------------------------------------------
+# The upstream image sets WORKDIR /opt/hermes, and /opt/hermes/pyproject.toml
+# contains:
+#
+#     [tool.uv]
+#     exclude-newer = "14 days"
+#
+# uv discovers configuration from the working directory upward, so OUR install
+# layers silently inherited upstream's rolling 14-day cutoff and refused to
+# consider any wheel uploaded more recently than ~2 weeks ago. That is what
+# broke the first CI build (tag tenant-image-v0.1.0).
+#
+# It is worth being precise about the failure, because the obvious reading of
+# the error is wrong. uv reported:
+#
+#     Because only the following versions of torch are available: ...
+#     hint: Wheels are available for `torch` (v2.9.1) on the following
+#     platform: `macosx_11_0_arm64`
+#
+# which looks like a pin/platform problem. It is not. Reproduced locally with
+# uv against a python 3.13 venv and a pyproject.toml carrying the same cutoff:
+#
+#     bare ==2.9.1,  cutoff ACTIVE   -> No solution found (macosx hint)  <- CI
+#     bare ==2.9.1,  cutoff DISABLED -> resolves fine
+#     ==2.9.1+cpu,   cutoff ACTIVE   -> No solution found                <- !!
+#     ==2.9.1+cpu,   cutoff DISABLED -> resolves fine
+#
+# The cutoff filters the Linux `+cpu` wheels, leaving only the older macOS ones,
+# and uv's hint then blames the platform. So fixing ONLY the pin would have
+# failed the build again in exactly the same place.
+#
+# The cutoff would also have blocked the very next layer regardless of torch:
+# hindsight-api-slim==0.9.0 (uploaded 2026-08-07) and its pg0-embedded==0.15.1
+# dependency (2026-07-31) are both newer than the cutoff. Verified locally:
+# without --no-config the resolve fails outright; with it, 190 packages resolve.
+#
+# --no-config is the documented way to ignore discovered pyproject.toml/uv.toml
+# ("Avoid discovering configuration files", env: UV_NO_CONFIG). We do NOT want
+# upstream's supply-chain-freshness policy governing our two independent venvs —
+# we pin exact versions ourselves, which is the same guarantee reached honestly.
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -124,8 +168,8 @@ LABEL org.opencontainers.image.title="squire-hermes-tenant" \
 #
 #   cryptography — AES-256-GCM for the DEK-encrypted secret files
 #   supervisor   — process supervision inside the container
-RUN uv venv --python 3.13 /opt/squire/venv \
- && uv pip install --python /opt/squire/venv/bin/python --no-cache \
+RUN uv venv --no-config --python 3.13 /opt/squire/venv \
+ && uv pip install --no-config --python /opt/squire/venv/bin/python --no-cache \
         "supervisor==${SUPERVISOR_VERSION}" "cryptography==${CRYPTOGRAPHY_VERSION}"
 
 # ---------------------------------------------------------------------------
@@ -168,10 +212,20 @@ RUN uv venv --python 3.13 /opt/squire/venv \
 # wheel drags in the whole nvidia-cu* stack (multiple GB) a tenant can never
 # use; installing the CPU build first means the resolve below sees torch as
 # already satisfied.
-RUN uv venv --python 3.13 /opt/squire/hindsight-venv \
- && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
+#
+# TORCH_VERSION carries the `+cpu` local version, which is how the Linux wheels
+# on that index are actually named (torch-2.9.1+cpu-cp313-cp313-
+# manylinux_2_28_x86_64.whl; manylinux_2_28 is satisfied by trixie's glibc
+# 2.41). PEP 440 means a bare `==2.9.1` would ALSO match `2.9.1+cpu`, so this is
+# not what broke CI — see the --no-config note above. It is pinned explicitly
+# anyway because it makes the local version visible at the pin site, and because
+# `2.9.1+cpu` does not exist on PyPI: if this resolve ever falls back to the
+# default index it now fails loudly instead of quietly installing the
+# multi-gigabyte CUDA build into a container that has no GPU.
+RUN uv venv --no-config --python 3.13 /opt/squire/hindsight-venv \
+ && uv pip install --no-config --python /opt/squire/hindsight-venv/bin/python --no-cache \
         --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
- && uv pip install --python /opt/squire/hindsight-venv/bin/python --no-cache \
+ && uv pip install --no-config --python /opt/squire/hindsight-venv/bin/python --no-cache \
         "hindsight-api-slim[embedded-db,local-ml]==${HINDSIGHT_VERSION}" \
  && /opt/squire/hindsight-venv/bin/hindsight-api --help > /dev/null
 
@@ -350,8 +404,20 @@ ENV HOME=/opt/data \
 # tmpfs in every OCI runtime with no extra capabilities required (mounting our
 # own tmpfs would need CAP_SYS_ADMIN, which Railway does not grant). The
 # encrypted-at-rest copies live under SQUIRE_STATE_DIR on the volume.
+#
+# SQUIRE_SEALED_FILE_NAMES was previously SQUIRE_SECRET_FILES, which tripped
+# BuildKit's SecretsUsedInArgOrEnv lint on the first CI build. That was a false
+# positive — the value is a list of FILENAMES ('.env auth.json'), never a
+# credential — but a standing warning on every build trains people to ignore
+# warnings, and the new name is also just more accurate about what it holds.
+#
+# SQUIRE_SECRETS_TMPFS is deliberately NOT renamed. Its value is a directory
+# path, it did not trigger the lint on the first build, and renaming it would
+# ripple through five scripts and three test suites for a cosmetic change. If a
+# future BuildKit tightens the heuristic and flags it, rename it then — the
+# change is mechanical.
 ENV SQUIRE_SECRETS_TMPFS=/dev/shm/squire \
-    SQUIRE_SECRET_FILES=".env auth.json"
+    SQUIRE_SEALED_FILE_NAMES=".env auth.json"
 
 # --- Telegram adapter, webhook mode ----------------------------------------
 # Supplied per tenant by control-api at provision time (NOT baked here):

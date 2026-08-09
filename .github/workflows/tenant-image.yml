@@ -147,6 +147,32 @@ jobs:
             echo "::notice::tenant-image/patches/markers.tsv not found — skipping patch-overlay checks."
           fi
 
+      # MUST stay ahead of every step that runs python. The first CI run failed
+      # here: this step sat further down, next to the test suites, while
+      # "Templates parse (YAML / JSON)" — which imports yaml — ran before it and
+      # died with ModuleNotFoundError. Third-party imports and the step that
+      # installs them are not independent, so keep this immediately after the
+      # interpreter is set up and before anything that could need it.
+      #
+      # cryptography: AES-256-GCM for the secrets selftest.
+      # pyyaml: the template-parse step; never assume a runner ships it.
+      # Deliberately unpinned floors rather than the image's exact pins — these
+      # exercise long-stable APIs, and pinning here would mean a dependency bump
+      # in the image silently red-lining CI.
+      #
+      # `python3 -m pip` is correct ONLY because actions/setup-python puts its
+      # interpreter first on PATH, so this installs into the same python the
+      # later steps run. Without setup-python it would hit the runner's
+      # externally-managed system python and fail under PEP 668.
+      - name: Install python dependencies
+        if: steps.present.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "cryptography>=41" "pyyaml>=6"
+          # Prove the imports resolve in THIS interpreter before any step
+          # depends on them — a clearer failure than a traceback 200 lines later.
+          python3 -c "import yaml, cryptography; print('deps ok:', yaml.__version__, cryptography.__version__)"
+
       - name: Shell syntax
         if: steps.present.outputs.exists == 'true'
         run: |
@@ -260,15 +286,6 @@ jobs:
       # credential written in plaintext to the volume, a Postgres cluster landing
       # on ephemeral storage, a marker guard that no longer fails closed. None of
       # those show up as a crash, so none of them would be caught by a build.
-      - name: Install test dependencies
-        if: steps.present.outputs.exists == 'true'
-        # cryptography: AES-256-GCM for the secrets selftest.
-        # pyyaml: the template-parse step; not guaranteed present on a runner.
-        # Deliberately unpinned floors rather than the image's exact pins — the
-        # tests exercise long-stable APIs, and pinning here would mean a
-        # dependency bump in the image silently red-lining CI.
-        run: python3 -m pip install --quiet "cryptography>=41" "pyyaml>=6"
-
       - name: Secrets crypto selftest
         if: steps.present.outputs.exists == 'true'
         # Round-trips AES-256-GCM and asserts that a wrong key and a wrong AAD

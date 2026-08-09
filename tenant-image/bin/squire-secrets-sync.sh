@@ -47,7 +47,7 @@ TMPFS_DIR="${SQUIRE_SECRETS_TMPFS:-/dev/shm/squire}"
 # It was rejected as more crypto surface for a benefit — skipping two small
 # writes per boot — that rounds to zero.)
 DIGEST_DIR="${SQUIRE_DIGEST_DIR:-$TMPFS_DIR/digests}"
-SECRETS="${SQUIRE_SECRET_FILES:-.env auth.json}"
+SECRETS="${SQUIRE_SEALED_FILE_NAMES:-.env auth.json}"
 INTERVAL="${SQUIRE_SECRETS_SYNC_INTERVAL:-15}"
 # Same overridable interpreter/bin pair as squire-entrypoint.sh, so the sync
 # loop can be exercised outside a container.
