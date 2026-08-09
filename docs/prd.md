@@ -118,7 +118,7 @@ Signup offers two doors: **subscribe immediately** (card, agent live at once) or
 - Full agent for **72 hours**. If the user hasn't connected their own LLM yet, it runs on our key — **Sonnet-class default, ~$10 hard budget, 75 msgs/day** (enough to genuinely feel the product). Raised from Haiku/$2 on 2026-08-09: onboarding and everyday usefulness are both instruction-following, and the first live tenant showed a Haiku-class model ignoring the concierge script entirely. $2 at Sonnet prices buys ~50 turns, well under the advertised allowance, so the cap was resized to the promise. Connecting their own LLM mid-trial lifts the caps and upgrades the model — the concierge sells this as "unlock your agent's full brain," which doubles as the conversion step.
 - The concierge still pushes "connect your AI" early in session one — trial users who connect are the highest-intent converts and cost us near zero.
 - At 72h: **the agent stops working** — it replies only with a subscribe link (and a data note: tenant kept 14 days, then crypto-shredded unless subscribed). Container hibernates after 48h grace to reclaim capacity.
-- Worst-case trial CAC: ~$2 tokens + ~$0.30 infra per trial signup.
+- Worst-case trial CAC: ~$10 tokens + ~$0.30 infra per trial signup (was ~$2 before the 2026-08-09 Haiku->Sonnet move; worst case only materialises for a trial that actually exhausts the cap, i.e. someone who used the product hard for three days -- but price it as $10 when modelling paid acquisition.)
 
 ### 5.4 Pricing structure — deliberate penetration pricing
 
