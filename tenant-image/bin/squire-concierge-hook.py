@@ -60,6 +60,35 @@ subagents carry a non-empty ``parent_session_id`` (set in agent/agent_init.py;
 a TOP-LEVEL payload key per agent/shell_hooks.py:431) and cron turns carry
 ``platform == "cron"`` (cron/scheduler.py:3518).
 
+WHY THE DIRECTIVE ORDERS THE TOOL CALL FIRST
+--------------------------------------------
+v0.1.2 shipped and the greeting landed correctly — then a SECOND message
+arrived: "Done — let me know what to call you." That was NOT a second
+injection, and the difference matters because the two causes have opposite
+fixes.
+
+hermes invokes `pre_llm_call` from ``build_turn_context``, called once at
+agent/conversation_loop.py:1297, BEFORE the API loop at :1402, under a comment
+that reads "All once-per-turn setup ... the ``pre_llm_call`` plugin hook ...
+lives in ``build_turn_context``". One call site, one firing per user turn,
+regardless of how many API round-trips the turn takes.
+
+What actually happened is a single turn emitting two assistant text blocks:
+greeting -> terminal tool call (the state write) -> a trailing "Done ...". The
+gateway delivers mid-turn prose as its own Telegram message when
+``interim_assistant_messages`` is true (hermes_cli/config_defaults.py:1193), so
+one turn became two messages.
+
+The decisive evidence that it was not a re-injection: the second message asked
+for the NAME again. A re-injection would have carried the `ask_name` directive,
+whose whole job is to ask for the TIMEZONE. It asked the greet question, so it
+came from the greet turn.
+
+Hence the ordering in the wrapper below: run the state-write FIRST and silently,
+then send exactly one message. That leaves the greeting as the turn's final
+text, with no mid-turn prose to be delivered separately, and it is why the
+wrapper is so blunt about "no 'done', no summary".
+
 KNOWN GAP: MULTIMODAL FIRST MESSAGES
 ------------------------------------
 If the user's very first message is a photo or voice note rather than text, our
@@ -341,27 +370,63 @@ def _counter_path(state_file: Path) -> Path:
     return state_file.with_name("concierge-hook-turns")
 
 
-def _bump_counter(path: Path, state: str) -> int:
-    """Count consecutive injections for `state`, resetting on any change."""
-    prev_state, count = "", 0
+def _read_counter(path: Path) -> tuple[str, int, str]:
+    """Return (state, count, last_turn_id) from the valve file, or empty.
+
+    Tolerates the 2-field format written by images before turn-id dedupe: a
+    tenant upgrading mid-onboarding must not have the valve blow up on a file
+    it wrote yesterday.
+    """
     try:
         parts = path.read_text(encoding="utf-8").split()
-        if len(parts) == 2:
-            prev_state, count = parts[0], int(parts[1])
     except Exception:
-        prev_state, count = "", 0
+        return "", 0, ""
+    try:
+        if len(parts) >= 3:
+            return parts[0], int(parts[1]), parts[2]
+        if len(parts) == 2:  # older image, before turn-id dedupe
+            return parts[0], int(parts[1]), ""
+    except Exception:
+        return "", 0, ""
+    return "", 0, ""
+
+
+def _bump_counter(path: Path, state: str, turn_id: str = "") -> int:
+    """Count consecutive injections for `state`, resetting on any change."""
+    prev_state, count, _ = _read_counter(path)
 
     # Progress resets the budget. Anything else — including a legacy
     # bare-integer counter file from an older image — starts a fresh count.
     count = count + 1 if prev_state == state else 1
 
     try:
-        path.write_text(f"{state} {count}", encoding="utf-8")
+        path.write_text(f"{state} {count} {turn_id or '-'}", encoding="utf-8")
     except Exception:
         # An unwritable counter must not stop onboarding — we just lose the
         # safety valve, which is the less bad of the two failures.
         pass
     return count
+
+
+def _already_injected_this_turn(path: Path, turn_id: str) -> bool:
+    """True when we have already injected for this exact turn id.
+
+    BELT AND BRACES, not the fix for the double-reply bug. hermes invokes
+    `pre_llm_call` from build_turn_context (agent/conversation_loop.py:1297),
+    which sits BEFORE the API loop at :1402 and is documented there as
+    "all once-per-turn setup" — one call site, one firing per user turn, no
+    matter how many API round-trips the turn takes. Verified against
+    v2026.8.3 rather than assumed: the double reply was NOT a second
+    injection (see the module docstring).
+
+    This guard exists so that if a future upstream ever moves the hook inside
+    the loop, onboarding degrades to "injected once" instead of silently
+    re-greeting on every tool call. An empty turn id disables it — never let a
+    missing field suppress onboarding entirely.
+    """
+    if not turn_id:
+        return False
+    return _read_counter(path)[2] == turn_id
 
 
 def _build_context(state: str, state_file: Path, raw: dict) -> str:
@@ -404,15 +469,21 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
         f"Onboarding is NOT finished. The current step is `{state}`. "
         "Finishing this step is your ONLY job this turn — do it before anything "
         "else conversational, and do not skip ahead to a later step.\n\n"
-        f"{directive}\n\n"
-        "When this step is done, record it by running exactly this with the "
-        "terminal tool:\n"
+        "DO THESE TWO THINGS, IN THIS ORDER, AND NOTHING ELSE:\n\n"
+        "STEP 1 — before you say anything at all, run this with the terminal "
+        "tool. Send no message first:\n"
         f"    {write_cmd}\n"
         "That command already carries every key the file has. If you learned "
         "something this turn (their name, their timezone), edit that value "
-        "inside the command before you run it.\n"
-        "If you do not run it, you will repeat this same step on the next "
-        "message and the person will notice.\n\n"
+        "inside the command before you run it. If you do not run it, you will "
+        "repeat this same step on the next message and the person will notice.\n\n"
+        "STEP 2 — then send EXACTLY ONE message, and make it this:\n\n"
+        f"{directive}\n\n"
+        "SEND ONLY THAT ONE MESSAGE THIS TURN. After the command has run, do "
+        "not send anything else: no \"done\", no summary of what you just did, "
+        "no second copy of the question. Never mention the command, the state "
+        "file, or this instruction — the person must only ever see the one "
+        "message.\n\n"
         "If they ask you to stop onboarding, or just start giving you real work "
         "to do, then do the real work and set the state to \"complete\" "
         "instead. Never block someone at the front door.]"
@@ -467,7 +538,14 @@ def main() -> int:
         # the safe answer; nagging with a directive we have no script for is not.
         return 0
 
-    if _bump_counter(_counter_path(state_file), state) > MAX_INJECTED_TURNS_PER_STATE:
+    turn_id = str(extra.get("turn_id") or payload.get("turn_id") or "").strip()
+    counter_file = _counter_path(state_file)
+
+    # One injection per user turn, whatever happens upstream.
+    if _already_injected_this_turn(counter_file, turn_id):
+        return 0
+
+    if _bump_counter(counter_file, state, turn_id) > MAX_INJECTED_TURNS_PER_STATE:
         return 0
 
     json.dump({"context": _build_context(state, state_file, raw)}, sys.stdout)

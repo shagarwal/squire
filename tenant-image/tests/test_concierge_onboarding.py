@@ -323,6 +323,100 @@ for label, blob in [
 
 
 print()
+print("== 3b-bis. one injection per user turn, and one message per injection ==")
+
+def flat(text: str) -> str:
+    """Collapse whitespace before substring matching.
+
+    Both the YAML and the hook wrap their copy at ~80 columns, so a phrase like
+    "their own AI account" is routinely split across a newline. Matching raw
+    text here would produce assertions that pass or fail on line-wrapping,
+    which is exactly the kind of test that gets deleted in six months.
+    """
+    return " ".join(text.split()).lower()
+
+
+# The injected context for every drivable state, reused by the sections below.
+all_ctx = {st: context_for(st) for st in hook._NEXT_STATE}
+
+# v0.1.2 landed the greeting and then sent a SECOND message, "Done — let me
+# know what to call you.". Diagnosed before fixing: that was NOT a second
+# injection. hermes calls pre_llm_call from build_turn_context
+# (conversation_loop.py:1297), which sits BEFORE the API loop at :1402 under a
+# comment reading "All once-per-turn setup ... the pre_llm_call plugin hook".
+# One firing per user turn however many API round-trips it takes.
+#
+# The real cause was ONE turn emitting two assistant text blocks —
+# greeting -> terminal tool call -> trailing "Done ..." — with the gateway
+# delivering mid-turn prose as its own Telegram message
+# (interim_assistant_messages, config_defaults.py:1193). The decisive tell: the
+# second message re-asked for the NAME, whereas an ask_name re-injection would
+# have asked for the TIMEZONE.
+#
+# So the fix is ordering + an explicit one-message rule, asserted here.
+for st, ctx in all_ctx.items():
+    body = flat(ctx)
+    check(
+        f"`{st}` orders the state write BEFORE any message",
+        "step 1" in body and "before you say anything" in body,
+    )
+    check(
+        f"`{st}` demands exactly one message",
+        "send only that one message this turn" in body,
+    )
+    check(
+        f"`{st}` forbids a trailing acknowledgement",
+        'no "done"' in body and "no summary of what you just did" in body,
+    )
+    # The write command must come before the directive text in the injected
+    # string, or "first" is only a claim.
+    check(
+        f"`{st}` puts the command ahead of the reply copy in the text",
+        ctx.index("STEP 1") < ctx.index("STEP 2"),
+    )
+
+# Belt and braces: dedupe on turn id, so that if a future upstream ever moves
+# the hook inside the API loop we degrade to one injection instead of
+# re-greeting on every tool call.
+TURN = json.dumps({"state": "greet"})
+with tempfile.TemporaryDirectory() as td:
+    home = pathlib.Path(td)
+    sd = home / ".squire"; sd.mkdir()
+    (sd / "concierge-state.json").write_text(TURN, encoding="utf-8")
+
+    def call(turn_id: str, state_json: str | None = None) -> str:
+        if state_json is not None:
+            (sd / "concierge-state.json").write_text(state_json, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=payload(extra={"turn_id": turn_id}),
+            env={"PATH": os.environ.get("PATH", ""), "SQUIRE_STATE_DIR": str(sd)},
+            capture_output=True, text=True, timeout=30,
+        )
+        return proc.stdout
+
+    first = call("turn-1")
+    second = call("turn-1")          # same turn, e.g. a continuation call
+    check("first call in a turn injects", first.strip() != "")
+    check("a second call in the SAME turn injects nothing", second.strip() == "", second[:80])
+
+    third = call("turn-2")           # next user turn, state unchanged
+    check("the NEXT user turn injects again", third.strip() != "")
+
+    # A state change between turns must still advance the copy.
+    fourth = call("turn-3", json.dumps({"state": "ask_name"}))
+    check("a state change between turns still advances", fourth.strip() != "")
+    check(
+        "the advanced turn carries the new state's directive",
+        "`ask_name`" in json.loads(fourth)["context"],
+    )
+
+    # A missing turn id must never suppress onboarding.
+    fifth = call("")
+    check("an empty turn id does not suppress injection", fifth.strip() != "")
+
+
+print()
 print("== 3c. injected paths are ones the agent can actually open ==")
 
 # ${HERMES_SKILL_DIR} is substituted ONLY while hermes loads skill *content*
@@ -331,7 +425,6 @@ print("== 3c. injected paths are ones the agent can actually open ==")
 # "${HERMES_SKILL_DIR}/state-machine.yaml" becomes "/state-machine.yaml".
 # Worst in trial_explainer, where that pointer IS the guard rail against
 # inventing prices and limits.
-all_ctx = {st: context_for(st) for st in hook._NEXT_STATE}
 for st, ctx in all_ctx.items():
     check(
         f"`{st}` directive contains no unexpanded template variable",
@@ -421,7 +514,11 @@ with tempfile.TemporaryDirectory() as td:
     before = cfg.read_text(encoding="utf-8")
 
     tz_ctx = context_for("ask_timezone", env_home=str(home))
-    tz_cmds = emitted_commands(tz_ctx)
+    # Select by content, not position: the state-write command is now emitted
+    # FIRST (STEP 1), so indexing would silently run the wrong one — which is
+    # exactly what this test caught when the ordering changed.
+    tz_cmds = [c for c in emitted_commands(tz_ctx) if "timezone:" in c]
+    check("exactly one timezone command is emitted", len(tz_cmds) == 1, str(len(tz_cmds)))
     proc = subprocess.run(
         ["bash", "-c", tz_cmds[0]] if tz_cmds else ["false"],
         capture_output=True, text=True, timeout=30,
@@ -577,17 +674,6 @@ print()
 print("== 5. the greeting has actual substance ==")
 
 greet = states["greet"]
-
-
-def flat(text: str) -> str:
-    """Collapse whitespace before substring matching.
-
-    Both the YAML and the hook wrap their copy at ~80 columns, so a phrase like
-    "their own AI account" is routinely split across a newline. Matching raw
-    text here would produce assertions that pass or fail on line-wrapping,
-    which is exactly the kind of test that gets deleted in six months.
-    """
-    return " ".join(text.split()).lower()
 
 
 greet_blob = flat(json.dumps(greet))
@@ -941,6 +1027,48 @@ check(
     "except Exception:" in patch_text and "_squire_concierge_active = False" in patch_text,
 )
 
+# --- the /sethome prompt: set the home channel instead of asking ------------
+# Upstream prompts "No home channel is set for Telegram ... type /sethome" on
+# the first message of a fresh session, so it arrived AHEAD of the greeting and
+# pointed at a surface Squire does not sell. A Squire tenant is a single-user
+# DM: the chat the message arrived in IS the home channel, and there is nothing
+# to choose. Setting it also makes cron briefings work with no user action.
+check(
+    "patch 005 adopts the DM as the home channel",
+    "persist_home_channel" in patch_text and "HomeChannel" in patch_text,
+)
+check(
+    "it uses upstream's own persistence API rather than hand-writing config",
+    "_sq_persist_home(_sq_home)" in patch_text,
+)
+check(
+    "adoption is gated on this being a Squire tenant",
+    patch_text.count("concierge-state.json") >= 2,
+)
+check(
+    "the adopted channel is the chat the message arrived in",
+    "chat_id=str(source.chat_id)" in patch_text,
+)
+# On-disk only would leave the running gateway still believing no home is set,
+# so the prompt could reappear later in the same process.
+check(
+    "the live in-memory config is updated too, not just the file",
+    "_sq_pc.home_channel = _sq_home" in patch_text,
+)
+check(
+    "setting home suppresses the prompt by satisfying upstream's own check",
+    'home_env = "set"' in patch_text,
+)
+check(
+    "adoption failure falls back to upstream rather than breaking the turn",
+    "squire home-channel adoption failed" in patch_text,
+)
+# The prompt must be pre-empted, never reworded — upstream's own branch stays.
+check(
+    "upstream's /sethome branch is left intact for non-Squire deployments",
+    "sethome_cmd" not in patch_text or "-" not in patch_text.split("sethome_cmd")[0][-2:],
+)
+
 markers = (IMAGE_ROOT / "patches" / "markers.tsv").read_text(encoding="utf-8")
 check("patch 005 has an upstream anchor marker", "patch-005-anchor" in markers)
 check("patch 005 has a squire marker", "squire-005-concierge-suppress" in markers)
@@ -952,8 +1080,18 @@ check(
     "the profile_build config knob is build-checked against upstream",
     "upstream-onboarding-profile-build" in markers,
 )
+# If upstream reworks the /sethome block, our insertion point vanishes and the
+# prompt silently comes back — invisible without an anchor row.
+check(
+    "the /sethome prompt has an upstream anchor marker",
+    "upstream-sethome-prompt" in markers,
+)
+check(
+    "home-channel adoption has a squire marker",
+    "squire-005-home-channel" in markers,
+)
 for row in markers.splitlines():
-    if row.startswith(("patch-005", "squire-005", "upstream-onboarding")):
+    if row.startswith(("patch-005", "squire-005", "upstream-onboarding", "upstream-sethome")):
         check(f"marker row `{row.split(chr(9))[0]}` has 4 columns", len(row.split("\t")) == 4, row)
 
 
