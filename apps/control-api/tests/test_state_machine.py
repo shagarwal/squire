@@ -666,6 +666,88 @@ def test_stop_and_delete_tenant(pool_bot, fake_railway):
 
 
 @respx.mock
+def test_deprovision_deletes_the_volume_before_the_service(pool_bot, fake_railway):
+    """REGRESSION / VERIFIED LIVE: `serviceDelete` does NOT cascade to volumes. Delete
+    the service first and the volume survives as a permanently billed orphan still
+    holding the tenant's encrypted data -- so the crypto-shred silently isn't one.
+    The ordering here is the fix and must not be reshuffled."""
+    mock_all(fake_railway)
+    respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    with db.session_scope() as s:
+        provisioning.delete_tenant(s, tenant_id)
+
+    ops = fake_railway.operations()
+    assert "volumeDelete" in ops, "the volume must be deleted -- nothing else removes it"
+    assert "serviceDelete" in ops
+    assert ops.index("volumeDelete") < ops.index("serviceDelete"), (
+        "volume must be deleted BEFORE the service; the reverse ordering was proven "
+        "live to leave an orphaned, still-billed volume"
+    )
+    assert fake_railway.deleted_volume_ids == ["vol-1"]
+
+
+@respx.mock
+def test_deprovision_resolves_a_legacy_volume_sentinel(pool_bot, fake_railway):
+    """Rows provisioned before the probe became mandatory stored the string
+    'existing' instead of a volume id. That is not deletable, so deprovisioning must
+    look the real id up rather than skip straight to serviceDelete."""
+    mock_all(fake_railway)
+    respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+    with db.session_scope() as s:
+        tenant = provisioning.get_tenant(s, tenant_id)
+        tenant.railway_volume_id = provisioning._LEGACY_VOLUME_SENTINEL
+        s.add(tenant)
+        s.commit()
+
+    with db.session_scope() as s:
+        provisioning.delete_tenant(s, tenant_id)
+
+    assert fake_railway.deleted_volume_ids == ["vol-existing"]
+    ops = fake_railway.operations()
+    assert ops.index("volumeDelete") < ops.index("serviceDelete")
+
+
+@respx.mock
+def test_attach_volume_step_never_records_an_unresolvable_volume(pool_bot, fake_railway):
+    """A volume id we cannot name is a volume we cannot delete. If Railway ever
+    returns no id, fail the step and retry rather than record a sentinel."""
+    mock_all(fake_railway)
+
+    def no_id(request):
+        import json as _json
+
+        if "volumeCreate" in _json.loads(request.read())["query"]:
+            return httpx.Response(200, json={"data": {"volumeCreate": {}}})
+        return fake_railway.handler(request)
+
+    respx.post(GQL_URL).mock(side_effect=no_id)
+
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.PENDING
+        assert job.step == ProvisionStep.ATTACH_VOLUME
+        assert provisioning.get_tenant(s, tenant_id).railway_volume_id is None
+
+
+@respx.mock
 def test_run_pending_jobs_picks_up_due_work(pool_bot, fake_railway):
     """The background worker path used when the API restarts mid-provision."""
     mock_all(fake_railway)

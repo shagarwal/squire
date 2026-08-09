@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # Gate G1). On by default; flip off if wake latency proves unacceptable.
     railway_tenant_sleep: bool = True
     railway_timeout_seconds: float = 30.0
+    # Railway's volume list lags a few seconds behind a volumeCreate, and
+    # volumeCreate is NOT idempotent (a second call silently makes a duplicate,
+    # billed forever). `attach_volume` therefore re-probes after this delay before
+    # concluding a service has no volume. Set to 0 to disable the second probe.
+    railway_volume_probe_delay_seconds: float = 3.0
 
     # -- Tenant runtime -----------------------------------------------------
     # An EXPLICIT TAG, never `:latest`. `/fleet` reports what each tenant says it

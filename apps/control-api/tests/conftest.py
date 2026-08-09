@@ -34,6 +34,9 @@ def _env(tmp_path, monkeypatch) -> Iterator[None]:
         "RAILWAY_GRAPHQL_URL": "https://backboard.railway.com/graphql/v2",
         "RAILWAY_PROJECT_ID": "proj-123",
         "RAILWAY_ENVIRONMENT_ID": "env-123",
+        # No real Railway means no post-create list lag, so the second volume probe
+        # is pure sleep. Tests that care about the retry set their own delay.
+        "RAILWAY_VOLUME_PROBE_DELAY_SECONDS": "0",
         "TENANT_IMAGE": "ghcr.io/shagarwal/squire/hermes-tenant:v0",
         "INGRESS_PUBLIC_URL": "https://ingress.squire.test",
         "CONTROL_API_URL": "https://control-api.squire.test",

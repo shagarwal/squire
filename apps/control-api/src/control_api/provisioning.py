@@ -72,6 +72,12 @@ MAX_BACKOFF_SECONDS = 300.0
 #: than a legitimate step means two workers running the same Railway mutation.
 STALE_CLAIM_SECONDS = 300.0
 
+#: Value `railway_volume_id` used to hold when a volume was known to exist but its
+#: id could not be determined. Now unreachable -- `attach_volume` always returns a
+#: real id -- but rows provisioned earlier may still carry it, and a volume we
+#: cannot name is a volume we cannot delete (see `delete_tenant`).
+_LEGACY_VOLUME_SENTINEL = "existing"
+
 #: Tenant statuses a redeploy is allowed to touch (Task 0.6 upgrade drill).
 #:
 #: PROVISIONING is excluded because the state machine owns that tenant right now;
@@ -393,21 +399,24 @@ def _step_create_service(session: Session, tenant: Tenant, clients: ProvisionCli
 
 
 def _step_attach_volume(session: Session, tenant: Tenant, clients: ProvisionClients) -> None:
-    if tenant.railway_volume_id:
+    # A row carrying the legacy sentinel is deliberately NOT treated as done: it has
+    # no usable volume id, and deprovisioning needs one to avoid a billed orphan.
+    # Re-running resolves the real id via the probe inside `attach_volume`.
+    if tenant.railway_volume_id and tenant.railway_volume_id != _LEGACY_VOLUME_SENTINEL:
         return
     settings = get_settings()
 
-    # Pre-flight probe first: a volume created by a previous attempt that died
-    # before committing is detected positively here, rather than relying on us
-    # recognising Railway's duplicate-volume error wording.
-    volume_id = clients.railway.find_volume_for_service(tenant.railway_service_id)
-    if volume_id is None:
-        volume_id = clients.railway.attach_volume(
-            tenant.railway_service_id, settings.tenant_volume_mount_path
+    # `attach_volume` probes before creating -- mandatory, because volumeCreate is
+    # not idempotent and a duplicate volume is billed forever.
+    volume_id = clients.railway.attach_volume(
+        tenant.railway_service_id, settings.tenant_volume_mount_path
+    )
+    if not volume_id:
+        # Better to retry than to record an id we cannot later delete.
+        raise ProvisioningError(
+            f"volume for service {tenant.railway_service_id} could not be resolved"
         )
-    # `None` still means "Railway said it already exists" (probe inconclusive but
-    # the create was rejected as a duplicate); record a sentinel so we stop retrying.
-    tenant.railway_volume_id = volume_id or "existing"
+    tenant.railway_volume_id = volume_id
     _touch(session, tenant)
 
 
@@ -870,8 +879,14 @@ def stop_tenant(
 def delete_tenant(
     session: Session, tenant_id: str, clients: ProvisionClients | None = None
 ) -> Tenant:
-    """Crypto-shred: destroy the Railway service (and with it the volume + the only
-    copy of the DEK), revoke the trial key, and recycle the pool bot.
+    """Crypto-shred: destroy the tenant's Railway volume and service (and with them
+    the only copy of the DEK), revoke the trial key, and recycle the pool bot.
+
+    **Volume before service, and the order is load-bearing.** `serviceDelete` does
+    not cascade to volumes -- verified live: delete the service first and the volume
+    survives as a permanently billed orphan holding the tenant's encrypted data,
+    which would make this "crypto-shred" neither a shred nor free. Deleting the
+    volume while its service is still live removes it cleanly.
 
     The tenant *row* is retained with status=deleted as an audit record -- it holds
     no content and no credentials, only registry metadata.
@@ -891,6 +906,24 @@ def delete_tenant(
             except Exception:  # noqa: BLE001 -- never block deletion on Telegram
                 log.warning("deleteWebhook failed for bot %s", bot.id, exc_info=True)
             release_bot(session, bot)
+
+    # Volume FIRST -- see the docstring. Resolve the id live rather than trusting
+    # the stored one: rows provisioned before the probe became mandatory may carry
+    # the legacy "existing" sentinel instead of a real volume id, and an unresolved
+    # volume is exactly the orphan we are trying to avoid.
+    volume_id = tenant.railway_volume_id
+    if volume_id in (None, _LEGACY_VOLUME_SENTINEL) and tenant.railway_service_id:
+        volume_id = clients.railway.find_volume_for_service(tenant.railway_service_id)
+    if volume_id and volume_id != _LEGACY_VOLUME_SENTINEL:
+        clients.railway.delete_volume(volume_id)
+    elif tenant.railway_service_id:
+        # Nothing we can delete by id. Say so loudly: silently proceeding to
+        # serviceDelete is what creates an unbilled-to-anyone orphan.
+        log.warning(
+            "tenant %s: could not resolve a volume id; deleting the service may "
+            "leave an orphaned volume -- check the Railway project",
+            tenant.id,
+        )
 
     if tenant.railway_service_id:
         clients.railway.delete_service(tenant.railway_service_id)

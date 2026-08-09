@@ -14,6 +14,7 @@ import pytest
 import respx
 
 from control_api.clients.railway import RailwayClient, RailwayError
+from railway_fake import FakeRailway
 
 GQL = "https://backboard.railway.com/graphql/v2"
 
@@ -115,16 +116,63 @@ def test_attach_volume(railway):
 
 
 @respx.mock
-def test_attach_volume_is_idempotent_when_railway_says_it_exists(railway):
-    """A retry after a partial failure must not explode -- Railway rejects a second
-    volume on the same mount path, and we treat that as success."""
+def test_attach_volume_probes_before_creating(railway):
+    """VERIFIED LIVE: volumeCreate is NOT idempotent -- a second call for the same
+    service+mountPath silently creates a duplicate volume that is billed forever.
+    The probe is therefore the only thing standing between a retry and a double
+    bill, and it must run before every create."""
+    fake = FakeRailway(existing_volume_service_ids={"svc-1"})
+    respx.post(GQL).mock(side_effect=fake.handler)
+
+    assert railway.attach_volume("svc-1", "/opt/data") == "vol-existing"
+    assert "volumeCreate" not in fake.operations(), "must not create a second volume"
+
+
+@respx.mock
+def test_attach_volume_retries_the_probe_before_creating(railway, monkeypatch):
+    """The volume list lags behind volumeCreate: immediately after a create the
+    probe still reports nothing. One None is therefore not proof of absence."""
+    monkeypatch.setenv("RAILWAY_VOLUME_PROBE_DELAY_SECONDS", "0.01")
+    from control_api.config import get_settings
+
+    get_settings.cache_clear()
+    from control_api.clients.railway import RailwayClient
+
+    fake = FakeRailway(existing_volume_service_ids={"svc-1"}, volume_probe_lag=1)
+    respx.post(GQL).mock(side_effect=fake.handler)
+
+    assert RailwayClient().attach_volume("svc-1", "/opt/data") == "vol-existing"
+    assert fake.operations().count("project") == 2, "the probe must be retried"
+    assert "volumeCreate" not in fake.operations()
+
+
+@respx.mock
+def test_attach_volume_creates_when_there_is_genuinely_no_volume(railway):
+    fake = FakeRailway()
+    respx.post(GQL).mock(side_effect=fake.handler)
+    assert railway.attach_volume("svc-1", "/opt/data") == "vol-1"
+    assert "volumeCreate" in fake.operations()
+
+
+@respx.mock
+def test_delete_volume(railway):
+    route = respx.post(GQL).mock(return_value=gql_response({"volumeDelete": True}))
+    assert railway.delete_volume("vol-1") is True
+
+    import json
+
+    sent = json.loads(route.calls.last.request.read())
+    assert "volumeDelete" in sent["query"]
+    assert sent["variables"] == {"volumeId": "vol-1"}
+
+
+@respx.mock
+def test_delete_volume_tolerates_a_missing_volume(railway):
+    """Crypto-shred must be safe to re-run."""
     respx.post(GQL).mock(
-        return_value=httpx.Response(
-            200,
-            json={"errors": [{"message": "A volume already exists for this service"}]},
-        )
+        return_value=httpx.Response(200, json={"errors": [{"message": "Volume not found"}]})
     )
-    assert railway.attach_volume("svc-1", "/opt/data") is None
+    assert railway.delete_volume("vol-1") is False
 
 
 @respx.mock
@@ -196,6 +244,33 @@ def test_stop_service_no_deployment_is_noop(railway):
 
 
 @respx.mock
+def test_stop_service_treats_an_already_stopped_deployment_as_success(railway):
+    """VERIFIED LIVE: an already-stopped tenant still HAS a latest deployment, and
+    Railway rejects stopping it with 'Deployment is not stoppable'. That wording
+    matches none of the not-found hints, so it used to become a hard RailwayError --
+    which would fail trial expiry for every already-stopped tenant."""
+    responses = [
+        gql_response({"deployments": {"edges": [{"node": {"id": "dep-9"}}]}}),
+        httpx.Response(
+            200, json={"errors": [{"message": "Deployment is not stoppable"}]}
+        ),
+    ]
+    respx.post(GQL).mock(side_effect=responses)
+    assert railway.stop_service("svc-1") is False
+
+
+@respx.mock
+def test_stop_service_still_raises_on_a_real_error(railway):
+    responses = [
+        gql_response({"deployments": {"edges": [{"node": {"id": "dep-9"}}]}}),
+        httpx.Response(200, json={"errors": [{"message": "Not Authorized"}]}),
+    ]
+    respx.post(GQL).mock(side_effect=responses)
+    with pytest.raises(RailwayError, match="Not Authorized"):
+        railway.stop_service("svc-1")
+
+
+@respx.mock
 def test_delete_service(railway):
     route = respx.post(GQL).mock(return_value=gql_response({"serviceDelete": True}))
     assert railway.delete_service("svc-1") is True
@@ -208,8 +283,17 @@ def test_delete_service(railway):
 
 
 @respx.mock
+def test_delete_service_is_idempotent_because_railway_says_success(railway):
+    """VERIFIED LIVE: deleting an already-deleted service returns success, not an
+    error -- so re-running a crypto-shred is safe with no special handling."""
+    respx.post(GQL).mock(return_value=gql_response({"serviceDelete": True}))
+    assert railway.delete_service("svc-already-gone") is True
+
+
+@respx.mock
 def test_delete_service_tolerates_missing_service(railway):
-    """Deleting an already-deleted service must be idempotent (crypto-shred reruns)."""
+    """Defensive only: live Railway reports success for an already-deleted service
+    (see above), so this branch is unreachable today. Kept in case that changes."""
     respx.post(GQL).mock(
         return_value=httpx.Response(200, json={"errors": [{"message": "Service not found"}]})
     )

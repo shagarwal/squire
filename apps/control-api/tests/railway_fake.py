@@ -26,6 +26,14 @@ class FakeRailway:
     latest_deployment_id: str | None = "dep-1"
     #: Service ids that already have a volume attached (pre-flight probe answers).
     existing_volume_service_ids: set[str] = field(default_factory=set)
+    #: Volume ids passed to volumeDelete, in order.
+    deleted_volume_ids: list[str] = field(default_factory=list)
+    #: Service ids passed to serviceDelete, in order.
+    deleted_service_ids: list[str] = field(default_factory=list)
+    #: How many probes to answer with None before reporting the volume. Models the
+    #: real API's post-create list lag.
+    volume_probe_lag: int = 0
+    _volume_probes: int = 0
     #: Variable NAMES the read-back probe reports. None = "every name we were sent",
     #: which is the healthy case; set it explicitly to simulate a lost variable.
     variable_names: set[str] | None = None
@@ -44,6 +52,11 @@ class FakeRailway:
         if op == "project":
             # One operation name, two queries -- disambiguate on the selection set.
             if "volumes" in query:  # find_volume_for_service
+                self._volume_probes += 1
+                # The real API's volume list lags behind volumeCreate; `volume_probe_lag`
+                # makes the first N probes report nothing even though a volume exists.
+                if self._volume_probes <= self.volume_probe_lag:
+                    return self._ok({"project": {"volumes": {"edges": []}}})
                 edges = [
                     {
                         "node": {
@@ -78,7 +91,14 @@ class FakeRailway:
             return self._ok({"serviceCreate": {"id": sid, "name": name}})
 
         if op == "volumeCreate":
+            # Mirrors the live behaviour that makes the probe mandatory: Railway
+            # does NOT reject a duplicate, it just makes another volume.
+            self.existing_volume_service_ids.add(variables["input"]["serviceId"])
             return self._ok({"volumeCreate": {"id": "vol-1"}})
+
+        if op == "volumeDelete":
+            self.deleted_volume_ids.append(variables["volumeId"])
+            return self._ok({"volumeDelete": True})
 
         if op == "variableCollectionUpsert":
             self._upserted_names.update(variables["input"]["variables"].keys())
@@ -102,6 +122,10 @@ class FakeRailway:
             return self._ok({"deploymentStop": True})
 
         if op == "serviceDelete":
+            self.deleted_service_ids.append(variables["id"])
+            # Live behaviour: serviceDelete does NOT remove the volume. The fake
+            # keeps `existing_volume_service_ids` untouched on purpose, so a test
+            # that deletes in the wrong order can still observe the orphan.
             return self._ok({"serviceDelete": True})
 
         raise AssertionError(f"unexpected Railway operation: {op}\n{query}")
