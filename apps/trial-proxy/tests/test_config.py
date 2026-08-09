@@ -121,9 +121,14 @@ def test_the_tenant_images_default_model_is_reachable_through_this_proxy():
     requested = tenant_config.get("model")
     assert requested, "the tenant template must pin a model"
 
-    # hermes' config is `provider:model`; the bare model id is what lands in the
-    # request body's `model` field, and that is what LiteLLM matches on.
-    provider, _, model_id = requested.partition(":")
+    # CORRECTED 2026-08-09 against live behaviour. This test used to split on
+    # ":" and assert only the bare model id was listed, on the assumption that
+    # hermes strips the provider prefix. It does not -- the first real tenant
+    # conversation 400'd on `model=anthropic:claude-haiku-4-5` while this test
+    # was green. hermes sends the configured string VERBATIM, so the verbatim
+    # string is what must be listed; asserting anything else re-opens the exact
+    # gap this test exists to close.
+    provider, _, _model_id = requested.partition(":")
     assert provider == "anthropic", (
         f"the tenant template requests provider {provider!r}; the trial proxy only "
         "fronts Anthropic models"
@@ -133,11 +138,13 @@ def test_the_tenant_images_default_model_is_reachable_through_this_proxy():
         proxy_config = yaml.safe_load(f)
     names = {m["model_name"] for m in proxy_config["model_list"]}
 
-    assert model_id in names, (
-        f"tenant-image/home-template/config.yaml requests {requested!r}, so trial "
-        f"tenants send model={model_id!r} -- but this proxy only exposes {sorted(names)}. "
-        "LiteLLM would 400 every trial message. Add a model_name entry here (Haiku-"
-        "pinned, per the no-wildcard-routing rule) or change the tenant template."
+    assert requested in names, (
+        f"tenant-image/home-template/config.yaml requests {requested!r}, and hermes "
+        f"sends that string verbatim as the request's `model` field -- but this proxy "
+        f"only exposes {sorted(names)}. LiteLLM 400s every trial message in that case "
+        "(observed live 2026-08-09). Add a model_name entry here matching the string "
+        "EXACTLY (Haiku-pinned, per the no-wildcard-routing rule), or change the "
+        "tenant template."
     )
 
 

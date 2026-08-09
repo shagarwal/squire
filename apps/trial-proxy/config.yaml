@@ -47,10 +47,18 @@ model_list:
   #
   # THE CONTRACT, both sides now checked against each other:
   #   tenant-image/home-template/config.yaml -> model: "anthropic:claude-haiku-4-5"
-  #   this file                              -> model_name: claude-haiku-4-5
-  # The provider prefix is stripped before the request, so the bare id the proxy
-  # receives is `claude-haiku-4-5` and the alias below matches it exactly. No
-  # dated snapshot id is involved on either side.
+  #   this file                              -> model_name: "anthropic:claude-haiku-4-5"
+  #
+  # CORRECTED 2026-08-09 by the first live tenant conversation. The previous
+  # comment here asserted that hermes strips the `anthropic:` provider prefix
+  # and sends the bare `claude-haiku-4-5`. It does not: the gateway sends the
+  # configured string VERBATIM, and every message 400'd with
+  #   "Invalid model name passed in model=anthropic:claude-haiku-4-5"
+  # while the contract test passed, because the test encoded the same wrong
+  # assumption (it split on ":" and only checked the bare half). The colon-form
+  # alias below is what production actually requests; the bare alias is kept
+  # because it costs nothing and makes the proxy tolerant of a future hermes
+  # version that does strip the prefix.
   #
   # tests/test_config.py::test_the_tenant_images_default_model_is_reachable reads
   # the tenant template directly and fails if either side drifts — do not "fix" a
@@ -65,6 +73,15 @@ model_list:
   # $2 cap in a couple of calls. Every model this trial key can reach must be
   # an explicit, Haiku-pinned entry below — an unrecognized model name should
   # fail closed (400), not fail open onto an expensive model.
+  # The alias production actually hits: hermes sends its configured
+  # `provider:model` string verbatim as the request's `model` field.
+  - model_name: "anthropic:claude-haiku-4-5"
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Bare-id alias, kept as forward-compatibility if hermes ever starts
+  # stripping the provider prefix. Same Haiku pin, so it cannot fail open.
   - model_name: claude-haiku-4-5
     litellm_params:
       model: anthropic/claude-haiku-4-5
