@@ -60,6 +60,24 @@ Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive
 
 Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
 
+> ### ▶ NEXT-SESSION START HERE (updated 2026-08-08 late night)
+>
+> **Phase 0 code is complete, reviewed, merged to `main`, and LIVE on Railway staging.** All six tasks' code shipped through implementer + spec + quality reviews. One tenant was provisioned end-to-end tonight and reached a running/heartbeating state; the first live conversation exposed the fixes queued below. `main` HEAD at handoff: see `git log` (last clean commit `8da0f4a`; autopair work lands on top).
+>
+> **Live staging** (details in memory `staging-deployment.md`): project `squire-staging` (`ddbcfda7-…`), env `production` (`0923ea14-…`). Services: `control-api` (`https://control-api-production-588b.up.railway.app`, /healthz ok), `ingress` (`https://ingress-production-6c96.up.railway.app`), `trial-proxy` (internal), `control-db`, `litellm-db`. Bot pool: 5 bots loaded (`squire_alpha_01..05_bot`). First tenant: `38c2ebc966c30509` (shaurya123@gmail.com) on `@squire_alpha_01_bot`.
+>
+> **Deploy quirk:** `railway up` from inside the repo dir fails (`exclude-patterns` non-printable-ASCII builder error, never fully root-caused). Deploy by copying the service dir to a clean dir OUTSIDE the repo (`tar --exclude=.venv…`) then `railway up . --path-as-root -s <svc> -p <proj> -e production`; CI `deploy.yml` (fresh checkout) is unaffected. Local CLI is 5.34.2 at `~/.local/bin/railway`.
+>
+> **IMMEDIATE NEXT STEP — finish the autopair security fix** (branch `fix/first-contact-autopair`, worktree `/tmp/squire-autopair`): first-contact must auto-pair the owner + fire the concierge greeting on `/start` (Telegram forbids true bot-initiated first contact; the Start button is the mechanism). Security re-review found the binding gate still accepts the FLEET-WIDE `INTERNAL_API_TOKEN` (every trial tenant's agent can read it → permanent unrecoverable tenant takeover); the fix is: bind ONLY on the per-bot `X-Telegram-Bot-Api-Secret-Token` (dedicated `_authorised_for_binding`, hmac compare), with ingress stamping that secret on forwards + through the retry buffer. Must pass security re-review (mutant that binds with the fleet token must die). THEN: merge → tag `tenant-image-v0.1.1` → deploy updated `ingress` → redeploy the tenant on the new image → tap Start → expect instant greeting.
+>
+> **Then, to actually finish Phase 0's exit criteria:**
+> - **G1 tuning + measurement (the big one):** first tenant idle RSS measured at **~1.3GB vs the 512MB target** (2.6×). Levers both un-pulled: set `HINDSIGHT_API_EMBEDDINGS_PROVIDER` to a cloud embedder (biggest chunk — local sentence-transformers), and confirm Railway serverless sleep actually engages (interacts with the 300s heartbeat — a tenant that beats every 5 min may never sleep; see risk §2 / `staging-deployment.md`). Then measure real $/mo + wake latency across the fleet → the G1 pass/fail gate.
+> - Onboard the remaining alpha tenants (provision more via `infra/provision.py`), run the upgrade drill for real (`infra/upgrade_drill.py` against the live fleet), verify nightly restic→B2 once a B2 bucket exists.
+>
+> **Shaurya one-offs still outstanding:** Stripe acct, AWS/KMS acct (G2), Backblaze B2 bucket, more Telegram accounts if scaling past ~15 bots. (Railway Pro ✅, tenant image public on GHCR ✅, tokens ✅, bots ✅ all done.)
+>
+> **Deferred follow-ups (tracked, non-blocking):** hindsight `claude-code` provider for Claude Max tenants + auth.json markers revisit at 1C; Gate G2 secrets hardening (fleet-wide INTERNAL_API_TOKEN blast radius is the motivating example — the autopair takeover was one symptom); the em-dash/`.dockerignore` and matrix-`if` CI gotchas are fixed but worth remembering.
+
 ### Task 0.1 — Repos & CI skeleton
 - [x] GitHub repo `squire` created and linked to this folder (2026-08-07); grow into monorepo layout: `apps/web`, `apps/control-api`, `apps/ingress`, `tenant-image/`, `infra/`, `docs/`.
 - [x] Create Railway projects `squire-staging`, `squire-prod` — created 2026-08-08 via `railway init` (no services yet; RAILWAY_TOKEN_* GitHub secrets still to set).
