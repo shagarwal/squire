@@ -250,3 +250,21 @@ def test_no_global_budget_reset_cadence_configured(config):
         "(or deliberately omitting it) belongs at key-creation time in "
         "control-api's POST /key/generate call, not here"
     )
+
+
+def test_entrypoint_binds_dual_stack_for_railway_private_networking():
+    """Railway private DNS answers with IPv6; a 0.0.0.0 bind is IPv4-only.
+
+    Observed live 2026-08-09: control-api -> trial-proxy.railway.internal
+    connected over IPv6 got ECONNREFUSED while IPv4 succeeded, because litellm
+    defaults to --host 0.0.0.0. httpx/anyio clients mask this by retrying the
+    next address, so it only shows up as a wasted connection per request (and a
+    hard failure for any client without fallback). Pin the dual-stack bind.
+    """
+    dockerfile = (CONFIG_PATH.parent / "Dockerfile").read_text()
+    entrypoint = [ln for ln in dockerfile.splitlines() if ln.startswith("ENTRYPOINT")]
+    assert entrypoint, "trial-proxy Dockerfile must define an ENTRYPOINT"
+    assert '"--host", "::"' in entrypoint[-1], (
+        "litellm must bind :: (dual-stack) so Railway private-network clients "
+        f"reaching it over IPv6 are served; got: {entrypoint[-1]}"
+    )

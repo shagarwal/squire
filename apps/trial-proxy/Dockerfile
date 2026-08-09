@@ -122,4 +122,11 @@ EXPOSE 4000
 # requests instead of being SIGKILLed. (See point 1 in the version-pin
 # comment above for how this matches the base image's own entrypoint
 # behavior.)
-ENTRYPOINT ["litellm", "--config", "/app/config.yaml"]
+# --host "::" (NOT the 0.0.0.0 default): Railway's private DNS returns an
+# IPv6 address for <service>.railway.internal, and a process bound to
+# 0.0.0.0 is IPv4-only, so every private-network client gets ECONNREFUSED
+# on IPv6 first. httpx/anyio callers silently recover by retrying IPv4
+# (which is why this was invisible until a raw-socket probe on 2026-08-09),
+# but it costs a failed connection per request and breaks clients without
+# fallback. "::" accepts both families via dual-stack.
+ENTRYPOINT ["litellm", "--config", "/app/config.yaml", "--host", "::"]
