@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
+from sqlalchemy import BigInteger
 from sqlmodel import Field, SQLModel
 
 
@@ -83,7 +84,24 @@ class Bot(SQLModel, table=True):
 
     # Primary key IS the Telegram numeric bot id (the prefix of the token). That
     # makes the ingress hot-path lookup a primary-key hit.
-    id: int = Field(primary_key=True)
+    #
+    # BigInteger, NOT plain int: Telegram now issues 10-digit bot ids (>2^31), and
+    # SQLModel's `int` maps to a 32-bit INTEGER on Postgres. Registering a real
+    # BotFather token failed live with psycopg NumericValueOutOfRange. SQLite has no
+    # fixed-width integers so tests cannot catch this by behaviour -- the column
+    # type is pinned by a model-inspection test instead
+    # (tests/test_telegram_id_ranges.py). Telegram has also signalled that user/chat
+    # ids may exceed 2^52, so BigInteger is the right floor for anything
+    # Telegram-numeric, not a stopgap for today's 10 digits.
+    # `autoincrement=False` because this id comes FROM Telegram -- we never generate
+    # one. Without it SQLAlchemy sees an integer PK with no default and emits
+    # BIGSERIAL, creating a sequence that is never advanced (harmless, but it
+    # misrepresents where the id comes from and litters the schema).
+    id: int = Field(
+        primary_key=True,
+        sa_type=BigInteger,
+        sa_column_kwargs={"autoincrement": False},
+    )
     token: str
     username: str
     status: BotStatus = Field(default=BotStatus.AVAILABLE, index=True)
@@ -101,7 +119,15 @@ class Tenant(SQLModel, table=True):
     status: TenantStatus = Field(default=TenantStatus.PROVISIONING, index=True)
 
     # Indexed because ingress resolves tenant-by-bot on every Telegram update.
-    bot_id: int | None = Field(default=None, foreign_key="bot.id", index=True, unique=True)
+    # BigInteger to match `Bot.id` -- a 32-bit FK pointing at a 64-bit PK would fail
+    # to create the constraint on Postgres. See the note on `Bot.id`.
+    bot_id: int | None = Field(
+        default=None,
+        foreign_key="bot.id",
+        index=True,
+        unique=True,
+        sa_type=BigInteger,
+    )
 
     # Mirror of Railway state (implementation-plan §1: "the placement table becomes
     # a mirror of Railway state").
