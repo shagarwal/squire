@@ -165,17 +165,14 @@ first and ask for their name once more, lightly. Never ask twice in a row.""",
     "ask_timezone": """You are waiting for this person's location or timezone. Convert whatever they
 give you (a city is a perfectly good answer) into an IANA timezone name such as
 Europe/London or America/Los_Angeles. Do three things: save it with
-hindsight_retain, confirm it back to them in a few words, and write ONLY the
-`timezone:` line of {config_file} with this exact command
-(edit the zone name, change nothing else — that file also holds the runtime's
-own settings and rewriting it wholesale would break them):
+hindsight_retain, confirm it back to them in a few words, and record it by
+running this ONE command with the terminal tool, on a single line, changing
+only Europe/London to their actual zone:
 
-    python3 - <<'PY'
-    import re, pathlib
-    p = pathlib.Path("{config_file}")
-    s = p.read_text()
-    p.write_text(re.sub(r'(?m)^timezone:.*$', 'timezone: "Europe/London"', s))
-    PY
+{tz_cmd}
+
+Do not rewrite {config_file} any other way. That file also holds the runtime's
+own settings, and replacing it wholesale breaks them.
 
 Then ask ONE question: what is one thing they would like you to take off their
 plate this week.""",
@@ -296,6 +293,36 @@ def _skill_file() -> str:
     return str(_home() / "skills" / "concierge" / "state-machine.yaml")
 
 
+def _timezone_command() -> str:
+    """A single-line command that rewrites ONLY the `timezone:` line.
+
+    Single-line and shlex-quoted for the same reason the state-write command is:
+    an emitted command has to run EXACTLY as printed. The first version of this
+    was an indented ``python3 - <<'PY'`` heredoc, which cannot work — the
+    delimiter must be at column 0 unless you use ``<<-`` (and even that only
+    strips tabs) — so running it verbatim died with "here-document delimited by
+    end-of-file" plus an IndentationError, leaving config.yaml untouched.
+
+    That failure was invisible to the agent, which would confirm the timezone
+    and move on while the file still said UTC, defeating the exact step that
+    exists so "tomorrow morning" means something. And a model that helpfully
+    de-indented it would have succeeded, making the outcome probabilistic —
+    the opposite of this hook's whole thesis.
+
+    Targeted on purpose: an anchored per-line substitution, not a YAML
+    round-trip. config.yaml also carries the `hooks:` block that makes
+    onboarding work at all, and rewriting the file wholesale is how that gets
+    silently dropped.
+    """
+    script = (
+        "import re,pathlib;"
+        "p=pathlib.Path({!r});"
+        "p.write_text(re.sub(r'(?m)^timezone:.*$', "
+        "'timezone: \"Europe/London\"', p.read_text()))"
+    ).format(str(_home() / "config.yaml"))
+    return "python3 -c " + shlex.quote(script)
+
+
 def _counter_path(state_file: Path) -> Path:
     """Sibling file holding the safety-valve counter, as "<state> <count>".
 
@@ -340,6 +367,7 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
         ("{skill_file}", _skill_file()),
         ("{config_file}", str(_home() / "config.yaml")),
         ("{env_file}", str(_home() / ".env")),
+        ("{tz_cmd}", _timezone_command()),
     ):
         directive = directive.replace(token, value)
 

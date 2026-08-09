@@ -117,7 +117,8 @@ PAYLOAD = payload()
 
 
 def run_hook(state_file_content: str | None, *, env_style: str = "state_dir",
-             counter: str | None = None, stdin: str | None = None) -> tuple[int, str]:
+             counter: str | None = None, stdin: str | None = None,
+             env_home: str | None = None) -> tuple[int, str]:
     """Run the hook against a temp state dir. Returns (returncode, stdout)."""
     with tempfile.TemporaryDirectory() as td:
         home = pathlib.Path(td)
@@ -135,6 +136,10 @@ def run_hook(state_file_content: str | None, *, env_style: str = "state_dir",
             env["SQUIRE_STATE_DIR"] = str(state_dir)
         else:  # exercise the HERMES_HOME fallback path
             env["HERMES_HOME"] = str(home)
+        if env_home is not None:
+            # Point the directive's PATH templating at a real tree, so an
+            # emitted command can be executed against actual files.
+            env["HERMES_HOME"] = env_home
 
         proc = subprocess.run(
             [sys.executable, str(HOOK)],
@@ -357,6 +362,100 @@ check(
     "the timezone write targets only the timezone line",
     "^timezone:" in all_ctx["ask_timezone"],
     all_ctx["ask_timezone"][:200],
+)
+
+
+print()
+print("== 3c-bis. EVERY emitted command must run exactly as printed ==")
+
+# The rule this section enforces, learned the hard way: an emitted command is
+# only as good as its ability to run VERBATIM. The timezone step originally
+# emitted an indented `python3 - <<'PY'` heredoc; a heredoc delimiter must sit
+# at column 0, so it died with "here-document delimited by end-of-file" and an
+# IndentationError, silently leaving config.yaml on UTC. It was missed because
+# it was only ever substring-checked, while the state-write command was
+# genuinely executed. So: check them all, structurally and by execution.
+
+_CMD_STARTS = ("printf ", "python3 ", "python ", "sh ", "bash ", "sed ", "cat ", "echo ")
+
+
+def emitted_commands(context: str) -> list[str]:
+    """Every line in an injected directive that reads as a shell command."""
+    return [
+        ln.strip() for ln in context.splitlines() if ln.strip().startswith(_CMD_STARTS)
+    ]
+
+
+all_cmds = {st: emitted_commands(ctx) for st, ctx in all_ctx.items()}
+check(
+    "the states that promise a command actually emit one",
+    all(all_cmds[st] for st in ("greet", "ask_timezone")),
+    {k: len(v) for k, v in all_cmds.items()},
+)
+
+for st, cmds in all_cmds.items():
+    # A multi-line construct cannot survive being emitted inside indented
+    # prose. Ban the whole class rather than the one instance we hit.
+    check(
+        f"`{st}` emits no heredoc (cannot survive indentation)",
+        "<<" not in all_ctx[st],
+    )
+    for i, cmd in enumerate(cmds):
+        # bash -n parses without executing: catches unterminated quotes and
+        # heredocs regardless of what the command would do.
+        rc_syntax = subprocess.run(
+            ["bash", "-n", "-c", cmd], capture_output=True, text=True
+        ).returncode
+        check(f"`{st}` command #{i} is syntactically valid shell", rc_syntax == 0, cmd[:90])
+        check(
+            f"`{st}` command #{i} is a single line",
+            "\n" not in cmd and len(cmd.splitlines()) == 1,
+        )
+
+# Now actually RUN the timezone command, against a copy of the REAL template —
+# the one that carries the hooks: block onboarding depends on.
+with tempfile.TemporaryDirectory() as td:
+    home = pathlib.Path(td)
+    cfg = home / "config.yaml"
+    cfg.write_text(CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    before = cfg.read_text(encoding="utf-8")
+
+    tz_ctx = context_for("ask_timezone", env_home=str(home))
+    tz_cmds = emitted_commands(tz_ctx)
+    proc = subprocess.run(
+        ["bash", "-c", tz_cmds[0]] if tz_cmds else ["false"],
+        capture_output=True, text=True, timeout=30,
+    )
+    after = cfg.read_text(encoding="utf-8")
+    try:
+        parsed = yaml.safe_load(after)
+    except Exception:
+        parsed = None
+
+check("the timezone command exits 0", proc.returncode == 0, proc.stderr[:200])
+check("config.yaml still parses as YAML afterwards", isinstance(parsed, dict))
+check(
+    "the timezone actually changed",
+    isinstance(parsed, dict) and parsed.get("timezone") == "Europe/London",
+    str((parsed or {}).get("timezone")),
+)
+# The regression that would disable onboarding entirely.
+check(
+    "the hooks: block survives the timezone write",
+    isinstance(parsed, dict)
+    and (parsed.get("hooks") or {}).get("pre_llm_call")
+    and parsed["hooks"]["pre_llm_call"][0]["command"].endswith("squire-concierge-hook.py"),
+    str((parsed or {}).get("hooks")),
+)
+check(
+    "the timezone write changes exactly one line",
+    sum(1 for a, b in zip(before.splitlines(), after.splitlines()) if a != b) == 1,
+)
+check(
+    "no other config key is disturbed",
+    isinstance(parsed, dict)
+    and parsed.get("onboarding", {}).get("profile_build") == "off"
+    and (parsed.get("telegram") or {}).get("reactions") is False,
 )
 
 print()
