@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+env.ignore
 *.pem
 *.key
 auth.json
