@@ -53,13 +53,14 @@ def create_app(
 
     cache = TenantCache(client, settings, clock=clock)
 
-    async def _do_forward(internal_url: str, body: bytes) -> bool:
+    async def _do_forward(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         return await forward_update(
             client,
             internal_url,
             body,
             connect_timeout=settings.forward_connect_timeout,
             total_timeout=settings.forward_total_timeout,
+            webhook_secret=webhook_secret,
         )
 
     buffer = RetryBuffer(settings, _do_forward, clock=clock)
@@ -151,7 +152,10 @@ def create_app(
             )
             return Response(status_code=403)
 
-        ok = await _do_forward(tenant.internal_url, body)
+        # Re-stamp the per-bot secret so the tenant can prove this update came
+        # through ingress. Load-bearing for trust-on-first-use owner binding --
+        # see forwarder.forward_update.
+        ok = await _do_forward(tenant.internal_url, body, tenant.webhook_secret)
         latency_ms = (time.monotonic() - start) * 1000
 
         if ok:
@@ -167,7 +171,8 @@ def create_app(
         # Forward failed -- most likely a sleeping/restarting tenant.
         # Buffer-and-wake: tell Telegram we're fine, let the background
         # retry worker redeliver once the tenant is reachable again.
-        buffer.enqueue(tenant.tenant_id, tenant.internal_url, bot_id, body)
+        buffer.enqueue(tenant.tenant_id, tenant.internal_url, bot_id, body,
+                       tenant.webhook_secret)
         log_event(
             "forward_failed_buffered",
             bot_id=bot_id,

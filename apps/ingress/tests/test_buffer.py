@@ -32,7 +32,7 @@ def test_tenant_buffer_drops_oldest_on_overflow(settings):
 async def test_retry_buffer_redelivers_on_success(settings, fake_clock):
     attempts = []
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         attempts.append((internal_url, body))
         return True  # tenant is awake, delivery succeeds immediately
 
@@ -56,7 +56,7 @@ async def test_retry_buffer_backs_off_and_eventually_succeeds(settings, fake_clo
     # Fail the first two attempts, then succeed.
     results = iter([False, False, True])
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         return next(results)
 
     rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
@@ -76,7 +76,7 @@ async def test_retry_buffer_backs_off_and_eventually_succeeds(settings, fake_clo
 
 
 async def test_retry_buffer_gives_up_after_max_age(settings, fake_clock):
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         return False  # tenant never comes back
 
     rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
@@ -92,7 +92,7 @@ async def test_retry_buffer_gives_up_after_max_age(settings, fake_clock):
 async def test_retry_preserves_fifo_order_per_tenant(settings, fake_clock):
     delivered = []
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         delivered.append(body)
         return True
 
@@ -122,7 +122,7 @@ async def test_run_forever_survives_forward_fn_exceptions(settings, caplog):
 
     call_count = 0
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         nonlocal call_count
         call_count += 1
         raise RuntimeError("boom -- simulated unexpected failure")
@@ -161,3 +161,74 @@ async def test_run_forever_survives_forward_fn_exceptions(settings, caplog):
         }
         assert event["bot_id"] is None
         assert event["tenant_id"] is None
+
+
+async def test_retry_carries_webhook_secret_on_drain(settings, fake_clock):
+    """The buffered (wake) path must forward the per-bot secret.
+
+    A buffered update is usually a sleeping tenant's FIRST message -- exactly the
+    first-contact update whose authenticity decides owner binding. Dropping the
+    secret on retry (buffer.py:169 `buf.webhook_secret`->"") silently degrades
+    the wake path to a pairing code. This is the coverage M6 was missing.
+    """
+    seen = []
+
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
+        seen.append((internal_url, body, webhook_secret))
+        return True
+
+    rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
+    rb.enqueue("tenant-1", "http://tenant-1.internal", bot_id=42, body=b"hello",
+               webhook_secret="per-bot-A")
+
+    fake_clock.advance(2.0)
+    await rb.retry_once()
+
+    assert seen == [("http://tenant-1.internal", b"hello", "per-bot-A")]
+
+
+async def test_retry_uses_rotated_secret(settings, fake_clock):
+    """A rotated secret must reach the drain -- kills M7 (drop the refresh).
+
+    control-api can rotate the per-bot secret; a retry with the stale value
+    would be refused by the tenant's own binding check. get_or_create refreshes
+    buf.webhook_secret on every enqueue, so the SECOND enqueue's value is what
+    the drain must use.
+    """
+    seen = []
+
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
+        seen.append(webhook_secret)
+        return True
+
+    rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
+    # First enqueue with the old secret; still buffered (not yet due).
+    rb.enqueue("tenant-1", "http://tenant-1.internal", bot_id=42, body=b"u1",
+               webhook_secret="old-secret")
+    # Second enqueue after a rotation, same tenant.
+    rb.enqueue("tenant-1", "http://tenant-1.internal", bot_id=42, body=b"u2",
+               webhook_secret="new-secret")
+
+    fake_clock.advance(2.0)
+    await rb.retry_once()
+    await rb.retry_once()
+
+    # Both queued items drain against the freshest known secret. The point is
+    # that the OLD secret is never used once a rotation has been seen.
+    assert "old-secret" not in seen
+    assert seen and all(s == "new-secret" for s in seen), seen
+
+
+async def test_empty_secret_forwarded_as_empty(settings, fake_clock):
+    """A tenant with no configured secret enqueues an empty string, not a crash."""
+    seen = []
+
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
+        seen.append(webhook_secret)
+        return True
+
+    rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
+    rb.enqueue("tenant-1", "http://tenant-1.internal", bot_id=42, body=b"u1")
+    fake_clock.advance(2.0)
+    await rb.retry_once()
+    assert seen == [""]

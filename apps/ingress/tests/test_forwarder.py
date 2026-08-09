@@ -68,3 +68,47 @@ async def test_forward_strips_trailing_slash_from_internal_url():
         client, "http://tenant-1.internal/", b"{}", connect_timeout=5.0, total_timeout=10.0
     )
     assert seen_urls == ["http://tenant-1.internal/webhook/telegram"]
+
+
+async def test_forward_stamps_per_bot_secret_header():
+    """The tenant must be able to tell an ingress forward from a raw POST.
+
+    This is a security control, not plumbing: the tenant image binds its owner
+    on first contact, so an unauthenticated forgery to a not-yet-bound tenant
+    would be permanent account takeover. See forwarder.forward_update.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.headers)
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ok = await forward_update(
+        client, "http://tenant-1.internal", b"{}",
+        connect_timeout=5.0, total_timeout=10.0,
+        webhook_secret="per-bot-secret-value",
+    )
+    assert ok is True
+    assert seen.get("x-telegram-bot-api-secret-token") == "per-bot-secret-value"
+    assert seen.get("content-type") == "application/json"
+
+
+async def test_forward_omits_header_when_no_secret_configured():
+    """An empty secret must not become a literal empty header.
+
+    A tenant treating "present but empty" as authenticated would reintroduce
+    exactly the bypass app.py guards against on the inbound side.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(request.headers)
+        return httpx.Response(200)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await forward_update(
+        client, "http://tenant-1.internal", b"{}",
+        connect_timeout=5.0, total_timeout=10.0, webhook_secret="",
+    )
+    assert "x-telegram-bot-api-secret-token" not in seen

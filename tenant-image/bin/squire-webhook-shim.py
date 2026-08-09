@@ -35,10 +35,18 @@ TELEGRAM_WEBHOOK_PORT           adapter's local port (default 8443)
 TELEGRAM_WEBHOOK_SECRET         stamped onto forwarded requests
 SQUIRE_WEBHOOK_REQUIRE_AUTH     "true" => reject unauthenticated posts (see below)
 INTERNAL_API_TOKEN              shared secret with ingress, if it sends one
+SQUIRE_AUTOPAIR                 "false" => never bind an owner on first contact;
+                                fall back to upstream's pairing-code ceremony.
+                                Default true. Note that binding ALWAYS requires
+                                an authenticated request regardless of this flag
+                                and of SQUIRE_WEBHOOK_REQUIRE_AUTH.
+HERMES_HOME                     tenant state root (default /opt/data); the
+                                pairing store written by autopair lives under it
 """
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import ipaddress
 import json
@@ -56,6 +64,34 @@ UPSTREAM_PORT = int(os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443"))
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "")
 TENANT_ID = os.environ.get("TENANT_ID", "")
+
+# --- Trust-on-first-use owner binding --------------------------------------
+# The shim is the only thing that sees a Telegram update BEFORE hermes does,
+# which is exactly what this needs: the owner must be approved by the time the
+# gateway authorizes THIS update, or the first contact gets a pairing code
+# instead of a greeting. See squire_autopair.py for the full rationale and the
+# security semantics. HERMES_HOME is the mounted volume, so the binding is
+# durable. SQUIRE_AUTOPAIR=false restores upstream's pairing-code ceremony.
+HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
+# `or "true"` rather than a get() default: an env var that is SET BUT EMPTY
+# (trivially produced by `-e SQUIRE_AUTOPAIR=` or an unset shell variable in a
+# compose file) would otherwise read as "" and silently disable owner binding.
+# The symptom — every tenant asking for a pairing code — looks nothing like its
+# cause. Same reasoning for HERMES_HOME above, where an empty value would send
+# the pairing store to a relative path.
+AUTOPAIR_ENABLED = (os.environ.get("SQUIRE_AUTOPAIR") or "true").lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Import by path rather than relying on cwd: supervisord starts us from an
+# unspecified directory, and a silent ImportError here would mean every tenant
+# quietly falls back to the pairing gate.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from squire_autopair import defang_start_command, maybe_bind_owner
+except ImportError:  # pragma: no cover - defensive
+    maybe_bind_owner = None
+    defang_start_command = None
 
 # Telegram updates are small; the largest realistic body is a long message with
 # a big entity list. 2 MiB is generous and stops an unbounded read.
@@ -114,18 +150,52 @@ def counters_snapshot() -> dict:
 
 
 def _authorised(headers) -> bool:
-    """True if the request carries a credential we recognise.
+    """True if the request carries a DELIVERY credential we recognise.
 
     Two accepted forms, so either ingress design works:
       * X-Telegram-Bot-Api-Secret-Token — Telegram's own header, preserved by a
         verbatim-forwarding ingress;
       * X-Squire-Internal-Token — our own service-to-service token.
+
+    This gates DELIVERY only, and only when SQUIRE_WEBHOOK_REQUIRE_AUTH is on.
+    The fleet-wide internal token is legitimately accepted here — losing a
+    message because ingress used its own token instead of the per-bot secret is
+    a worse failure than accepting it. It must NOT be used to gate ownership
+    binding; that is what _authorised_for_binding exists to prevent.
+
+    compare_digest, not ==, on both arms: this now sits next to
+    ownership-adjacent logic, and a constant-time compare is the standing
+    convention for bearer-shaped secrets here (matches ingress/app.py).
     """
-    if WEBHOOK_SECRET and headers.get("X-Telegram-Bot-Api-Secret-Token") == WEBHOOK_SECRET:
+    tg = headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
+    if WEBHOOK_SECRET and hmac.compare_digest(tg, WEBHOOK_SECRET):
         return True
-    if INTERNAL_TOKEN and headers.get("X-Squire-Internal-Token") == INTERNAL_TOKEN:
+    internal = headers.get("X-Squire-Internal-Token") or ""
+    if INTERNAL_TOKEN and hmac.compare_digest(internal, INTERNAL_TOKEN):
         return True
     return False
+
+
+def _authorised_for_binding(headers) -> bool:
+    """True ONLY for the per-bot Telegram secret. Never the fleet token.
+
+    Binding an owner is trust-on-first-use: it converts "sent this request" into
+    "permanently owns this tenant". The fleet-wide INTERNAL_API_TOKEN is readable
+    by every trial tenant's own agent (it is in the container environment), so
+    accepting it here would let any tenant's agent forge a first-contact update
+    to any not-yet-bound tenant and seize it — the exact takeover this guard
+    exists to stop, and the one _authorised (which accepts that token for
+    delivery) cannot be reused for.
+
+    The per-bot secret is known only to Telegram, control-api, and this one
+    tenant; ingress re-stamps it on every forward. So it, and only it, may bind.
+
+    Empty WEBHOOK_SECRET returns False: compare_digest("", "") is True, and a
+    tenant with no configured secret must be un-bindable, not bindable by a
+    request that also sent nothing.
+    """
+    tg = headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
+    return bool(WEBHOOK_SECRET) and hmac.compare_digest(tg, WEBHOOK_SECRET)
 
 
 def _is_loopback(client_address) -> bool:
@@ -252,6 +322,72 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length)
+
+        # Bind the owner BEFORE forwarding. Ordering is the whole trick: upstream's
+        # PairingStore.is_approved() re-reads the approved JSON on every call with
+        # no caching, so a write completed here is visible to the gateway while it
+        # authorizes this very update. Do it after forwarding and the first contact
+        # gets a pairing code; do it on a timer and it gets one too.
+        #
+        # Never fatal, and never blocks delivery: maybe_bind_owner swallows its own
+        # errors, and a failure here just means the tenant pairs the upstream way.
+        # AUTHENTICATION IS MANDATORY FOR BINDING, regardless of REQUIRE_AUTH.
+        #
+        # REQUIRE_AUTH governs DELIVERY and stays false: an unauthenticated POST
+        # is still forwarded, because refusing delivery on a header disagreement
+        # would silently break every tenant. Binding is a different matter.
+        #
+        # Trust-on-first-use turns "can reach this port" into "is the permanent
+        # owner of this tenant". Before autopair, forging an update to a
+        # not-yet-bound tenant got you a useless pairing code; with it, it is
+        # account takeover, and the real customer has no shell to recover from
+        # it. So an unauthenticated update may be delivered but may NEVER bind:
+        # it degrades to upstream's pairing-code path, which is visible to the
+        # owner and recoverable by an operator.
+        #
+        # The credential is the PER-BOT secret ONLY — _authorised_for_binding,
+        # NOT _authorised. _authorised also accepts the fleet-wide internal
+        # token, which every trial tenant's agent can read from its environment;
+        # binding on that would be the exact takeover this guards against. Using
+        # the delivery check here is the bug the first re-review caught.
+        may_bind = (AUTOPAIR_ENABLED and maybe_bind_owner is not None
+                    and _authorised_for_binding(self.headers))
+        if AUTOPAIR_ENABLED and maybe_bind_owner is not None and not may_bind:
+            # Loud, because this is either an attack or a misconfigured ingress,
+            # and the symptom the user reports ("it asked me for a pairing code")
+            # is otherwise indistinguishable between the two.
+            log("unauthenticated update: NOT binding owner (falling back to "
+                "upstream pairing). If this is a real first contact, ingress is "
+                "not stamping X-Telegram-Bot-Api-Secret-Token.")
+
+        if may_bind:
+            try:
+                update = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                update = None
+            if isinstance(update, dict):
+                bound = maybe_bind_owner(HERMES_HOME, update)
+                if bound:
+                    # Only on the update that bound the owner. Upstream swallows
+                    # "/start" as a platform ping (run.py:14961 returns ""), so
+                    # without this the deep-link tap authorizes the owner and
+                    # then answers with silence — worse than the pairing code it
+                    # replaced. See defang_start_command for why this is a slash
+                    # strip and not a synthesised greeting.
+                    if defang_start_command(update):
+                        body = json.dumps(update).encode("utf-8")
+                        log("first contact: /start relayed as text so the "
+                            "concierge greeting can fire")
+                    # Deliberately does NOT log the Telegram user id. It is the
+                    # tenant owner's account identifier, this output goes to a
+                    # shared log aggregator, and the heartbeat holds no user ids
+                    # by design — this must not become the exception.
+                    # Logged, deliberately NOT counted. _COUNTERS is a fixed
+                    # three-outcome set that squire-heartbeat.py forwards to
+                    # control-api; adding a key here would both KeyError and
+                    # widen the metrics contract to report a per-tenant lifecycle
+                    # event that control-api has no need to know.
+                    log("first contact: bound tenant owner (id redacted)")
 
         conn = None
         try:
