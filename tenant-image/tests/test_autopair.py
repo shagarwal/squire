@@ -265,6 +265,26 @@ check("entity covering the slash shrinks instead of moving",
       u["message"]["entities"] == [{"type": "bold", "offset": 0, "length": 2}],
       u["message"].get("entities"))
 
+# /start@Bot removes MORE than one leading char (the @suffix is dropped too), so
+# a single-constant shift would be wrong -> entities are dropped, not guessed.
+u = dm(1, text="/start@SquireBot ref")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 16},
+                            {"type": "code", "offset": 17, "length": 3}]
+defang_start_command(u)
+check("/start@Bot drops entities rather than mis-shift",
+      "entities" not in u["message"], u["message"].get("entities"))
+check("/start@Bot text still defanged", u["message"]["text"] == "start ref",
+      u["message"]["text"])
+
+# Malformed entities are dropped (documented), not passed through.
+u = dm(1, text="/start")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
+                            {"type": "code", "offset": "x", "length": 3},
+                            "not-a-dict"]
+defang_start_command(u)
+check("malformed entities dropped", "entities" not in u["message"],
+      u["message"].get("entities"))
+
 # Everything else must be left strictly alone — this must not become a general
 # command rewriter.
 for label, text in (("ordinary text", "hello"), ("another command", "/help"),

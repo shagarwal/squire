@@ -305,41 +305,51 @@ def defang_start_command(update: dict) -> bool:
     # carried, and a future signup flow may use it to correlate the tenant.
     msg["text"] = (f"start {rest}".strip() if rest.strip() else "start")
 
-    # Telegram marks the command span in entities. Two things have to happen and
-    # only one of them is obvious:
+    # Telegram entity offsets are absolute indices into the text, so removing
+    # characters from the front invalidates every later entity. We only remap
+    # them when the edit removed EXACTLY ONE leading character — a bare "/start"
+    # or "/start <payload>", where the sole change is the dropped slash
+    # (delta == 1). For "/start@Bot" (the @suffix is dropped too), or leading /
+    # trailing whitespace, more than the slash moved and the offsets no longer
+    # map by a single constant. A WRONG offset highlights the wrong characters,
+    # which is worse than none, so in those cases we drop entities entirely.
     #
-    #   1. drop the leading bot_command entity — leaving it would point at text
-    #      that is no longer a command, and adapters do read entities;
-    #   2. SHIFT every surviving entity left by one, because we removed one
-    #      character from the front of the string. Entity offsets are absolute
-    #      indices into the text, so a mention or a link after the command would
-    #      otherwise be off by one and highlight the wrong characters.
-    #
-    # An entity anchored at offset 0 covered the slash itself, so it loses a
-    # character rather than moving; if that empties it, it is dropped.
+    # In practice a /start message carries only its bot_command entity, so the
+    # remap is defensive; the drop path is the honest fallback for the messy
+    # cases rather than a guess at their arithmetic. Malformed entries (non-dict,
+    # or non-int offset/length) are dropped for the same reason.
     entities = msg.get("entities")
     if isinstance(entities, list):
-        shifted = []
-        for e in entities:
-            if not isinstance(e, dict):
-                continue
-            offset = e.get("offset")
-            length = e.get("length")
-            if not isinstance(offset, int) or not isinstance(length, int):
-                continue
-            if offset == 0 and e.get("type") == "bot_command":
-                continue  # the command span itself
-            moved = dict(e)
-            if offset == 0:
-                moved["length"] = length - 1
-                if moved["length"] <= 0:
-                    continue
+        delta = len(text) - len(msg["text"])
+        if delta == 1 and text == text.strip():
+            shifted = []
+            for e in entities:
+                if not isinstance(e, dict):
+                    continue  # malformed entity dropped
+                offset = e.get("offset")
+                length = e.get("length")
+                if not isinstance(offset, int) or not isinstance(length, int):
+                    continue  # malformed entity dropped
+                if offset == 0 and e.get("type") == "bot_command":
+                    continue  # the command span itself
+                moved = dict(e)
+                if offset == 0:
+                    # This entity covered the slash; it loses that character
+                    # rather than moving, and is dropped if that empties it.
+                    moved["length"] = length - 1
+                    if moved["length"] <= 0:
+                        continue
+                else:
+                    moved["offset"] = offset - 1
+                shifted.append(moved)
+            if shifted:
+                msg["entities"] = shifted
             else:
-                moved["offset"] = offset - 1
-            shifted.append(moved)
-        if shifted:
-            msg["entities"] = shifted
+                msg.pop("entities", None)
         else:
+            # More than one leading char removed (@Bot suffix, surrounding
+            # whitespace): offsets can't be remapped by a constant, so drop
+            # rather than emit wrong ones.
             msg.pop("entities", None)
     return True
 

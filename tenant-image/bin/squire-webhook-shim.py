@@ -46,6 +46,7 @@ HERMES_HOME                     tenant state root (default /opt/data); the
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import ipaddress
 import json
@@ -149,18 +150,52 @@ def counters_snapshot() -> dict:
 
 
 def _authorised(headers) -> bool:
-    """True if the request carries a credential we recognise.
+    """True if the request carries a DELIVERY credential we recognise.
 
     Two accepted forms, so either ingress design works:
       * X-Telegram-Bot-Api-Secret-Token — Telegram's own header, preserved by a
         verbatim-forwarding ingress;
       * X-Squire-Internal-Token — our own service-to-service token.
+
+    This gates DELIVERY only, and only when SQUIRE_WEBHOOK_REQUIRE_AUTH is on.
+    The fleet-wide internal token is legitimately accepted here — losing a
+    message because ingress used its own token instead of the per-bot secret is
+    a worse failure than accepting it. It must NOT be used to gate ownership
+    binding; that is what _authorised_for_binding exists to prevent.
+
+    compare_digest, not ==, on both arms: this now sits next to
+    ownership-adjacent logic, and a constant-time compare is the standing
+    convention for bearer-shaped secrets here (matches ingress/app.py).
     """
-    if WEBHOOK_SECRET and headers.get("X-Telegram-Bot-Api-Secret-Token") == WEBHOOK_SECRET:
+    tg = headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
+    if WEBHOOK_SECRET and hmac.compare_digest(tg, WEBHOOK_SECRET):
         return True
-    if INTERNAL_TOKEN and headers.get("X-Squire-Internal-Token") == INTERNAL_TOKEN:
+    internal = headers.get("X-Squire-Internal-Token") or ""
+    if INTERNAL_TOKEN and hmac.compare_digest(internal, INTERNAL_TOKEN):
         return True
     return False
+
+
+def _authorised_for_binding(headers) -> bool:
+    """True ONLY for the per-bot Telegram secret. Never the fleet token.
+
+    Binding an owner is trust-on-first-use: it converts "sent this request" into
+    "permanently owns this tenant". The fleet-wide INTERNAL_API_TOKEN is readable
+    by every trial tenant's own agent (it is in the container environment), so
+    accepting it here would let any tenant's agent forge a first-contact update
+    to any not-yet-bound tenant and seize it — the exact takeover this guard
+    exists to stop, and the one _authorised (which accepts that token for
+    delivery) cannot be reused for.
+
+    The per-bot secret is known only to Telegram, control-api, and this one
+    tenant; ingress re-stamps it on every forward. So it, and only it, may bind.
+
+    Empty WEBHOOK_SECRET returns False: compare_digest("", "") is True, and a
+    tenant with no configured secret must be un-bindable, not bindable by a
+    request that also sent nothing.
+    """
+    tg = headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
+    return bool(WEBHOOK_SECRET) and hmac.compare_digest(tg, WEBHOOK_SECRET)
 
 
 def _is_loopback(client_address) -> bool:
@@ -310,11 +345,13 @@ class Handler(BaseHTTPRequestHandler):
         # it degrades to upstream's pairing-code path, which is visible to the
         # owner and recoverable by an operator.
         #
-        # The credential is the PER-BOT secret (ingress re-stamps it on every
-        # forward). Deliberately not the fleet-wide INTERNAL_API_TOKEN: every
-        # trial tenant's own agent can read that out of its environment, so it
-        # is exactly the credential an attacker already holds.
-        may_bind = AUTOPAIR_ENABLED and maybe_bind_owner is not None and _authorised(self.headers)
+        # The credential is the PER-BOT secret ONLY — _authorised_for_binding,
+        # NOT _authorised. _authorised also accepts the fleet-wide internal
+        # token, which every trial tenant's agent can read from its environment;
+        # binding on that would be the exact takeover this guards against. Using
+        # the delivery check here is the bug the first re-review caught.
+        may_bind = (AUTOPAIR_ENABLED and maybe_bind_owner is not None
+                    and _authorised_for_binding(self.headers))
         if AUTOPAIR_ENABLED and maybe_bind_owner is not None and not may_bind:
             # Loud, because this is either an attack or a misconfigured ingress,
             # and the symptom the user reports ("it asked me for a pairing code")

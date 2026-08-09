@@ -166,6 +166,12 @@ class RetryBuffer:
             if item.next_attempt_at > now:
                 break  # front item not due yet; everything behind it is even newer
 
+            # buf.webhook_secret reflects whatever was last seen at enqueue
+            # (get_or_create refreshes it), not the value at this instant. A
+            # rotation mid-drain is therefore picked up on the next enqueue, not
+            # retroactively for already-queued items. That is the safe-degrade
+            # direction: at worst one buffered update is refused by the tenant
+            # and retried, versus never noticing a rotation at all.
             ok = await self._forward_fn(buf.internal_url, item.body, buf.webhook_secret)
             if ok:
                 buf.items.popleft()

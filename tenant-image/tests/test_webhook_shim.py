@@ -27,6 +27,8 @@ IMAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SHIM = str(IMAGE_ROOT / "bin" / "squire-webhook-shim.py")
 
 SECRET = "s3cr3t-token"
+# The fleet-wide token: authenticates delivery, must never authenticate binding.
+INTERNAL = "fleet-wide-internal-token"
 UPSTREAM_PORT = 18443
 SHIM_PORT = 18080
 UPSTREAM_PATH = "/webhook/telegram"
@@ -118,6 +120,7 @@ def run(env_extra, with_upstream=True):
             "SQUIRE_WEBHOOK_PATH": "/webhook/telegram",
             "TELEGRAM_WEBHOOK_PORT": str(UPSTREAM_PORT),
             "TELEGRAM_WEBHOOK_SECRET": SECRET,
+            "INTERNAL_API_TOKEN": INTERNAL,
             "TENANT_ID": "t-test",
         }
     )
@@ -332,6 +335,20 @@ try:
     received.clear()
     post("/webhook/telegram", forged, headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"})
     check("wrong secret did NOT bind an owner", not approved.exists(), str(approved))
+
+    # THE CRITICAL CASE the first re-review caught: the fleet-wide internal token
+    # authenticates DELIVERY but must NEVER bind, because every trial tenant's
+    # own agent can read it from its environment. A forged update carrying ONLY
+    # the internal token must be forwarded verbatim and bind nobody.
+    received.clear()
+    status, _ = post("/webhook/telegram", forged,
+                     headers={"X-Squire-Internal-Token": INTERNAL})
+    check("fleet-token-only update still delivered", status == 200, status)
+    check("fleet token did NOT bind an owner", not approved.exists(), str(approved))
+    if received:
+        fwdi = json.loads(received[0]["body"])
+        check("fleet-token /start forwarded VERBATIM",
+              fwdi["message"]["text"] == "/start", fwdi["message"].get("text"))
 
     # --- the real, authenticated first contact -----------------------------
     received.clear()
