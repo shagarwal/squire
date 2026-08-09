@@ -108,3 +108,45 @@ squire-003-xchat-sessionkey	gateway/slash_commands.py	_xchat_key	required
 #       WhatsApp bridge from the image, this row fails the build and forces that
 #       to be a deliberate decision instead of a silent one.
 squire-004-dm-read-receipt	scripts/whatsapp-bridge/bridge_helpers.js	isGroup ? { participant	required
+
+# 005 — deterministic first-conversation onboarding (gateway/run.py), added
+#       2026-08-09 after the first real tenant conversation produced no
+#       onboarding at all.
+#
+#       Upstream injects its own first-contact note into the user-message
+#       sidecar on the very first message ever, instructing the agent to
+#       introduce itself in "one or two sentences max" and to mention /help.
+#       That is a directly competing instruction in the same slot Squire's
+#       concierge directive uses, and the shorter/more concrete one wins on a
+#       Haiku-class trial model. The patch skips upstream's note while
+#       .squire/concierge-state.json says onboarding is unfinished, and leaves
+#       upstream's behaviour untouched otherwise.
+#
+#       The upstream-anchor row is what catches a refactor that moves or
+#       rewords the block the patch keys on: if the anchor vanishes, the patch
+#       may still "apply" somewhere harmless and silently stop suppressing.
+#       WHY A PATCH AND NOT JUST THE HOOK (asked and answered 2026-08-09 — do
+#       not re-litigate without re-reading these lines): a pre_llm_call hook
+#       cannot strip upstream's note, for three independent reasons.
+#         1. ORDER. agent/turn_context.py:1056 invokes pre_llm_call; the
+#            gateway note is consumed afterwards at :1111
+#            (consume_gateway_turn_context_notes) and CONCATENATED onto the
+#            hook's own output at :1124. Upstream's note lands after ours, in
+#            the most-recent position in the user message.
+#         2. VISIBILITY. The note is never in the hook payload. It is staged
+#            per-session at gateway/run.py:17355 and read inside turn_context;
+#            the hook kwargs are session/task/turn id, user_message,
+#            conversation_history, is_first_turn, model, platform, sender.
+#         3. MUTABILITY. Shell hooks are subprocesses — agent/shell_hooks.py:464
+#            runs them with JSON on stdin and parses stdout. The only verbs
+#            _parse_response accepts for pre_llm_call are {"context": ...};
+#            there is no suppress/replace verb and no shared memory to mutate.
+#
+#       The config knob is build-checked too: config.yaml sets
+#       `onboarding.profile_build: off` to silence upstream's STRONGER first
+#       contact directive, and that knob is only honoured while upstream still
+#       calls profile_build_mode(). If upstream drops it, the knob becomes a
+#       no-op that looks configured — so fail the build instead.
+upstream-onboarding-profile-build	gateway/run.py	profile_build_mode(	required
+patch-005-anchor	gateway/run.py	First-message onboarding -- only on the very first interaction ever	required
+squire-005-concierge-suppress	gateway/run.py	_squire_concierge_active	required

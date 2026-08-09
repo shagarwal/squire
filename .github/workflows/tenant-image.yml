@@ -341,6 +341,18 @@ jobs:
         # what keeps a stranger out of someone else's agent.
         run: python3 tenant-image/tests/test_autopair.py
 
+      - name: Deterministic first-conversation onboarding
+        if: steps.present.outputs.exists == 'true'
+        # The first live tenant answered the founder with no introduction and no
+        # idea what to do next — everything for onboarding had shipped and none
+        # of it fired. This suite pins all three causes: the state file is seeded
+        # so there is positive state to act on, the pre_llm_call hook states the
+        # current step every turn and goes silent forever once complete, and the
+        # greeting is asserted to actually say who the agent is, what it can do,
+        # and what the user must do next. The copy assertions are as
+        # load-bearing as the mechanical ones.
+        run: python3 tenant-image/tests/test_concierge_onboarding.py
+
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
         # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,

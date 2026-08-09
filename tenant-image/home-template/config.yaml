@@ -79,6 +79,59 @@ skills:
   # the concierge skill uses it to find its state machine file.
   template_vars: true
 
+# --- Onboarding ------------------------------------------------------------
+# Squire runs its OWN first conversation (the `concierge` skill). Upstream runs
+# one too, and it was winning.
+#
+# On the very first message ever, gateway/run.py injects a note into the user
+# message telling the agent to introduce itself in "one or two sentences max"
+# and to mention /help — or, by default (`profile_build: ask`), an even stronger
+# directive to offer to build a user profile. Both land in the same
+# high-salience slot our concierge directive uses, and both are shorter and more
+# concrete than a pointer buried in SOUL.md. On a Haiku-class trial model the
+# short concrete instruction wins every time, which is exactly why the first
+# live tenant got a two-line hello and no onboarding at all.
+#
+# `off` stops the profile-build directive. Patch 005 suppresses the remaining
+# plain intro note while concierge state is not `complete`. Together they leave
+# exactly one voice giving the agent instructions on message one.
+onboarding:
+  profile_build: "off"
+
+# --- Hooks -----------------------------------------------------------------
+# The deterministic half of onboarding. hermes runs `pre_llm_call` hooks once
+# per turn and appends whatever they print to the USER message, which is the
+# highest-salience position in the prompt — better than the system prompt for a
+# small model, and the same channel upstream uses for its own must-deliver
+# notes.
+#
+# squire-concierge-hook.py reads .squire/concierge-state.json and, while that
+# state is not `complete`, states the current step and exactly what to do about
+# it. That is the whole point: the agent is TOLD it is onboarding rather than
+# being asked to notice that it should be. It goes silent the moment onboarding
+# completes, so it costs nothing for the rest of a tenant's life.
+#
+# The hook is fail-open by construction (see its module docstring): any error
+# prints nothing and exits 0, and hermes treats a failed hook as a no-op. It can
+# never be the reason a message goes unanswered.
+hooks:
+  pre_llm_call:
+    # 10s is generous for a file read; the script normally finishes in tens of
+    # milliseconds. The timeout exists so a pathological filesystem stall cannot
+    # hold up a user's reply.
+    - command: "/opt/squire/bin/squire-concierge-hook.py"
+      timeout: 10
+
+# Shell hooks normally require an interactive consent prompt on first use. The
+# gateway has no TTY, so without this the hook above would silently never
+# register — a failure that looks exactly like the bug we are fixing.
+#
+# This is not a privilege boundary: the hook is baked into the image, and the
+# agent already has the `terminal` tool, so nothing here grants code execution
+# that was not already available. It does mean any hook later added to this file
+# is auto-accepted, which is why this file is image-managed.
+hooks_auto_accept: true
+
 # --- Approvals -------------------------------------------------------------
 # Left at upstream defaults deliberately. The dangerous-action approval flow is
 # one of the things the PRD sells (§2 "cross-chat approvals"), and re-deriving

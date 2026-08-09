@@ -30,8 +30,18 @@ facts:
     At 72 hours the agent stops answering and replies only with a link to
     subscribe. The tenant's data is kept for 14 days and then permanently
     destroyed unless they subscribe.
-  price_starter: "$5/month — early-bird pricing, Telegram, the full agent"
-  price_pro: "$10/month — adds WhatsApp, voice notes, extra personas and cron"
+  price_starter: >
+    $5/month — early-bird pricing. Telegram, and the full agent: memory,
+    skills, cron and approvals.
+  # NOT "adds cron". prd.md §5.4 gives Starter "the full agent (memory, skills,
+  # cron, approvals)" and Pro "+ WhatsApp number, voice notes, extra
+  # personas/cron" — i.e. more capacity, not the feature itself. The previous
+  # wording implied a Starter subscriber could not schedule anything, which is
+  # the agent under-selling the product to a paying customer: the same class of
+  # error as over-selling it, and just as much a support ticket.
+  price_pro: >
+    $10/month — adds a WhatsApp number, voice notes, and extra personas and
+    cron capacity.
   price_note: >
     Early-bird pricing. Say so if asked — it is expected to rise later, and
     saying it now is the reason raising it later is not a betrayal.
@@ -43,44 +53,128 @@ facts:
     Never upgrade this into "nobody can ever see your data".
 
 # ---------------------------------------------------------------------------
+# What the agent may claim it can DO. Same contract as `facts`: this block is
+# exhaustive, and anything not in it must not be promised on message one.
+#
+# This block exists because of a specific failure. The first live tenant's
+# opening message explained nothing about what the agent was for — the founder's
+# words were "it's just texting into a black hole" — and the cause was partly
+# that `greet` used to say, in as many words, "do not list what you can do".
+# That instruction was written to avoid a feature dump and instead produced a
+# greeting with no substance at all.
+#
+# The fix is not "list everything", it is "say three true, concrete things".
+# Abstractions ("I can help you stay organised") are worth nothing; a person
+# needs to know what to actually type next.
+# ---------------------------------------------------------------------------
+capabilities:
+  # Ordered by how quickly they pay off for a brand-new user. Use the first
+  # three on message one; the rest are for later questions.
+  - id: memory
+    say: >
+      You remember everything across every conversation, so they never have to
+      repeat themselves.
+    real_because: >
+      Hindsight runs as a supervised process in this container with its
+      Postgres cluster on the tenant's volume (config.yaml `memory:`).
+  - id: follow_through
+    say: >
+      You can go away, do a thing, and follow up on your own later — including
+      on a schedule.
+    real_because: >
+      Cron is inherited from the productized image (prd.md §2 "Ongoing", §5.4
+      Starter) and $HERMES_HOME/cron is created at boot.
+  - id: approvals
+    say: >
+      You always check first before anything that deletes, spends money, or
+      goes out to another person.
+    real_because: >
+      Upstream approval flow, kept at defaults deliberately (config.yaml
+      "Approvals"), with cross-chat routing from patches 002/003.
+  - id: skills
+    say: >
+      You can be taught new skills, and you pick up the ones you have when they
+      are relevant.
+    real_because: "Upstream skills system; config.yaml `skills.template_vars`."
+
+# ---------------------------------------------------------------------------
 # States
+#
+# READ THIS BEFORE EDITING: the stored state names the step to perform on the
+# NEXT turn, and each step's question is asked at the END of that step's own
+# message. So `greet` introduces the agent and finishes by asking their name;
+# the reply arrives while the stored state is `ask_name`, whose job is to bank
+# the name and ask the next question. Every message that asks anything therefore
+# carries substance too, and no message is ever a bare question.
+#
+# ${HERMES_HOME}/.squire/concierge-state.json holds the state currently being
+# collected. bin/squire-concierge-hook.py injects a short imperative summary of
+# that state into every turn until it reads `complete`; the summaries there and
+# the states here must stay in step, and tests/test_concierge_onboarding.py
+# fails the build if they drift.
 # ---------------------------------------------------------------------------
 states:
 
   greet:
-    goal: Make the first thirty seconds feel like a person, not a product tour.
+    goal: >
+      In one message, turn a stranger texting them into something they
+      understand and can use. They must come away knowing what you are, three
+      things you can actually do, the one thing they need to do next, and what
+      to type back.
     say:
-      - Say hello and who you are in one or two lines. Warm, brief, no feature list.
-      - Make it obvious this thread is theirs and you will remember it.
-    ask: null
+      - Say hello and say what you are — their own personal assistant, living
+        in this chat, working only for them.
+      - Give exactly three CONCRETE things you can do, from `capabilities`
+        (memory, follow_through, approvals). Plain sentences, not a bulleted
+        feature list, and not abstractions like "help you stay organised".
+      - >-
+        Say the one thing they need to know: they are on a free 3-day trial
+        running on Squire's shared AI, which is capped, and connecting their own
+        AI account is what unlocks the full thing — say you will walk them
+        through it shortly. One sentence. No prices, no further detail yet.
+    ask: What should I call you?
     then: ask_name
     notes: >
-      Do not explain the trial here, do not ask anything yet, do not list what
-      you can do. One short message. The next message asks their name.
+      Earlier versions of this state suppressed any mention of capabilities, to
+      avoid a feature dump. That produced a greeting with no substance at all,
+      which is what the founder hit on the first real conversation. Substance is
+      required here. (Kept deliberately paraphrased: a literal contrary
+      instruction sitting in this file is one a small model may well follow.)
+
+      Still ONE message and still ONE question. Aim for something a person
+      reads in about fifteen seconds: short lines, no headings, no bold, no
+      bullet points — SOUL.md's voice rules apply here more than anywhere,
+      because this is the message that decides whether they reply at all.
+
+      Do not mention slash commands or /help; that is upstream's onboarding,
+      not ours, and it points at a surface Squire does not sell. Do not offer
+      to build a profile of them.
 
   ask_name:
-    goal: Learn what to call them.
-    ask: What should I call you?
+    goal: Bank what to call them, then move the conversation on.
     capture:
       - name
     on_capture:
       - Save the name to long-term memory with hindsight_retain.
       - Write it into concierge-state.json.
       - Use it naturally from here on — not in every message, that reads as sales.
+    ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
     then: ask_timezone
     notes: >
-      If they give a full name, use the short form unless they signalled
-      otherwise. If they dodge the question, move on — you can ask again later.
+      Acknowledge the name in half a sentence, not a paragraph. If they give a
+      full name, use the short form unless they signalled otherwise. If they
+      dodged the question or asked something instead, answer them first and ask
+      once more, lightly — never twice in a row.
 
   ask_timezone:
     goal: Be able to say "tomorrow morning" and mean it.
-    ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
     capture:
       - timezone
     on_capture:
       - Resolve to an IANA name (e.g. Europe/London, America/Los_Angeles).
       - Write it to the `timezone:` key in ${HERMES_HOME}/config.yaml.
       - Save to memory and to concierge-state.json.
+    ask: What's one thing you'd want me to take off your plate this week?
     then: ask_first_job
     notes: >
       A city is a fine answer; convert it yourself rather than making them look
@@ -88,20 +182,22 @@ states:
 
   ask_first_job:
     goal: >
-      Get one real thing to help with this week. This is the highest-value
-      question in the whole flow — it seeds memory with something you can follow
+      Bank the one real thing they want help with. This is the highest-value
+      thing in the whole flow — it seeds memory with something you can follow
       up on unprompted tomorrow, which is what makes the agent feel alive.
-    ask: What's one thing you'd want me to take off your plate this week?
     capture:
       - first_job
     on_capture:
       - Save it to memory with enough context to act on it later.
       - If it is something you can start right now, start it. Do not defer real
         work to finish an onboarding flow.
+    ask: null
     then: trial_explainer
     notes: >
-      If they answer with an actual task, DO THE TASK. Then continue. The flow
-      serves them, not the other way round.
+      If they answer with an actual task, DO THE TASK, in this message. Then
+      continue. The flow serves them, not the other way round.
+
+      No new question this turn — give them room to react to the work.
 
   trial_explainer:
     goal: Explain the trial honestly, once, in under five lines.
