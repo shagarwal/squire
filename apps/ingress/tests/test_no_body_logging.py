@@ -50,6 +50,13 @@ def _assert_no_body_leak(caplog):
         message = record.getMessage()
         # The literal secret string must never appear anywhere in a log line.
         assert SECRET_MESSAGE_MARKER not in message
+        # Nor may the per-bot webhook secret. Ingress now re-stamps it on every
+        # forward (it is what lets a tenant tell a real forward from a forged
+        # POST, and therefore what protects first-contact owner binding), so it
+        # passes through more code paths than before -- including the retry
+        # buffer. A credential that gates account binding must never reach the
+        # log aggregator.
+        assert "correct-secret" not in message
         # Every log line from this service must be the structured JSON
         # object log_event() produces -- with *only* the allowed fields.
         # If some other code path ever calls logging directly (bypassing

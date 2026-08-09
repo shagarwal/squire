@@ -32,7 +32,7 @@ def test_tenant_buffer_drops_oldest_on_overflow(settings):
 async def test_retry_buffer_redelivers_on_success(settings, fake_clock):
     attempts = []
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         attempts.append((internal_url, body))
         return True  # tenant is awake, delivery succeeds immediately
 
@@ -56,7 +56,7 @@ async def test_retry_buffer_backs_off_and_eventually_succeeds(settings, fake_clo
     # Fail the first two attempts, then succeed.
     results = iter([False, False, True])
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         return next(results)
 
     rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
@@ -76,7 +76,7 @@ async def test_retry_buffer_backs_off_and_eventually_succeeds(settings, fake_clo
 
 
 async def test_retry_buffer_gives_up_after_max_age(settings, fake_clock):
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         return False  # tenant never comes back
 
     rb = RetryBuffer(settings, forward_fn, clock=fake_clock)
@@ -92,7 +92,7 @@ async def test_retry_buffer_gives_up_after_max_age(settings, fake_clock):
 async def test_retry_preserves_fifo_order_per_tenant(settings, fake_clock):
     delivered = []
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         delivered.append(body)
         return True
 
@@ -122,7 +122,7 @@ async def test_run_forever_survives_forward_fn_exceptions(settings, caplog):
 
     call_count = 0
 
-    async def forward_fn(internal_url: str, body: bytes) -> bool:
+    async def forward_fn(internal_url: str, body: bytes, webhook_secret: str = "") -> bool:
         nonlocal call_count
         call_count += 1
         raise RuntimeError("boom -- simulated unexpected failure")

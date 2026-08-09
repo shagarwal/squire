@@ -66,13 +66,39 @@ deliberately a one-shot, not a policy:
   own encrypted volume and is never reported outward — the heartbeat holds no
   chat or user ids by design, and this must not become the exception.
 
+* Authenticated requests only. The caller (squire-webhook-shim.py) binds only
+  when the request carries the correct per-bot secret, which ingress re-stamps
+  on every forward. Without that check, "can reach this tenant's port" would
+  equal "is its permanent owner" — and the fleet-wide INTERNAL_API_TOKEN is
+  readable by every trial tenant's own agent, so it must NOT be the credential
+  that gates this. An unauthenticated update is still delivered; it just cannot
+  bind, and degrades to the pairing code, which is visible and recoverable.
+
 The residual exposure is one message wide: between the container becoming
-reachable and the owner tapping Start, anyone who knows the pool bot's handle
-could bind themselves. That is strictly narrower than the alternatives (which
-are open forever), it requires knowing an unadvertised handle in a small window,
-and the blast radius is one empty trial tenant with no data in it. If that ever
-becomes unacceptable, the fix is for control-api to pass the expected owner id
-once signup can learn it, and for this module to require a match.
+reachable and the owner tapping Start, an attacker who holds a valid per-bot
+secret could bind themselves. That secret is known only to Telegram,
+control-api and the tenant. That is strictly narrower than the alternatives
+(which are open forever), and the blast radius is one empty trial tenant with
+no data in it. If that ever becomes unacceptable, the fix is for control-api to
+pass the expected owner id once signup can learn it, and for this module to
+require a match.
+
+KNOWN LIMITS, stated so nobody discovers them the hard way
+----------------------------------------------------------
+* POLLING MODE HAS NO AUTOPAIR. This runs in the webhook shim, which only sees
+  updates when the adapter is in webhook mode (TELEGRAM_WEBHOOK_URL set). A
+  tenant running long polling — local `docker run`, or any future
+  ingress-less deployment — never calls this and gets upstream's pairing code.
+  That is correct for a hand-run dev container and wrong for production; if
+  polling ever ships to customers this must move (a `pre_gateway_dispatch`
+  plugin is the natural home).
+* REVOKING THE LAST APPROVED USER RE-ARMS TRUST-ON-FIRST-USE. The trigger is
+  "the approved store is empty", not "this tenant is new". So
+  `hermes pairing revoke <platform> <id>` on the only owner returns the tenant
+  to first-contact state, and the next authenticated message binds whoever sent
+  it. For the intended flow (rebinding a tenant to a new owner) that is the
+  useful behaviour; it is documented here because it is not the behaviour the
+  phrase "first contact" implies on its own.
 """
 
 from __future__ import annotations
@@ -80,9 +106,26 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 PLATFORM = "telegram"
+
+# Serialises read -> check-empty -> write in maybe_bind_owner.
+#
+# The shim is a ThreadingHTTPServer, so concurrent updates run this
+# concurrently. Without the lock, the empty-store check and the write are not
+# atomic and several callers can clear the check before any of them writes.
+# Under an 8-thread burst the STORE still came out single-owner every time --
+# every writer was racing to write a set of size one, and the write is a
+# whole-file atomic replace -- but the RETURN VALUE lied: more than one caller
+# was told "you bound the owner", and each of those then defanged its own
+# /start. The durable state was fine; the contract was not.
+#
+# Per-process, which is sufficient: the shim is the only writer in this
+# container. Upstream's PairingStore has the same scope (a threading.RLock).
+_BIND_LOCK = threading.Lock()
 
 
 def pairing_dir(hermes_home: str | os.PathLike) -> Path:
@@ -262,18 +305,40 @@ def defang_start_command(update: dict) -> bool:
     # carried, and a future signup flow may use it to correlate the tenant.
     msg["text"] = (f"start {rest}".strip() if rest.strip() else "start")
 
-    # Telegram marks the command span in entities; leaving a bot_command entity
-    # pointing at text that is no longer a command is inconsistent, and adapters
-    # do read entities.
+    # Telegram marks the command span in entities. Two things have to happen and
+    # only one of them is obvious:
+    #
+    #   1. drop the leading bot_command entity — leaving it would point at text
+    #      that is no longer a command, and adapters do read entities;
+    #   2. SHIFT every surviving entity left by one, because we removed one
+    #      character from the front of the string. Entity offsets are absolute
+    #      indices into the text, so a mention or a link after the command would
+    #      otherwise be off by one and highlight the wrong characters.
+    #
+    # An entity anchored at offset 0 covered the slash itself, so it loses a
+    # character rather than moving; if that empties it, it is dropped.
     entities = msg.get("entities")
     if isinstance(entities, list):
-        remaining = [
-            e for e in entities
-            if not (isinstance(e, dict) and e.get("type") == "bot_command"
-                    and e.get("offset") == 0)
-        ]
-        if remaining:
-            msg["entities"] = remaining
+        shifted = []
+        for e in entities:
+            if not isinstance(e, dict):
+                continue
+            offset = e.get("offset")
+            length = e.get("length")
+            if not isinstance(offset, int) or not isinstance(length, int):
+                continue
+            if offset == 0 and e.get("type") == "bot_command":
+                continue  # the command span itself
+            moved = dict(e)
+            if offset == 0:
+                moved["length"] = length - 1
+                if moved["length"] <= 0:
+                    continue
+            else:
+                moved["offset"] = offset - 1
+            shifted.append(moved)
+        if shifted:
+            msg["entities"] = shifted
         else:
             msg.pop("entities", None)
     return True
@@ -294,14 +359,13 @@ def maybe_bind_owner(hermes_home: str | os.PathLike, update: dict,
     try:
         path = approved_path(hermes_home, platform)
 
-        # Read FIRST and cheaply. Almost every call returns here.
+        # Cheap unlocked pre-check so the overwhelmingly common case (an
+        # established tenant, every message forever after the first) never
+        # contends on the lock.
         try:
-            approved = load_approved(path)
+            if load_approved(path):
+                return None
         except (OSError, ValueError, UnicodeDecodeError):
-            # Unreadable or corrupt. Refuse to bind: we cannot prove the store
-            # is empty, and overwriting it would revoke the real owner.
-            return None
-        if approved:
             return None
 
         sender = extract_sender(update)
@@ -309,29 +373,43 @@ def maybe_bind_owner(hermes_home: str | os.PathLike, update: dict,
             return None
         user_id, user_name = sender
 
-        # Re-read under the assumption another process may have won the race in
-        # between (the gateway approving a code, say). Upstream guards its own
-        # writes with an in-process lock only, so this is best-effort by
-        # construction — but the window is microseconds and the loser simply
-        # does not bind.
-        try:
-            if load_approved(path):
+        # Everything that decides ownership happens under the lock: re-read,
+        # confirm still empty, write, and verify. Doing the check outside it
+        # lets two concurrent first contacts both believe they bound the owner.
+        with _BIND_LOCK:
+            try:
+                approved = load_approved(path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                # Unreadable or corrupt. Refuse to bind: we cannot prove the
+                # store is empty, and overwriting it would revoke the real owner.
                 return None
-        except (OSError, ValueError, UnicodeDecodeError):
-            return None
+            if approved:
+                return None
 
-        import time
+            _atomic_write_0600(path, {
+                user_id: {
+                    "user_name": user_name,
+                    "approved_at": time.time(),
+                    # Provenance, so an operator reading this file later can tell
+                    # a trust-on-first-use binding from a deliberate `hermes
+                    # pairing approve`. Upstream ignores unknown keys.
+                    "approved_by": "squire-autopair-first-contact",
+                }
+            })
 
-        _atomic_write_0600(path, {
-            user_id: {
-                "user_name": user_name,
-                "approved_at": time.time(),
-                # Provenance, so an operator reading this file later can tell a
-                # trust-on-first-use binding from a deliberate `hermes pairing
-                # approve`. Upstream ignores unknown keys.
-                "approved_by": "squire-autopair-first-contact",
-            }
-        })
+            # Read back before claiming success. The caller uses a truthy return
+            # to decide whether to rewrite the user's message, so "I bound the
+            # owner" must mean the durable store actually says so and says US.
+            # A cross-process writer (the gateway approving a code at the same
+            # instant) can still land last; if it did, we did not win and must
+            # not report that we did.
+            try:
+                final = load_approved(path)
+            except (OSError, ValueError, UnicodeDecodeError):
+                return None
+            if list(final) != [user_id]:
+                return None
+
         return user_id
     except Exception:
         return None

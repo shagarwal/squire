@@ -35,6 +35,13 @@ TELEGRAM_WEBHOOK_PORT           adapter's local port (default 8443)
 TELEGRAM_WEBHOOK_SECRET         stamped onto forwarded requests
 SQUIRE_WEBHOOK_REQUIRE_AUTH     "true" => reject unauthenticated posts (see below)
 INTERNAL_API_TOKEN              shared secret with ingress, if it sends one
+SQUIRE_AUTOPAIR                 "false" => never bind an owner on first contact;
+                                fall back to upstream's pairing-code ceremony.
+                                Default true. Note that binding ALWAYS requires
+                                an authenticated request regardless of this flag
+                                and of SQUIRE_WEBHOOK_REQUIRE_AUTH.
+HERMES_HOME                     tenant state root (default /opt/data); the
+                                pairing store written by autopair lives under it
 """
 
 from __future__ import annotations
@@ -64,8 +71,14 @@ TENANT_ID = os.environ.get("TENANT_ID", "")
 # instead of a greeting. See squire_autopair.py for the full rationale and the
 # security semantics. HERMES_HOME is the mounted volume, so the binding is
 # durable. SQUIRE_AUTOPAIR=false restores upstream's pairing-code ceremony.
-HERMES_HOME = os.environ.get("HERMES_HOME", "/opt/data")
-AUTOPAIR_ENABLED = os.environ.get("SQUIRE_AUTOPAIR", "true").lower() in (
+HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
+# `or "true"` rather than a get() default: an env var that is SET BUT EMPTY
+# (trivially produced by `-e SQUIRE_AUTOPAIR=` or an unset shell variable in a
+# compose file) would otherwise read as "" and silently disable owner binding.
+# The symptom — every tenant asking for a pairing code — looks nothing like its
+# cause. Same reasoning for HERMES_HOME above, where an empty value would send
+# the pairing store to a relative path.
+AUTOPAIR_ENABLED = (os.environ.get("SQUIRE_AUTOPAIR") or "true").lower() in (
     "1", "true", "yes", "on",
 )
 
@@ -283,7 +296,34 @@ class Handler(BaseHTTPRequestHandler):
         #
         # Never fatal, and never blocks delivery: maybe_bind_owner swallows its own
         # errors, and a failure here just means the tenant pairs the upstream way.
-        if AUTOPAIR_ENABLED and maybe_bind_owner is not None:
+        # AUTHENTICATION IS MANDATORY FOR BINDING, regardless of REQUIRE_AUTH.
+        #
+        # REQUIRE_AUTH governs DELIVERY and stays false: an unauthenticated POST
+        # is still forwarded, because refusing delivery on a header disagreement
+        # would silently break every tenant. Binding is a different matter.
+        #
+        # Trust-on-first-use turns "can reach this port" into "is the permanent
+        # owner of this tenant". Before autopair, forging an update to a
+        # not-yet-bound tenant got you a useless pairing code; with it, it is
+        # account takeover, and the real customer has no shell to recover from
+        # it. So an unauthenticated update may be delivered but may NEVER bind:
+        # it degrades to upstream's pairing-code path, which is visible to the
+        # owner and recoverable by an operator.
+        #
+        # The credential is the PER-BOT secret (ingress re-stamps it on every
+        # forward). Deliberately not the fleet-wide INTERNAL_API_TOKEN: every
+        # trial tenant's own agent can read that out of its environment, so it
+        # is exactly the credential an attacker already holds.
+        may_bind = AUTOPAIR_ENABLED and maybe_bind_owner is not None and _authorised(self.headers)
+        if AUTOPAIR_ENABLED and maybe_bind_owner is not None and not may_bind:
+            # Loud, because this is either an attack or a misconfigured ingress,
+            # and the symptom the user reports ("it asked me for a pairing code")
+            # is otherwise indistinguishable between the two.
+            log("unauthenticated update: NOT binding owner (falling back to "
+                "upstream pairing). If this is a real first contact, ingress is "
+                "not stamping X-Telegram-Bot-Api-Secret-Token.")
+
+        if may_bind:
             try:
                 update = json.loads(body.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):

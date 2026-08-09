@@ -34,8 +34,12 @@ from typing import Awaitable, Callable, Deque, Dict
 from .config import Settings
 from .logging import log_event
 
-# forward_fn(internal_url, body) -> True if delivered, False if still failing.
-ForwardFn = Callable[[str, bytes], Awaitable[bool]]
+# forward_fn(internal_url, body, webhook_secret) -> True if delivered.
+# The secret travels with the retry too: a buffered update is usually a SLEEPING
+# tenant's very first message, which is exactly the first-contact update whose
+# authenticity decides owner binding. Dropping the header on the retry path
+# would mean the wake path silently degrades to a pairing code.
+ForwardFn = Callable[[str, bytes, str], Awaitable[bool]]
 
 
 @dataclass
@@ -60,9 +64,11 @@ class TenantBuffer:
     contract asks for, with no extra bookkeeping needed.
     """
 
-    def __init__(self, tenant_id: str, internal_url: str, maxsize: int) -> None:
+    def __init__(self, tenant_id: str, internal_url: str, maxsize: int,
+                 webhook_secret: str = "") -> None:
         self.tenant_id = tenant_id
         self.internal_url = internal_url
+        self.webhook_secret = webhook_secret
         self.items: Deque[QueuedUpdate] = deque(maxlen=maxsize)
 
     def enqueue(self, body: bytes, bot_id: int, now: float, initial_delay: float) -> bool:
@@ -97,23 +103,30 @@ class RetryBuffer:
         self._clock = clock
         self._buffers: Dict[str, TenantBuffer] = {}
 
-    def get_or_create(self, tenant_id: str, internal_url: str) -> TenantBuffer:
+    def get_or_create(self, tenant_id: str, internal_url: str,
+                      webhook_secret: str = "") -> TenantBuffer:
         buf = self._buffers.get(tenant_id)
         if buf is None:
-            buf = TenantBuffer(tenant_id, internal_url, self._settings.queue_max_size)
+            buf = TenantBuffer(tenant_id, internal_url, self._settings.queue_max_size,
+                               webhook_secret)
             self._buffers[tenant_id] = buf
         else:
             # internal_url can shift across redeploys / fresh cache lookups;
             # always retry against the freshest known address.
             buf.internal_url = internal_url
+            # Same for the secret: control-api can rotate it, and a retry with
+            # a stale secret would be refused by the tenant's own check.
+            if webhook_secret:
+                buf.webhook_secret = webhook_secret
         return buf
 
     def queue_depth(self, tenant_id: str) -> int:
         buf = self._buffers.get(tenant_id)
         return len(buf) if buf is not None else 0
 
-    def enqueue(self, tenant_id: str, internal_url: str, bot_id: int, body: bytes) -> None:
-        buf = self.get_or_create(tenant_id, internal_url)
+    def enqueue(self, tenant_id: str, internal_url: str, bot_id: int, body: bytes,
+                webhook_secret: str = "") -> None:
+        buf = self.get_or_create(tenant_id, internal_url, webhook_secret)
         now = self._clock()
         overflowed = buf.enqueue(body, bot_id, now, self._settings.retry_initial_delay)
         log_event("buffer_enqueue", bot_id=bot_id, tenant_id=tenant_id, queue_depth=len(buf))
@@ -153,7 +166,7 @@ class RetryBuffer:
             if item.next_attempt_at > now:
                 break  # front item not due yet; everything behind it is even newer
 
-            ok = await self._forward_fn(buf.internal_url, item.body)
+            ok = await self._forward_fn(buf.internal_url, item.body, buf.webhook_secret)
             if ok:
                 buf.items.popleft()
                 log_event(

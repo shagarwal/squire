@@ -236,8 +236,33 @@ u = dm(1, text="/start")
 u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
                             {"type": "bold", "offset": 0, "length": 1}]
 defang_start_command(u)
-check("other entities survive",
-      u["message"]["entities"] == [{"type": "bold", "offset": 0, "length": 1}],
+check("entity covering only the slash is dropped",
+      "entities" not in u["message"], u["message"].get("entities"))
+
+# Surviving entities must SHIFT LEFT: we removed one character from the front of
+# the text and entity offsets are absolute indices. An earlier version of this
+# test asserted the UNshifted offsets and so encoded the off-by-one as correct.
+u = dm(1, text="/start ref_abc")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
+                            {"type": "code", "offset": 7, "length": 7}]
+defang_start_command(u)
+check("command entity dropped, later entities shift left by one",
+      u["message"]["entities"] == [{"type": "code", "offset": 6, "length": 7}],
+      u["message"].get("entities"))
+# The real assertion behind the arithmetic: the span still covers the same text.
+txt = u["message"]["text"]
+ent = u["message"]["entities"][0]
+check("shifted entity still spans 'ref_abc'",
+      txt[ent["offset"]:ent["offset"] + ent["length"]] == "ref_abc",
+      repr(txt[ent["offset"]:ent["offset"] + ent["length"]]))
+
+# An entity anchored at 0 covered the slash, so it shrinks rather than moves.
+u = dm(1, text="/start")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
+                            {"type": "bold", "offset": 0, "length": 3}]
+defang_start_command(u)
+check("entity covering the slash shrinks instead of moving",
+      u["message"]["entities"] == [{"type": "bold", "offset": 0, "length": 2}],
       u["message"].get("entities"))
 
 # Everything else must be left strictly alone — this must not become a general
@@ -251,6 +276,42 @@ for label, text in (("ordinary text", "hello"), ("another command", "/help"),
 check("non-text message untouched",
       defang_start_command({"message": {"chat": {"type": "private"}}}) is False)
 check("non-dict untouched", defang_start_command([]) is False)
+
+print("== 10. concurrent first contacts: exactly ONE caller may be told it won ==")
+# The shim is a ThreadingHTTPServer, so this genuinely runs concurrently. The
+# store came out single-owner even before the lock — every writer was racing to
+# write a set of size one — but the RETURN VALUE lied, and the caller uses it to
+# decide whether to rewrite the user's message. N-1 users would have had their
+# /start defanged and then been handed a pairing code.
+import threading  # noqa: E402
+
+for attempt in range(20):
+    h = fresh_home()
+    barrier = threading.Barrier(8)
+    winners: list[str] = []
+    lock = threading.Lock()
+
+    def racer(uid: int) -> None:
+        barrier.wait()
+        got = maybe_bind_owner(h, dm(uid, f"u{uid}"))
+        if got:
+            with lock:
+                winners.append(got)
+
+    threads = [threading.Thread(target=racer, args=(2000 + i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    store = read_store(h)
+    if len(winners) != 1 or list(store) != winners:
+        check(f"exactly one winner (attempt {attempt})", False,
+              f"winners={winners} store={list(store)}")
+        break
+else:
+    check("exactly one winner across 20 x 8-thread races", True)
+    check("store agrees with the reported winner", True)
 
 print()
 if failures:

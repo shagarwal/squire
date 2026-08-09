@@ -307,7 +307,35 @@ try:
             "text": "/start",
         },
     }
-    status, _ = post("/webhook/telegram", first)
+    AUTH = {"X-Telegram-Bot-Api-Secret-Token": SECRET}
+
+    # --- an UNAUTHENTICATED first contact must never bind ------------------
+    # This is the account-takeover path: without the check, anyone who can reach
+    # the tenant's port forges a first message to a not-yet-bound tenant and
+    # becomes its permanent owner, with no shell for the customer to recover.
+    # It must still be DELIVERED (refusing delivery on a header disagreement
+    # would break every tenant) — it just falls back to the pairing code.
+    forged = json.loads(json.dumps(first))
+    forged["update_id"] = 899
+    forged["message"]["from"]["id"] = 6666
+    forged["message"]["chat"]["id"] = 6666
+    status, _ = post("/webhook/telegram", forged)
+    check("unauthenticated update still delivered", status == 200, status)
+    check("unauthenticated update did NOT bind an owner", not approved.exists(),
+          str(approved))
+    if received:
+        fwdf = json.loads(received[0]["body"])
+        check("unauthenticated /start forwarded VERBATIM",
+              fwdf["message"]["text"] == "/start", fwdf["message"].get("text"))
+
+    # A wrong secret is no better than none.
+    received.clear()
+    post("/webhook/telegram", forged, headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"})
+    check("wrong secret did NOT bind an owner", not approved.exists(), str(approved))
+
+    # --- the real, authenticated first contact -----------------------------
+    received.clear()
+    status, _ = post("/webhook/telegram", first, headers=AUTH)
     check("first contact still forwards (200)", status == 200, status)
     check("owner was bound during that request", approved.exists(), str(approved))
     if approved.exists():
@@ -330,9 +358,21 @@ try:
     second["update_id"] = 901
     second["message"]["from"]["id"] = 999999
     second["message"]["chat"]["id"] = 999999
-    post("/webhook/telegram", second)
+    received.clear()
+    post("/webhook/telegram", second, headers=AUTH)
     store = json.loads(approved.read_text())
     check("second user not auto-approved", list(store) == ["424242"], list(store))
+
+    # "One message wide" is a claim about the FORWARDED BODY, not just the store.
+    # Asserting only on the store let a mutant survive that bound once but went on
+    # defanging every later /start: the store stayed correct while every
+    # subsequent user's command was silently rewritten. Inspect the bytes.
+    if received:
+        fwd2 = json.loads(received[0]["body"])
+        check("second /start forwarded VERBATIM (still a command)",
+              fwd2["message"]["text"] == "/start", fwd2["message"].get("text"))
+        check("second update otherwise intact",
+              fwd2["message"]["from"]["id"] == 999999, fwd2["message"]["from"])
 finally:
     proc.terminate()
     proc.wait(timeout=10)
@@ -343,6 +383,41 @@ finally:
     # shared aggregator, so the log line must be present but the id must not.
     check("shim logged the binding", "bound tenant owner" in out, out[-200:])
     check("owner id absent from logs", "424242" not in out, out[-200:])
+    check("refusal to bind is logged loudly", "NOT binding owner" in out, out[-300:])
+    check("per-bot secret absent from logs", SECRET not in out, out[-200:])
+
+print("== SQUIRE_AUTOPAIR=false restores the upstream pairing ceremony ==")
+received.clear()
+home2 = tempfile.mkdtemp()
+approved2 = pathlib.Path(home2) / "platforms" / "pairing" / "telegram-approved.json"
+adapter3 = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), FakeAdapter)
+adapter3.daemon_threads = True
+threading.Thread(target=adapter3.serve_forever, daemon=True).start()
+proc = run({"SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH, "HERMES_HOME": home2,
+            "SQUIRE_AUTOPAIR": "false"})
+try:
+    optout = {
+        "update_id": 950,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 777001, "is_bot": False, "first_name": "owner"},
+            "chat": {"id": 777001, "type": "private"},
+            "text": "/start",
+        },
+    }
+    status, _ = post("/webhook/telegram", optout,
+                     headers={"X-Telegram-Bot-Api-Secret-Token": SECRET})
+    check("opt-out still delivers", status == 200, status)
+    check("opt-out binds nobody", not approved2.exists(), str(approved2))
+    if received:
+        fwd3 = json.loads(received[0]["body"])
+        check("opt-out forwards /start verbatim",
+              fwd3["message"]["text"] == "/start", fwd3["message"].get("text"))
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    adapter3.shutdown()
+    adapter3.server_close()
 
 print()
 if failures:

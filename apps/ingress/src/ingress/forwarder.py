@@ -14,12 +14,36 @@ async def forward_update(
     *,
     connect_timeout: float,
     total_timeout: float,
+    webhook_secret: str = "",
 ) -> bool:
     """POST `body` verbatim to `<internal_url>/webhook/telegram`.
 
     We deliberately do not parse or mutate the body -- it is passed through
     as opaque bytes, both here and in the retry buffer, so there is no code
     path where this service inspects Telegram payload fields.
+
+    `webhook_secret` is re-stamped as X-Telegram-Bot-Api-Secret-Token so the
+    tenant can tell an ingress-forwarded update from an arbitrary POST to its
+    port. We verified this same secret on the way in (app.py) and then dropped
+    it; the tenant needs it too, and for a stronger reason than it looks.
+
+    WHY THIS IS A SECURITY CONTROL AND NOT PLUMBING
+    -----------------------------------------------
+    The tenant image binds its owner on first contact (trust on first use). If
+    the tenant cannot distinguish a real forwarded update from a forged one,
+    anyone able to reach a tenant's port can send a synthetic "first message"
+    to a not-yet-bound tenant and become its permanent owner -- and the real
+    customer has no shell to recover it. Before trust-on-first-use the same
+    forgery only yielded a useless pairing code; afterwards it is account
+    takeover, so the tenant must be able to refuse.
+
+    Deliberately the PER-BOT secret, not the fleet-wide internal token: every
+    trial tenant's own agent can read INTERNAL_API_TOKEN out of its environment,
+    so the fleet token is precisely the credential an attacker already has. The
+    per-bot secret is known only to Telegram, control-api and that one tenant.
+
+    The value is never logged -- see logging.log_event's field allowlist and
+    tests/test_no_body_logging.py.
 
     Returns True on any 2xx response from the tenant. Returns False on
     timeout, connection refused, or any other network-level failure, *and*
@@ -30,11 +54,14 @@ async def forward_update(
     """
     url = internal_url.rstrip("/") + "/webhook/telegram"
     timeout = httpx.Timeout(total_timeout, connect=connect_timeout)
+    headers = {"Content-Type": "application/json"}
+    if webhook_secret:
+        headers["X-Telegram-Bot-Api-Secret-Token"] = webhook_secret
     try:
         resp = await client.post(
             url,
             content=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=timeout,
         )
     except httpx.HTTPError:
