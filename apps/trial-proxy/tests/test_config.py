@@ -148,22 +148,25 @@ def test_the_tenant_images_default_model_is_reachable_through_this_proxy():
     )
 
 
-def test_no_model_list_entry_hardcodes_a_non_haiku_anthropic_model(config):
-    """Guard against silently widening the trial key's blast radius: every
-    model this trial proxy can reach must resolve to a Haiku-class model.
-    (We deliberately don't use LiteLLM's provider-wildcard routing for this
-    exact reason -- see config.yaml's model_list comments.)"""
+def test_no_model_list_entry_reaches_an_opus_class_model(config):
+    """Guard the trial key's blast radius: fail closed against expensive models.
+
+    Originally this asserted every entry was Haiku-class. The trial model was
+    raised to Sonnet on 2026-08-09 (founder decision: onboarding is pure
+    instruction-following and a small model ignoring the concierge directive is
+    what produced the first live tenant's two-line greeting). The GUARD's intent
+    is unchanged and still load-bearing -- a trial tenant must never be able to
+    reach an Opus-class model and drain the $2 cap in a couple of calls -- so
+    the ceiling moved rather than disappeared. Anything above Sonnet is banned.
+    """
+    banned = ("opus",)
     for entry in config["model_list"]:
-        underlying_model = entry["litellm_params"]["model"]
-        assert "haiku" in underlying_model.lower(), (
+        underlying_model = entry["litellm_params"]["model"].lower()
+        assert not any(b in underlying_model for b in banned), (
             f"model_list entry {entry.get('model_name')!r} maps to "
-            f"{underlying_model!r}, which is not Haiku-class -- every "
-            f"model reachable via this trial proxy must be Haiku-class "
-            f"per the $2 hard-budget / low-abuse-value design"
-        )
-        assert underlying_model.startswith("anthropic/"), (
-            f"model_list entry {entry.get('model_name')!r} maps to "
-            f"{underlying_model!r}, expected an anthropic/* model id"
+            f"{underlying_model!r}, which is above the Sonnet ceiling. The trial "
+            "key must not be able to reach it -- see the no-wildcard-routing "
+            "rationale in config.yaml."
         )
 
 

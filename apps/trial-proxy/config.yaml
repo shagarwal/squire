@@ -69,12 +69,32 @@ model_list:
   # see https://docs.litellm.ai/docs/wildcard_routing) even though it would
   # sidestep this exact-name-matching problem: wildcard routing forwards
   # whatever model name the caller asks for straight to Anthropic, which
-  # would let a trial tenant request e.g. `claude-opus-4-1` and burn the
+  # would let a trial tenant request e.g. an Opus-class model and burn the
   # $2 cap in a couple of calls. Every model this trial key can reach must be
-  # an explicit, Haiku-pinned entry below — an unrecognized model name should
-  # fail closed (400), not fail open onto an expensive model.
-  # The alias production actually hits: hermes sends its configured
-  # `provider:model` string verbatim as the request's `model` field.
+  # an explicit entry below, and none of them may be Opus-class — an
+  # unrecognized model name should fail closed (400), not fail open onto an
+  # expensive model. (Ceiling raised from Haiku to Sonnet on 2026-08-09; the
+  # rule is "no model above Sonnet", enforced by tests/test_config.py.)
+  # Sonnet-class trial model (raised from Haiku 2026-08-09, founder decision).
+  # Rationale: onboarding is the highest-leverage message in the product's life
+  # and it is entirely instruction-following — a small model ignoring the
+  # concierge directive is exactly how the first live tenant produced a two-line
+  # greeting. The $2 per-key hard cap still bounds spend; see the budget note in
+  # docs/implementation-plan.md about what that cap buys at Sonnet prices.
+  - model_name: "anthropic:claude-sonnet-5"
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Haiku aliases retained: cheaper fallback we can flip tenants back to without
+  # a proxy redeploy, and trial-default still points here for non-chat callers.
+  # The alias production hits: hermes sends its configured `provider:model`
+  # string verbatim as the request's `model` field.
   - model_name: "anthropic:claude-haiku-4-5"
     litellm_params:
       model: anthropic/claude-haiku-4-5
