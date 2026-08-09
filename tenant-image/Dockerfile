@@ -293,6 +293,24 @@ RUN /usr/local/bin/restic version
 #
 # Copied without a blanket --chmod: markers.tsv and the .patch files are data
 # and have no business being executable. Only the two scripts get the bit.
+# `patch` is NOT in the upstream image. Its apt line installs ca-certificates,
+# curl, python3, ripgrep, ffmpeg, the build toolchain, git, openssh-client,
+# docker-cli and xz-utils — no patch(1). The second CI build died here, and the
+# error was actively misleading: apply-patches.sh ran `patch --dry-run`, got
+# "command not found", and reported "001 does not apply to /opt/hermes", which
+# sent us looking for a drifted source tree that was never the problem. The
+# script now checks for the binary explicitly (see its header), but the real fix
+# is to install it.
+#
+# Why patch(1) and not `git apply`, which IS present: our patches were generated
+# against a June tree and land on v2026.8.3 with large line offsets (001 +549,
+# 002 +2087, 003 +1620). Offset tolerance is exactly what patch(1) is for.
+# git apply is stricter about context location and would turn a survivable
+# offset into a build failure on the next upstream bump.
+RUN apt-get -o Acquire::Retries=3 update \
+ && apt-get -o Acquire::Retries=3 install -y --no-install-recommends patch \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY patches/ /opt/squire/patches/
 RUN chmod 0755 /opt/squire/patches/*.sh \
  && /opt/squire/patches/apply-patches.sh /opt/hermes \

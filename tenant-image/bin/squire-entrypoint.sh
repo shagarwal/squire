@@ -50,6 +50,22 @@ SQUIRE_SUPERVISORD_CONF="${SQUIRE_SUPERVISORD_CONF:-/opt/squire/supervisord.conf
 
 VOLUME_PATH="${SQUIRE_VOLUME:-/opt/data}"
 
+# --- Preflight: are the helpers we shell out to actually runnable? ----------
+# Cheap, and it converts a whole class of silent breakage into one clear line.
+# The scripts below are invoked as executables, not via `bash <file>`, so a
+# checkout that lost the exec bit (git records mode; a Windows/WSL working tree
+# reports 777 for everything and hides the difference) turns every call into
+# Permission denied. Downstream that looked like "sealing just didn't happen".
+for _helper in squire-secrets-sync.sh squire-hindsight-env.sh; do
+    if [ ! -x "$SQUIRE_BIN/$_helper" ]; then
+        die "$SQUIRE_BIN/$_helper is not executable.
+     The image sets 0755 via COPY --chmod, so this is a source checkout whose
+     exec bit was never recorded in git. Fix with:
+       git update-index --chmod=+x tenant-image/bin/$_helper"
+    fi
+done
+unset _helper
+
 log "tenant=${TENANT_ID:-<unset>} hermes_home=$HERMES_HOME home=${HOME:-<unset>} port=${PORT:-8080}"
 
 # ---------------------------------------------------------------------------
@@ -347,7 +363,19 @@ fi
 
 # Re-seal everything now so the volume is consistent even if the container is
 # killed before secrets-sync's first pass.
-"$SQUIRE_BIN/squire-secrets-sync.sh" --once || log "warning: initial reseal failed"
+# NOT `|| log warning`. That is what hid the second CI failure: the helper was
+# checked out non-executable, every invocation was Permission denied, nothing
+# was ever sealed onto the volume, and boot carried on looking healthy. A tenant
+# in that state accepts credentials, serves the user, and loses everything on
+# the next redeploy — the worst possible failure shape. If the first seal cannot
+# be completed, stop.
+if ! "$SQUIRE_BIN/squire-secrets-sync.sh" --once; then
+    die "initial credential seal FAILED — refusing to start.
+     Nothing has been written to $SECRETS_ENC_DIR, so this tenant would run with
+     credentials that exist only in tmpfs and vanish on the next redeploy.
+     Check that $SQUIRE_BIN/squire-secrets-sync.sh is executable and that
+     $STATE_DIR is writable."
+fi
 
 log "starting supervisord"
 exec "$SQUIRE_SUPERVISORD" -n -c "$SQUIRE_SUPERVISORD_CONF"
