@@ -14,7 +14,7 @@
 
 - [x] Railway CLI installed (v4.31.0) and authenticated as shaurya123@gmail.com — Claude drives Railway via `railway ... --json` in Bash.
 - [x] Official Railway MCP registered (`https://mcp.railway.com`, HTTP transport) — Shaurya: run `/mcp` once to complete OAuth when prompted.
-- [ ] Shaurya one-offs (only manual steps in the whole plan): upgrade Railway to **Pro** ($20/seat — needed for usage headroom and support), create Stripe account, create AWS account (KMS only), create Backblaze B2 bucket, create 1–2 Telegram accounts for the bot pool. Claude will prompt for each exactly when needed with `!`-prefixed commands where possible.
+- [ ] Shaurya one-offs (only manual steps in the whole plan): ~~upgrade Railway to **Pro**~~ (done 2026-08-08), create Stripe account, create AWS account (KMS only), create Backblaze B2 bucket, create 1–2 Telegram accounts for the bot pool. Claude will prompt for each exactly when needed with `!`-prefixed commands where possible.
 
 **Division of labor from here on:** Claude executes (Railway provisioning, deploys, env vars, logs, debugging) and reports; Shaurya approves spend, does OAuth/browser-only steps, and scans QR-free (no QR anywhere in this product — that died with Baileys).
 
@@ -62,32 +62,32 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 
 ### Task 0.1 — Repos & CI skeleton
 - [x] GitHub repo `squire` created and linked to this folder (2026-08-07); grow into monorepo layout: `apps/web`, `apps/control-api`, `apps/ingress`, `tenant-image/`, `infra/`, `docs/`.
-- [ ] Create Railway projects `squire-staging`, `squire-prod` — Claude via `railway init` / MCP.
-- [ ] GitHub Actions: build + push `tenant-image` to GHCR on tag; deploy `web`/`control-api`/`ingress` to Railway on merge (Railway GitHub integration or `railway up` with service tokens).
+- [x] Create Railway projects `squire-staging`, `squire-prod` — created 2026-08-08 via `railway init` (no services yet; RAILWAY_TOKEN_* GitHub secrets still to set).
+- [x] GitHub Actions: build + push `tenant-image` to GHCR on tag; deploy `web`/`control-api`/`ingress` to Railway on merge (`deploy.yml` matrix job + `test.yml` per-service suites; first tag build being debugged — torch +cpu wheel pin).
 
 ### Task 0.2 — Tenant image v0
-- [ ] Dockerfile: upstream hermes-agent pinned at current release tag + patch overlay applied at build (adapt `~/.hermes/patches/apply-patches.sh` + marker greps from `reference/hermes-update-plan-v2026.8.3.md` into a CI check) + supervisord running gateway + Hindsight daemon + embedded PG in one container.
-- [ ] Bake productized `~/.hermes` template: SOUL.md (de-personalized from Shaurya's), skills, config.yaml with Telegram adapter (webhook mode), Hindsight tuned per `reference/hindsight-optimization-guide.md`.
-- [ ] Concierge skill v1 (baked): greet → name/timezone → trial explainer → connect-your-LLM flow (state machine in config-adjacent file; 4 provider options with honest labels per PRD §2).
-- [ ] Secrets init shim: entrypoint decrypts DEK-encrypted `.env`/`auth.json` from volume into tmpfs before gateway start; DEK arrives via Railway service variable set per-tenant by `control-api` at creation (rotate = redeploy). *(Railway variables are visible to our API token — acceptable for alpha; Gate G2 below hardens this.)*
-- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s.
+- [x] Dockerfile: upstream hermes-agent pinned at v2026.8.3 (digest-pinned) + patch overlay (all four VPS patches vendored 2026-08-08, incl. 004; fail-closed marker CI check) + supervisord running gateway + Hindsight daemon + embedded PG in one container. *(First CI image build in progress — never built before merge.)*
+- [x] Bake productized `~/.hermes` template: SOUL.md (de-personalized), skills, config.yaml with Telegram adapter (webhook mode via shim), Hindsight tuned per guide (with corrections — guide's MAX_SLOTS knob was a deprecated no-op alias).
+- [x] Concierge skill v1 (baked): 9-state machine in `state-machine.yaml`, 4 provider options with honest labels.
+- [x] Secrets init shim: AES-256-GCM, plaintext only on tmpfs (/dev/shm), first-boot init, wrong-DEK boot refusal, volume-durability gates.
+- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s. *(Needs first live deploy.)*
 
 ### Task 0.3 — Control API v0 + provisioning
-- [ ] FastAPI + SQLModel on `control-db`: `tenants`, `bots`, `provision_jobs` tables.
-- [ ] Railway GraphQL client: create service from GHCR image, attach volume, set variables (bot token, DEK, ingress URL), deploy, delete. Idempotent state machine with retries.
-- [ ] Bot pool: manual BotFather batch (20 bots via Shaurya's Telegram) → tokens loaded via CLI script → `control-api` assigns + sets webhook to `ingress/<bot_id>`.
-- [ ] CLI command (`infra/provision.py`): `provision --email x@y.com` → tenant live + t.me link printed. **This is the alpha signup.**
+- [x] FastAPI + SQLModel on `control-db`: `tenants`, `bots`, `provision_jobs` tables (140 tests; privacy-schema guard is build-breaking).
+- [x] Railway GraphQL client: create service from GHCR image, attach volume, set variables, deploy, delete. Idempotent state machine with atomic job claims + retries. *(Every mutation still unverified against the live API — in-code first-live-deploy checklist.)*
+- [ ] Bot pool: manual BotFather batch (20 bots via Shaurya's Telegram) → tokens loaded via CLI script (`infra/load_bots.py` ready) → `control-api` assigns + sets webhook. *(Code done; Shaurya's BotFather batch pending.)*
+- [x] CLI command (`infra/provision.py`): `provision --email x@y.com` → tenant live + t.me link printed. **This is the alpha signup.**
 
 ### Task 0.4 — Ingress v0
-- [ ] Thin FastAPI/uvicorn service: `POST /<bot_id>` → look up tenant → forward over Railway private networking → 200 to Telegram. No body logging (structural: log schema has no body field). Buffer-and-wake path for sleeping tenants.
+- [x] Thin FastAPI/uvicorn service: `POST /telegram/<bot_id>` → look up tenant → forward over Railway private networking → 200 to Telegram. No body logging (structural: log schema has no body field). Buffer-and-wake path for sleeping tenants. (34 tests.)
 
 ### Task 0.5 — Trial proxy v0
-- [ ] LiteLLM on Railway, virtual key per tenant, $2 budget / 75 msg/day / Haiku-class default; `control-api` creates/revokes keys on trial start / LLM-connect / expiry.
+- [x] LiteLLM on Railway, virtual key per tenant, $2 hard budget / Haiku-class default (75 msg/day approximated — no native LiteLLM daily-count primitive; documented in config); `control-api` creates/revokes keys on trial start / expiry. *(LLM-connect revocation trigger is Phase 1C.)*
 
 ### Task 0.6 — Alpha operations
-- [ ] Heartbeat: tenant emits counts-only metrics to `control-api`; `/fleet` status endpoint.
-- [ ] Nightly restic → B2, client-side encrypted with tenant DEK (runs in-container via Railway cron).
-- [ ] Upgrade drill: build image vN+1 → redeploy 1 canary tenant → verify → roll fleet via API loop. Rollback = redeploy previous image tag.
+- [x] Heartbeat: tenant emits counts-only metrics to `control-api`; `/internal/fleet` status endpoint.
+- [x] Nightly restic → B2, client-side encrypted with tenant DEK (in-container supervisord loop — Railway cron can't exec into a running service; documented deviation). *(Inert until B2 account exists.)*
+- [ ] Upgrade drill: build image vN+1 → redeploy 1 canary tenant → verify → roll fleet via API loop. Rollback = redeploy previous image tag. *(Tooling landed — `infra/upgrade_drill.py` + redeploy endpoint; the drill itself needs a live fleet.)*
 - [ ] Onboard 10 invited alpha users. Run 2 weeks. **Measure G1.**
 
 ---
