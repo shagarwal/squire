@@ -333,10 +333,19 @@ jobs:
         # silently for exactly the tenants who just paid us.
         run: bash tenant-image/tests/test_hindsight_env.sh
 
+      - name: First-contact owner binding (trust on first use)
+        if: steps.present.outputs.exists == 'true'
+        # The first message on a brand-new tenant must bind its sender as owner so
+        # the concierge greeting flows immediately — and NOTHING afterwards may
+        # bind. Most of this suite is the negative half: the gate closing again is
+        # what keeps a stranger out of someone else's agent.
+        run: python3 tenant-image/tests/test_autopair.py
+
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
         # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,
-        # and the /metrics counts the fleet heartbeat is built on.
+        # the /metrics counts the fleet heartbeat is built on, and the end-to-end
+        # proof that owner binding lands BEFORE the update is forwarded.
         run: python3 tenant-image/tests/test_webhook_shim.py
 
       - name: Fleet heartbeat is counts-only

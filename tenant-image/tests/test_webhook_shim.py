@@ -280,6 +280,70 @@ finally:
     proc.terminate()
     proc.wait(timeout=10)
 
+print("== first-contact owner binding (end to end through the shim) ==")
+# tests/test_autopair.py covers the binding logic exhaustively. This proves the
+# WIRING: that a real POST through the real shim binds the owner BEFORE the
+# update is forwarded. Ordering is the entire point — upstream authorizes this
+# same update downstream, so a binding that lands late is a pairing code.
+import tempfile  # noqa: E402
+
+received.clear()
+# The "gateway down" section above deliberately killed the fake adapter; bring a
+# fresh one up so this section exercises the delivery path rather than a 503.
+adapter2 = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), FakeAdapter)
+adapter2.daemon_threads = True
+threading.Thread(target=adapter2.serve_forever, daemon=True).start()
+
+home = tempfile.mkdtemp()
+approved = pathlib.Path(home) / "platforms" / "pairing" / "telegram-approved.json"
+proc = run({"SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH, "HERMES_HOME": home})
+try:
+    first = {
+        "update_id": 900,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 424242, "is_bot": False, "first_name": "owner"},
+            "chat": {"id": 424242, "type": "private"},
+            "text": "/start",
+        },
+    }
+    status, _ = post("/webhook/telegram", first)
+    check("first contact still forwards (200)", status == 200, status)
+    check("owner was bound during that request", approved.exists(), str(approved))
+    if approved.exists():
+        store = json.loads(approved.read_text())
+        check("bound the sender's id", list(store) == ["424242"], list(store))
+    check("update reached the gateway", len(received) == 1, len(received))
+
+    # The gateway must receive text, not a command: upstream swallows "/start"
+    # with an empty reply, so a verbatim relay here would authorize the owner and
+    # then say nothing at all.
+    if received:
+        fwd = json.loads(received[0]["body"])
+        check("forwarded body has /start defanged",
+              fwd["message"]["text"] == "start", fwd["message"].get("text"))
+        check("forwarded update is otherwise intact",
+              fwd["update_id"] == 900 and fwd["message"]["from"]["id"] == 424242, fwd)
+
+    # A different user afterwards must NOT be bound — the gate is closed.
+    second = json.loads(json.dumps(first))
+    second["update_id"] = 901
+    second["message"]["from"]["id"] = 999999
+    second["message"]["chat"]["id"] = 999999
+    post("/webhook/telegram", second)
+    store = json.loads(approved.read_text())
+    check("second user not auto-approved", list(store) == ["424242"], list(store))
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    adapter2.shutdown()
+    adapter2.server_close()
+    out = proc.stdout.read() if proc.stdout else ""
+    # The owner's Telegram id is an account identifier and this output goes to a
+    # shared aggregator, so the log line must be present but the id must not.
+    check("shim logged the binding", "bound tenant owner" in out, out[-200:])
+    check("owner id absent from logs", "424242" not in out, out[-200:])
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

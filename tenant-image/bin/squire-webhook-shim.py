@@ -57,6 +57,28 @@ WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "")
 TENANT_ID = os.environ.get("TENANT_ID", "")
 
+# --- Trust-on-first-use owner binding --------------------------------------
+# The shim is the only thing that sees a Telegram update BEFORE hermes does,
+# which is exactly what this needs: the owner must be approved by the time the
+# gateway authorizes THIS update, or the first contact gets a pairing code
+# instead of a greeting. See squire_autopair.py for the full rationale and the
+# security semantics. HERMES_HOME is the mounted volume, so the binding is
+# durable. SQUIRE_AUTOPAIR=false restores upstream's pairing-code ceremony.
+HERMES_HOME = os.environ.get("HERMES_HOME", "/opt/data")
+AUTOPAIR_ENABLED = os.environ.get("SQUIRE_AUTOPAIR", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Import by path rather than relying on cwd: supervisord starts us from an
+# unspecified directory, and a silent ImportError here would mean every tenant
+# quietly falls back to the pairing gate.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from squire_autopair import defang_start_command, maybe_bind_owner
+except ImportError:  # pragma: no cover - defensive
+    maybe_bind_owner = None
+    defang_start_command = None
+
 # Telegram updates are small; the largest realistic body is a long message with
 # a big entity list. 2 MiB is generous and stops an unbounded read.
 MAX_BODY = 2 * 1024 * 1024
@@ -252,6 +274,43 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length)
+
+        # Bind the owner BEFORE forwarding. Ordering is the whole trick: upstream's
+        # PairingStore.is_approved() re-reads the approved JSON on every call with
+        # no caching, so a write completed here is visible to the gateway while it
+        # authorizes this very update. Do it after forwarding and the first contact
+        # gets a pairing code; do it on a timer and it gets one too.
+        #
+        # Never fatal, and never blocks delivery: maybe_bind_owner swallows its own
+        # errors, and a failure here just means the tenant pairs the upstream way.
+        if AUTOPAIR_ENABLED and maybe_bind_owner is not None:
+            try:
+                update = json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                update = None
+            if isinstance(update, dict):
+                bound = maybe_bind_owner(HERMES_HOME, update)
+                if bound:
+                    # Only on the update that bound the owner. Upstream swallows
+                    # "/start" as a platform ping (run.py:14961 returns ""), so
+                    # without this the deep-link tap authorizes the owner and
+                    # then answers with silence — worse than the pairing code it
+                    # replaced. See defang_start_command for why this is a slash
+                    # strip and not a synthesised greeting.
+                    if defang_start_command(update):
+                        body = json.dumps(update).encode("utf-8")
+                        log("first contact: /start relayed as text so the "
+                            "concierge greeting can fire")
+                    # Deliberately does NOT log the Telegram user id. It is the
+                    # tenant owner's account identifier, this output goes to a
+                    # shared log aggregator, and the heartbeat holds no user ids
+                    # by design — this must not become the exception.
+                    # Logged, deliberately NOT counted. _COUNTERS is a fixed
+                    # three-outcome set that squire-heartbeat.py forwards to
+                    # control-api; adding a key here would both KeyError and
+                    # widen the metrics contract to report a per-tenant lifecycle
+                    # event that control-api has no need to know.
+                    log("first contact: bound tenant owner (id redacted)")
 
         conn = None
         try:
