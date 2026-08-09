@@ -55,10 +55,12 @@ agent:
 # variables from control-api; gateway/config.py enables the platform as soon as
 # TELEGRAM_BOT_TOKEN is present, so nothing here needs to turn it on.
 telegram:
-  # 👀 / ✅ reactions while a turn is running. Cheap, and it makes a slow tool
-  # loop feel alive instead of ignored — which matters a lot more when the
-  # container may have been asleep a second ago.
-  reactions: true
+  # Emoji reactions on every inbound message were turned OFF after founder
+  # feedback on the first live conversation (2026-08-09): reacting to each
+  # message reads as noise in a 1:1 personal chat, not as liveness. Telegram's
+  # native typing indicator already covers "I'm working on it", and ingress
+  # sends one on wake. Do not re-enable without user-facing evidence.
+  reactions: false
 
 display:
   platforms:
