@@ -9,18 +9,19 @@ name: deploy
 #   `squire-prod` Railway project, authenticated with RAILWAY_TOKEN_PROD. Prod is
 #   intentionally never triggered by a plain push.
 #
-# Required GitHub secrets (repo or "staging"/"production" environment secrets —
-# not set yet as of Task 0.1; Railway project creation is being handled
-# separately, add these once the projects + service tokens exist):
-#   RAILWAY_TOKEN_STAGING — Railway CLI token scoped to the squire-staging project
-#   RAILWAY_TOKEN_PROD    — Railway CLI token scoped to the squire-prod project
+# Required GitHub secrets (set 2026-08-08):
+#   RAILWAY_TOKEN_STAGING — Railway project token scoped to squire-staging
+#   RAILWAY_TOKEN_PROD    — Railway project token scoped to squire-prod
 #
-# NOTE (Task 0.1, Phase 0): apps/control-api, apps/ingress, apps/trial-proxy, and
-# apps/web are currently empty placeholders (only a .gitkeep file — real code
-# lands in later tasks: 0.3, 0.4, 0.5, and Phase 1 respectively). The deploy job
-# below has a "does this service have real content yet?" guard step and skips the
-# actual `railway up` when the directory is still just a placeholder, so this
-# workflow does not fail/block merges to main in the meantime.
+# DESIGN NOTE — why the matrix is built with fromJSON instead of a per-entry
+# job-level `if`: the `matrix` context is NOT available in job-level `if`
+# expressions (only github/needs/vars/inputs are — see GitHub's context
+# availability table). An earlier revision gated each matrix entry with
+# `needs.changes.outputs[matrix.filter_key]` at job level, which GitHub rejects
+# at event time as an invalid workflow file (the run fails in 0s with no jobs).
+# Instead, the `changes` job now emits a JSON array of services to deploy, and
+# the matrix itself is constructed from that array — entries that shouldn't
+# deploy simply never exist.
 
 on:
   push:
@@ -53,31 +54,24 @@ permissions:
 env:
   # Pinned so `npm install -g` doesn't silently track npm `latest` on every run.
   # Bump this deliberately when we want a newer Railway CLI.
-  # (Current as of Task 0.1 review: `npm view @railway/cli version` -> 5.33.0.)
   RAILWAY_CLI_VERSION: "5.33.0"
 
 jobs:
-  # Determines which service directories changed on this push, so the deploy
-  # job below only runs for the service(s) actually touched. Not used for
-  # workflow_dispatch runs — those explicitly name the service via the `service`
-  # input instead.
+  # Determines which service directories changed on this push and emits them as
+  # a JSON array (e.g. ["control-api","ingress"]) for the deploy matrix. Not
+  # used for workflow_dispatch runs — those explicitly name the service via the
+  # `service` input instead.
   changes:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    # NOTE: output/filter keys use underscores, not the services' hyphenated
-    # directory names — GitHub Actions expression dot-notation (e.g.
-    # `needs.changes.outputs.control-api`) parses `-` as subtraction, which
-    # would silently break these lookups. The deploy job below reads these via
-    # bracket notation (`outputs[matrix.filter_key]`), which sidesteps the
-    # issue entirely, but keeping the keys underscore-named here too avoids
-    # ever needing bracket notation with a literal hyphenated string.
     outputs:
-      control_api: ${{ steps.filter.outputs.control_api }}
-      ingress: ${{ steps.filter.outputs.ingress }}
-      trial_proxy: ${{ steps.filter.outputs.trial_proxy }}
-      web: ${{ steps.filter.outputs.web }}
+      # JSON array of hyphenated service names whose paths changed. "[]" when
+      # only the workflow file itself changed.
+      services: ${{ steps.list.outputs.services }}
     steps:
       - uses: actions/checkout@v4
+      # Filter keys use underscores: GitHub Actions expression dot-notation
+      # parses `-` as subtraction, so hyphenated output names are a trap.
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -90,51 +84,47 @@ jobs:
               - 'apps/trial-proxy/**'
             web:
               - 'apps/web/**'
+      - name: Assemble changed-service JSON list
+        id: list
+        env:
+          CONTROL_API: ${{ steps.filter.outputs.control_api }}
+          INGRESS: ${{ steps.filter.outputs.ingress }}
+          TRIAL_PROXY: ${{ steps.filter.outputs.trial_proxy }}
+          WEB: ${{ steps.filter.outputs.web }}
+        run: |
+          s=()
+          [ "$CONTROL_API" = "true" ] && s+=('"control-api"')
+          [ "$INGRESS" = "true" ] && s+=('"ingress"')
+          [ "$TRIAL_PROXY" = "true" ] && s+=('"trial-proxy"')
+          [ "$WEB" = "true" ] && s+=('"web"')
+          list="[$(IFS=,; echo "${s[*]}")]"
+          echo "services=$list" >> "$GITHUB_OUTPUT"
+          echo "Deploy list: $list"
 
-  # One matrix job covers all four services instead of four near-identical
-  # jobs. `filter_key` carries the underscore-named `changes` job output that
-  # corresponds to each hyphenated `service` (Railway service name / apps/
-  # directory name). `service` itself is a workflow-author-controlled literal
-  # from the `include` list below (never user input), so interpolating it
-  # directly into `working-directory` and the `railway up --service` command
-  # is safe.
+  # One matrix job covers all services. `matrix.service` values come either from
+  # the `changes` job's JSON list (push) or from the workflow_dispatch input —
+  # both workflow-author-controlled or choice-constrained, so interpolating into
+  # `working-directory` and `railway up --service` is safe.
   deploy:
     needs: changes
-    # !cancelled() (not always()) so a cancelled push-to-main run does not
-    # still attempt a deploy — always() fires even on cancellation, which
-    # would be wrong here. !cancelled() still runs despite `changes` being
-    # skipped (e.g. on workflow_dispatch, where `changes` never runs), which
-    # is the behavior we need.
-    #
-    # Per-matrix-entry gating:
-    #   - push:              deploy only the service(s) whose path changed,
-    #                         per the `changes` job output for this entry.
-    #   - workflow_dispatch:  deploy only the single service chosen via the
-    #                         `service` input.
+    # !cancelled() (not always()): a cancelled run must not still deploy, but
+    # the job must run despite `changes` being skipped on workflow_dispatch.
+    # The empty-list guard matters: constructing a matrix from "[]" is an error,
+    # so the job is skipped outright when a push changed no service directories
+    # (e.g. a push touching only this workflow file).
     if: |
       !cancelled() &&
-      ((github.event_name == 'push' && needs.changes.outputs[matrix.filter_key] == 'true') ||
-       (github.event_name == 'workflow_dispatch' && inputs.service == matrix.service))
+      (github.event_name == 'workflow_dispatch' || (needs.changes.outputs.services != '' && needs.changes.outputs.services != '[]'))
     strategy:
       fail-fast: false # one service's deploy failure shouldn't cancel the others
       matrix:
-        include:
-          - service: control-api
-            filter_key: control_api
-          - service: ingress
-            filter_key: ingress
-          - service: trial-proxy
-            filter_key: trial_proxy
-          - service: web
-            filter_key: web
+        service: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.service)) || fromJSON(needs.changes.outputs.services) }}
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || 'staging' }}
     steps:
       - uses: actions/checkout@v4
 
-      # Placeholder guard: apps/<service>/ only has .gitkeep until its
-      # implementation task lands (0.3 control-api, 0.4 ingress, 0.5
-      # trial-proxy, Phase 1 web).
+      # Placeholder guard: apps/web only has .gitkeep until Phase 1A lands.
       - name: Check apps/${{ matrix.service }} has real content
         id: content-check
         run: |
