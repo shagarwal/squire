@@ -73,7 +73,7 @@ Decisions already made with the user:
 - **Honesty boundary (published on the privacy page):** root-on-host could read memory; the guarantee is architectural + audited-policy, not confidential computing. While on Railway, Railway Inc. is additionally a subprocessor (their platform can technically access containers/volumes; TLS terminates at their edge) — named plainly in the privacy policy; the Hetzner fallback (G1) restores full host control.
 
 ### Trial abuse controls
-Trial is Haiku-class default, **~$2 hard budget / 75 msgs/day / 72 hours** per tenant (see §5.3) — low abuse value by construction. Belt-and-suspenders: one trial per Telegram user ID (phone-anchored), disposable-email block, signup velocity limits, trial tenants egress-allowlisted (Telegram + proxy only — kills spam-bot value); anomaly alerts auto-suspend. Expired trials hibernate after 48h and are crypto-shredded at day 14.
+Trial is Sonnet-class default, **~$10 hard budget / 75 msgs/day / 72 hours** per tenant (see §5.3) — low abuse value by construction. Belt-and-suspenders: one trial per Telegram user ID (phone-anchored), disposable-email block, signup velocity limits, trial tenants egress-allowlisted (Telegram + proxy only — kills spam-bot value); anomaly alerts auto-suspend. Expired trials hibernate after 48h and are crypto-shredded at day 14.
 
 ### Telegram bot supply
 BotFather ≈ 20 bots/account → maintain 3–5 aged accounts, pre-create weekly batches, low-watermark alert. Onboarding nudges BYO-bot (user pastes their own bot token via the secure link) which recycles pool bots. WhatsApp Cloud API numbers (Phase 2) are fully programmatic.
@@ -115,7 +115,7 @@ Average users are cheaper on every line (~$3–4 all-in, ~50/host density).
 
 Signup offers two doors: **subscribe immediately** (card, agent live at once) or **start a 3-day free trial** (no card). Trial mechanics:
 
-- Full agent for **72 hours**. If the user hasn't connected their own LLM yet, it runs on our key — **Haiku-class default, ~$2 hard budget, 75 msgs/day** (enough to genuinely feel the product; Sonnet-class reserved for a few showcase tool-turns). Connecting their own LLM mid-trial lifts the caps and upgrades the model — the concierge sells this as "unlock your agent's full brain," which doubles as the conversion step.
+- Full agent for **72 hours**. If the user hasn't connected their own LLM yet, it runs on our key — **Sonnet-class default, ~$10 hard budget, 75 msgs/day** (enough to genuinely feel the product). Raised from Haiku/$2 on 2026-08-09: onboarding and everyday usefulness are both instruction-following, and the first live tenant showed a Haiku-class model ignoring the concierge script entirely. $2 at Sonnet prices buys ~50 turns, well under the advertised allowance, so the cap was resized to the promise. Connecting their own LLM mid-trial lifts the caps and upgrades the model — the concierge sells this as "unlock your agent's full brain," which doubles as the conversion step.
 - The concierge still pushes "connect your AI" early in session one — trial users who connect are the highest-intent converts and cost us near zero.
 - At 72h: **the agent stops working** — it replies only with a subscribe link (and a data note: tenant kept 14 days, then crypto-shredded unless subscribed). Container hibernates after 48h grace to reclaim capacity.
 - Worst-case trial CAC: ~$2 tokens + ~$0.30 infra per trial signup.
@@ -151,7 +151,7 @@ This is intentional land-grab pricing, and the PRD is explicit about what makes 
 2. **Claude Max OAuth breakage** — already labeled unsupported; automatic fallback ladder to API key; the sanctioned Codex-subscription path is the marketed default for subscription users.
 3. **Bot-pool scaling / Telegram account risk** — BYO-bot nudge + WhatsApp Cloud API remove the ceiling.
 4. **Upstream velocity** (8,691-commit rebases) — thin-fork + CI image builds + canary rings (ring 0 = founders' own tenants).
-5. **Trial abuse** — controls in §4; ~$2 hard budget means worst case is bounded, noise-level spend.
+5. **Trial abuse** — controls in §4; ~$10 hard budget means worst case per abusive signup is bounded and still small, but it is 5x the old exposure: the per-signup controls (one trial per Telegram ID, disposable-email block, velocity limits) carry proportionally more weight now, and fleet-wide trial spend is worth watching once signups are open.
 6. **WhatsApp 24h window** (Phase 2) — agent-initiated sends (cron briefings) need approved template messages; design the cron output path around this.
 7. **Penetration-pricing margin** — at $5/$10 power users are unprofitable and average margin is thin (§5.4); survivable only with fair-use caps + density work + the planned price raise. If density lands at 30/host instead of 50, Starter is breakeven.
 

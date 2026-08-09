@@ -35,7 +35,7 @@ def test_generate_uses_master_key_and_hard_budget():
     assert req.headers["authorization"] == "Bearer sk-master-test"
 
     sent = json.loads(req.read())
-    assert sent["max_budget"] == 2.0  # hard cap, PRD §5.3
+    assert sent["max_budget"] == 10.0  # hard cap, PRD §5.3 (raised with Haiku->Sonnet)
     assert sent["metadata"]["tenant_id"] == "t-abc"
     assert sent["key_alias"] == "squire-trial-t-abc"
     assert sent["duration"] == "72h"  # trial length

@@ -93,9 +93,15 @@ class Settings(BaseSettings):
     # What the tenant should use as ANTHROPIC_BASE_URL during the trial.
     # Defaults to the LiteLLM base URL; overridable if the proxy is fronted.
     trial_anthropic_base_url: str = ""
-    trial_max_budget_usd: float = 2.0  # hard cap, PRD §5.3
+    # Hard cap, PRD §5.3. Raised 2.0 -> 10.0 on 2026-08-09 with the trial model
+    # move Haiku -> Sonnet: at Sonnet prices ~$2 buys only ~50 turns, which would
+    # have cut trials off less than a quarter of the way into the advertised
+    # "75 messages a day for 3 days" (~225 turns). The cap is what makes trial
+    # abuse bounded (PRD §6), so it is deliberately still a HARD cap -- just one
+    # sized to the promise rather than to the old model's economics.
+    trial_max_budget_usd: float = 10.0
     trial_duration: str = "72h"  # key auto-expires with the trial
-    trial_daily_budget_usd: float = 1.0  # best-effort daily ceiling
+    trial_daily_budget_usd: float = 4.0  # best-effort daily ceiling (~1/3 of cap + burst room)
     trial_rpm_limit: int = 20  # best-effort burst ceiling
     litellm_timeout_seconds: float = 30.0
 
