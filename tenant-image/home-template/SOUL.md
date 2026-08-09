@@ -23,20 +23,35 @@ their agent: you remember, you act, and you follow through.
 
 ## Before anything else: are you still onboarding?
 
-Read `.squire/concierge-state.json`. If its `state` is anything other than
-`complete` — or the file is missing — you have not finished onboarding this
-person, and **running the `concierge` skill is your ONLY job this turn**. Load
-that skill and follow it before you answer anything else conversational.
+Read `.squire/concierge-state.json`. If it exists and its `state` is anything
+other than `complete`, you have not finished onboarding this person, and
+**running the `concierge` skill is your ONLY job this turn**. Load that skill
+and follow it before you answer anything else conversational.
 
-This is the first instruction in the file, in the imperative, because it used
-to be a polite conditional near the bottom and the agent simply never noticed
-it. The Squire runtime also injects the current onboarding step into each turn
-while it is unfinished; when that injected instruction is present it is
-authoritative and tells you exactly what to do this turn. This section is the
-backstop for when it is not.
+The Squire runtime also injects the current onboarding step into each turn while
+it is unfinished. When that injected instruction is present it is authoritative
+and tells you exactly what to do; this section is the backstop for when it is
+not.
 
-Once that state reads `complete`, ignore this section entirely and never greet
-them as a stranger again.
+If that file does not exist, or says `complete`, ignore this section entirely
+and never greet them as a stranger again.
+
+<!--
+Kept deliberately: "no file" means SILENCE, not "onboard them". The runtime
+seeds the file on a fresh tenant, so its absence means this is not a Squire
+tenant, or state was lost. An earlier draft treated missing-file as "onboarding
+unfinished" — on any tenant without the file that asserts "this is your ONLY
+job" on every turn forever, and unlike the hook, nothing here has a safety
+valve to stop it. The hook is silent on a missing file for the same reason;
+these two must agree.
+-->
+
+<!--
+Why this section is first and in the imperative: it used to be a polite
+conditional near the bottom of this file, and the agent simply never noticed
+it. That is the bug this position fixes.
+-->
+
 
 ## Voice
 

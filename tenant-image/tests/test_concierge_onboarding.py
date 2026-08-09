@@ -50,6 +50,7 @@ STATE_MACHINE = SKILL_DIR / "state-machine.yaml"
 SOUL = TEMPLATE / "SOUL.md"
 CONFIG = TEMPLATE / "config.yaml"
 PATCH_005 = IMAGE_ROOT / "patches" / "005-first-contact-concierge-note.patch"
+DOCKERFILE = (IMAGE_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
 failures: list[str] = []
 
@@ -86,18 +87,37 @@ SOUL_TEXT = SOUL.read_text(encoding="utf-8")
 # payload on stdin, reading stdout as JSON.
 # ---------------------------------------------------------------------------
 
-PAYLOAD = json.dumps(
-    {
+def payload(**over) -> str:
+    """A realistic pre_llm_call payload, shaped the way shell_hooks.py sends it.
+
+    `parent_session_id` is a TOP-LEVEL key (_TOP_LEVEL_PAYLOAD_KEYS at
+    agent/shell_hooks.py:431); the rest of the hook site's kwargs land in
+    `extra`. Getting this shape right is the whole point of the subagent and
+    cron assertions below.
+    """
+    extra = {
+        "user_message": "hey",
+        "is_first_turn": True,
+        "model": "anthropic:claude-haiku-4-5",
+        "platform": "telegram",
+    }
+    extra.update(over.pop("extra", {}))
+    base = {
         "hook_event_name": "pre_llm_call",
         "session_id": "sess_test",
-        "user_message": "hey",
-        "extra": {"is_first_turn": True},
+        "parent_session_id": "",
+        "cwd": "/opt/data",
+        "extra": extra,
     }
-)
+    base.update(over)
+    return json.dumps(base)
+
+
+PAYLOAD = payload()
 
 
 def run_hook(state_file_content: str | None, *, env_style: str = "state_dir",
-             counter: str | None = None) -> tuple[int, str]:
+             counter: str | None = None, stdin: str | None = None) -> tuple[int, str]:
     """Run the hook against a temp state dir. Returns (returncode, stdout)."""
     with tempfile.TemporaryDirectory() as td:
         home = pathlib.Path(td)
@@ -118,7 +138,8 @@ def run_hook(state_file_content: str | None, *, env_style: str = "state_dir",
 
         proc = subprocess.run(
             [sys.executable, str(HOOK)],
-            input=PAYLOAD, env=env, capture_output=True, text=True, timeout=30,
+            input=PAYLOAD if stdin is None else stdin,
+            env=env, capture_output=True, text=True, timeout=30,
         )
         return proc.returncode, proc.stdout
 
@@ -207,35 +228,198 @@ print()
 print("== 3. the safety valve bounds the opposite failure ==")
 
 # If the agent never writes the state file, an unbounded hook would re-inject
-# the same directive forever — Groundhog Day, on a trial capped at 75 messages
-# a day. Endless onboarding is as brand-damaging as none.
-maxt = hook.MAX_INJECTED_TURNS
+# the same directive forever — Groundhog Day, on a metered trial. Endless
+# onboarding is as brand-damaging as none.
+maxt = hook.MAX_INJECTED_TURNS_PER_STATE
 check("valve is documented as a module constant", isinstance(maxt, int) and maxt > 0)
 # An absolute bound, not just a relative one. Every other assertion in this
-# section is expressed in terms of MAX_INJECTED_TURNS, so raising the constant
-# to a billion would "disable the valve" while keeping them all green. The flow
-# is 8 states; anything past ~40 turns of nagging is not a safety valve.
+# section is expressed in terms of the constant, so raising it to a billion
+# would "disable the valve" while keeping them all green.
 check(
     "valve is set to a value that actually bounds nagging",
-    len(hook._DIRECTIVES) <= maxt <= 40,
-    f"MAX_INJECTED_TURNS={maxt}",
+    2 <= maxt <= 12,
+    f"MAX_INJECTED_TURNS_PER_STATE={maxt}",
 )
 check(
     "just under the limit still injects",
-    context_for("greet", counter=str(maxt - 1)) != "",
+    context_for("greet", counter=f"greet {maxt - 1}") != "",
 )
 check(
     "at the limit the hook goes quiet",
-    context_for("greet", counter=str(maxt)) == "",
+    context_for("greet", counter=f"greet {maxt}") == "",
 )
 check(
     "well past the limit stays quiet",
-    context_for("greet", counter=str(maxt * 10)) == "",
+    context_for("greet", counter=f"greet {maxt * 10}") == "",
 )
-# A corrupt counter must not disable onboarding.
+
+# The budget is PER STATE and resets on progress. A global budget would punish a
+# user who simply chats a lot at each step, and would be drained by any subagent
+# or cron turn that slipped through — penalising the flow for making progress is
+# the wrong failure to engineer for.
+check(
+    "an exhausted budget for a DIFFERENT state does not silence this one",
+    context_for("ask_timezone", counter=f"greet {maxt * 10}") != "",
+)
+check(
+    "advancing the state resets the budget",
+    context_for("ask_name", counter=f"greet {maxt}") != "",
+)
+
+# A corrupt or legacy (bare-integer) counter must not disable onboarding.
 check(
     "unreadable counter falls back to injecting",
     context_for("greet", counter="not-a-number") != "",
+)
+check(
+    "legacy bare-integer counter falls back to injecting",
+    context_for("greet", counter="9") != "",
+)
+
+
+print()
+print("== 3b. the hook fires for the USER only, not subagents or cron ==")
+
+# Delegated subagents and cron jobs drive the same conversation loop and so the
+# same hook. "Say hello and introduce yourself" injected into a subagent is a
+# greeting nobody reads, and it burns the valve. ask_first_job actively
+# encourages starting real work mid-onboarding, so delegation during onboarding
+# is expected rather than hypothetical.
+rc, out = run_hook(
+    json.dumps({"state": "greet"}), stdin=payload(parent_session_id="sess_parent")
+)
+check("delegated subagent turn injects nothing", out.strip() == "", out[:80])
+check("delegated subagent turn exits 0", rc == 0, f"rc={rc}")
+
+rc, out = run_hook(
+    json.dumps({"state": "greet"}), stdin=payload(extra={"platform": "cron"})
+)
+check("cron turn injects nothing", out.strip() == "", out[:80])
+check("cron turn exits 0", rc == 0, f"rc={rc}")
+
+# ...but a real user turn still fires, on any platform.
+for plat in ("telegram", "whatsapp", ""):
+    rc, out = run_hook(
+        json.dumps({"state": "greet"}), stdin=payload(extra={"platform": plat})
+    )
+    check(f"user turn on platform {plat!r} still injects", out.strip() != "")
+
+# The hook must survive a payload shape it did not expect rather than going
+# silent — a stdin surprise must not cost someone their onboarding.
+for label, blob in [
+    ("empty stdin", ""),
+    ("non-JSON stdin", "not json"),
+    ("JSON array stdin", "[1,2]"),
+    ("payload with no extra", json.dumps({"session_id": "s"})),
+]:
+    rc, out = run_hook(json.dumps({"state": "greet"}), stdin=blob)
+    check(f"{label}: still injects (fail-open)", out.strip() != "", out[:60])
+    check(f"{label}: exits 0", rc == 0, f"rc={rc}")
+
+
+print()
+print("== 3c. injected paths are ones the agent can actually open ==")
+
+# ${HERMES_SKILL_DIR} is substituted ONLY while hermes loads skill *content*
+# (skills/skill_commands.py, gated on skills.template_vars). It is not an OS
+# env var, so in the shell the terminal tool runs it expands to nothing and
+# "${HERMES_SKILL_DIR}/state-machine.yaml" becomes "/state-machine.yaml".
+# Worst in trial_explainer, where that pointer IS the guard rail against
+# inventing prices and limits.
+all_ctx = {st: context_for(st) for st in hook._NEXT_STATE}
+for st, ctx in all_ctx.items():
+    check(
+        f"`{st}` directive contains no unexpanded template variable",
+        "${" not in ctx and "{skill_file}" not in ctx,
+        [tok for tok in ("${HERMES_SKILL_DIR}", "${HERMES_HOME}", "{skill_file}") if tok in ctx],
+    )
+for st in ("trial_explainer", "connect_llm", "awaiting_credential"):
+    check(
+        f"`{st}` points at state-machine.yaml by absolute path",
+        "/skills/concierge/state-machine.yaml" in all_ctx[st],
+    )
+check(
+    "the timezone step points at config.yaml by absolute path",
+    "/config.yaml" in all_ctx["ask_timezone"]
+    and "${" not in all_ctx["ask_timezone"],
+)
+# HERMES_HOME is a real env var (Dockerfile) so paths resolve under it.
+check(
+    "paths resolve under HERMES_HOME",
+    re.search(r"^ENV .*HERMES_HOME=/opt/data", DOCKERFILE, re.M) is not None
+    or "HERMES_HOME=/opt/data" in DOCKERFILE,
+)
+
+# The timezone write must be surgical. config.yaml also carries the `hooks:`
+# block that makes onboarding work at all — an agent rewriting the file
+# wholesale to set one key could drop it and disable the mechanism.
+check(
+    "the timezone write targets only the timezone line",
+    "^timezone:" in all_ctx["ask_timezone"],
+    all_ctx["ask_timezone"][:200],
+)
+
+print()
+print("== 3d. the state-write command is self-consistent ==")
+
+# An earlier version told the model to run a truncating `printf >` AND to keep
+# the file's existing keys — two contradictory instructions in exactly the place
+# we are engineering against silent skips.
+seeded = {"state": "greet", "name": None, "timezone": None, "llm": "trial",
+          "updated": "2026-08-09T00:00:00Z"}
+rc, out = run_hook(json.dumps(seeded))
+ctx = json.loads(out)["context"]
+check(
+    "the write command carries every key the state file had",
+    all(f'"{k}"' in ctx for k in seeded),
+    [k for k in seeded if f'"{k}"' not in ctx],
+)
+check(
+    "the write command no longer also demands manual key preservation",
+    "keeping any keys" not in ctx,
+)
+# It must be runnable as-is: extract and execute it against a temp file.
+def execute_write_command(context: str) -> dict | None:
+    """Actually run the emitted command; None if it is not valid shell/JSON.
+
+    Returns rather than raises so a badly-quoted command reports as a clean
+    FAIL instead of aborting the suite before the later sections run.
+    """
+    try:
+        cmd = next(
+            l.strip() for l in context.splitlines() if l.strip().startswith("printf ")
+        )
+    except StopIteration:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        target = pathlib.Path(td) / "concierge-state.json"
+        try:
+            subprocess.run(
+                ["bash", "-c", cmd.rsplit(">", 1)[0] + "> " + str(target)],
+                check=True, timeout=15, capture_output=True,
+            )
+            return json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+
+written = execute_write_command(ctx)
+check("the emitted command is valid shell and writes valid JSON", isinstance(written, dict))
+check("running it advances the state", (written or {}).get("state") == "ask_name", str(written))
+check(
+    "running it preserves the other keys",
+    written is not None
+    and all(written.get(k) == v for k, v in seeded.items() if k != "state"),
+    str(written),
+)
+# A name with an apostrophe must not break out of the shell quoting — this is
+# the difference between shlex.quote and hand-rolled single quotes.
+rc, out = run_hook(json.dumps({**seeded, "state": "ask_name", "name": "O'Brien"}))
+w2 = execute_write_command(json.loads(out)["context"])
+check(
+    "a name containing an apostrophe survives shell quoting",
+    (w2 or {}).get("name") == "O'Brien",
+    str(w2),
 )
 
 
@@ -309,6 +493,7 @@ def flat(text: str) -> str:
 
 greet_blob = flat(json.dumps(greet))
 greet_directive = flat(greet_ctx)
+trial_directive = context_for("trial_explainer")
 caps = {c["id"]: flat(c["say"]) for c in MACHINE["capabilities"]}
 # What the agent will actually read on turn one: the greet script plus the
 # capability lines it is told to draw from.
@@ -351,6 +536,18 @@ for label, blob in [
         f"greet ({label}) explicitly forbids sending them to /help",
         "do not mention slash commands or /help" in blob,
     )
+
+# Removing the "don't list capabilities" brake made the OPPOSITE failure live:
+# a wall of text as message one. The YAML's "fifteen seconds" note is the
+# non-authoritative half — the hook directive is what the model actually reads.
+check(
+    "the greet directive caps its own length",
+    "120 words" in greet_directive and "8 short lines" in greet_directive,
+)
+check(
+    "the greet directive names the wall-of-text failure explicitly",
+    "wall of text" in greet_directive,
+)
 
 check("greet still asks exactly one question", greet.get("ask") is not None)
 check(
@@ -399,12 +596,37 @@ check(
 # The trial numbers the injected directives repeat must match the facts block —
 # the hook is allowed to inline them, but not to invent them.
 check("trial length agrees with the facts block", "3 days" in facts["trial_length"])
+# The message-count figure must live in ONE place. The trial model is moving
+# Haiku -> Sonnet, which changes how far the $2 cap stretches, so this number is
+# about to be edited — and a second copy inlined in the hook would silently keep
+# telling users the old figure.
 check(
-    "the trial directive repeats the facts-block numbers",
-    "3 days" in hook._DIRECTIVES["trial_explainer"]
-    and "75 messages a day" in facts["trial_limits"]
-    and "75 messages a day" in hook._DIRECTIVES["trial_explainer"]
-    and "14 days" in hook._DIRECTIVES["trial_explainer"],
+    "the per-day message count lives in the facts block",
+    "75 messages a day" in facts["trial_limits"],
+)
+check(
+    "the trial directive does NOT inline the message count",
+    not any(
+        "75 message" in d or "75/day" in d for d in hook._DIRECTIVES.values()
+    ),
+)
+check(
+    "the trial directive points at the facts block by absolute path",
+    "/skills/concierge/state-machine.yaml" in trial_directive
+    and "`facts`" in trial_directive,
+    trial_directive[:160],
+)
+check(
+    "the trial directive forbids stating limits from memory",
+    "from memory" in trial_directive.lower(),
+)
+# prd.md:118 lists the spend cap alongside the message count. Quoting only the
+# message count implies 75/day is reachable when the $2 cap may end the trial
+# far sooner — that is us misleading the user, not the user misusing it.
+check(
+    "the trial's spend cap is stated alongside the message count",
+    "$2" in facts["trial_limits"],
+    facts["trial_limits"],
 )
 check(
     "no directive quotes a price (prices are answer-only, from facts)",
@@ -423,6 +645,25 @@ check(
 check("Starter is described as the full agent", "full agent" in facts["price_starter"].lower())
 
 # The connected state must not announce a promise the platform cannot keep yet.
+# The tenant-served /connect/<nonce> endpoint ships in Phase 1C. Leading with
+# "send the one-time link" invites the agent to invent a URL — a dead end for
+# the user and a phishing-shaped habit to teach. The YAML notes said so, but
+# notes are the third field down; the hook copy is what gets read.
+_await = all_ctx["awaiting_credential"]
+check(
+    "the credential step says the one-time link does not exist yet",
+    "does not exist yet" in _await.lower(),
+)
+check(
+    "the credential step forbids inventing a URL",
+    "never invent a url" in _await.lower(),
+)
+check(
+    "the credential state's say[] no longer leads with sending the link",
+    not str(states["awaiting_credential"]["say"][0]).lower().startswith("send the one-time link"),
+    str(states["awaiting_credential"]["say"][0])[:80],
+)
+
 check(
     "the connected directive does not claim the trial key was revoked",
     "revoked" not in hook._DIRECTIVES["connected"].lower()
@@ -445,6 +686,26 @@ check(
 check(
     "the mandate still exempts completed tenants",
     "complete" in SOUL_TEXT,
+)
+# A missing state file must mean SILENCE, not "onboard them". SOUL.md has no
+# safety valve: on any tenant without the file, "this is your ONLY job" would
+# assert on every turn forever. The hook is silent on a missing file for the
+# same reason and these two must agree.
+check(
+    "SOUL.md no longer treats a missing state file as unfinished onboarding",
+    "or the file is missing" not in SOUL_TEXT,
+)
+check(
+    "SOUL.md says explicitly what a missing file means",
+    "does not exist" in SOUL_TEXT,
+)
+# Prose that ships to the model every single turn should be instruction, not
+# archaeology. Rationale belongs in HTML comments, which are still there for a
+# maintainer but cost the model nothing to act on.
+_visible = re.sub(r"<!--.*?-->", "", SOUL_TEXT, flags=re.S)
+check(
+    "SOUL.md's maintainer archaeology is in comments, not the prompt body",
+    "it used to be" not in _visible.lower() and "never noticed it" not in _visible.lower(),
 )
 
 # Position is the point. Buried at line 79 of 93 it never fired.
@@ -481,11 +742,24 @@ check(
 )
 check("the hook has a timeout", bool(pre_llm and pre_llm[0].get("timeout")))
 
-# The gateway has no TTY. Without auto-accept the hook silently never
+# The gateway has no TTY. Without an auto-accept opt-in the hook silently never
 # registers — a failure indistinguishable from the bug being fixed.
+#
+# It must be the Dockerfile env var, NOT `hooks_auto_accept` in config.yaml:
+# config.yaml is seeded once and then owned by the tenant (hermes rewrites it on
+# migrations and via upstream mark_seen; the agent edits `timezone:`), so a key
+# there only looks image-managed. HERMES_ACCEPT_HOOKS is honoured by
+# _resolve_effective_accept (agent/shell_hooks.py:848).
 check(
-    "shell hooks are auto-accepted (the gateway has no TTY to consent on)",
-    CONFIG_YAML.get("hooks_auto_accept") is True,
+    "auto-accept is set in the image, via HERMES_ACCEPT_HOOKS",
+    re.search(r"^ENV HERMES_ACCEPT_HOOKS=1", DOCKERFILE, re.M) is not None,
+)
+# The parsed key, not the raw text — the comment above it legitimately explains
+# why hooks_auto_accept is NOT used here, and that prose should stay.
+check(
+    "auto-accept is not an active key in the tenant-writable config",
+    CONFIG_YAML.get("hooks_auto_accept") is None,
+    f"hooks_auto_accept={CONFIG_YAML.get('hooks_auto_accept')!r}",
 )
 
 # Upstream's profile-build directive is the strongest competitor for the same
@@ -521,6 +795,18 @@ check(
     "patch 005 only suppresses while onboarding is unfinished",
     '!= "complete"' in patch_text,
 )
+# The state read must sit INSIDE the first-message guard: that block runs once
+# per tenant lifetime, so onboarding costs no filesystem stat on any later turn.
+check(
+    "patch 005 reads state inside the first-message guard, not on every turn",
+    patch_text.index("has_any_sessions") < patch_text.index("_sq_state_path"),
+)
+check(
+    "patch 005 guards every append site (3 of them)",
+    patch_text.count("(squire patch 005)") >= 3,
+    f"guards={patch_text.count('(squire patch 005)')}",
+)
+
 check(
     "patch 005 fails open to upstream behaviour",
     "except Exception:" in patch_text and "_squire_concierge_active = False" in patch_text,

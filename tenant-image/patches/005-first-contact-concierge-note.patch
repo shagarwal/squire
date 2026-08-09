@@ -1,47 +1,65 @@
 diff --git a/gateway/run.py b/gateway/run.py
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -17181,11 +17181,42 @@
-                             "Session hygiene auto-compress failed: %s", e
-                         )
- 
-+        # (squire patch 005) Squire ships its own first-conversation flow (the
-+        # `concierge` skill, driven deterministically by the pre_llm_call hook
-+        # in bin/squire-concierge-hook.py). Upstream's first-contact note is a
-+        # COMPETING directive in the exact same user-message sidecar slot: it
-+        # tells the model to keep the introduction to "one or two sentences max"
-+        # and to advertise /help. On a Haiku-class trial model that short,
-+        # concrete instruction reliably beats our longer one, which is precisely
-+        # how the first live tenant produced a two-line greeting and no
-+        # onboarding at all. So: while Squire's concierge is mid-flow, upstream's
-+        # note is suppressed and the concierge owns the turn. Once concierge
-+        # state reads `complete` (or the file is absent/corrupt, i.e. this is not
-+        # a Squire tenant) upstream's behaviour is restored untouched.
-+        _squire_concierge_active = False
-+        try:
-+            import json as _sq_json
-+            _sq_state_path = _hermes_home / ".squire" / "concierge-state.json"
-+            _sq_raw = _sq_json.loads(_sq_state_path.read_text(encoding="utf-8"))
-+            _squire_concierge_active = (
-+                isinstance(_sq_raw, dict)
-+                and str(_sq_raw.get("state") or "").strip() != "complete"
-+            )
-+        except Exception:
-+            # Missing file, bad JSON, unreadable path -> not a Squire tenant
-+            # mid-onboarding. Fail OPEN to upstream behaviour; never let this
-+            # check break the first message.
-+            _squire_concierge_active = False
-+
-         # First-message onboarding -- only on the very first interaction ever.
-         # Delivered on the current user message (sidecar), NOT the ephemeral
+@@ -17186,6 +17186,39 @@
          # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
          # system-prompt diff and agent rebuild.
--        if not history and not await self.async_session_store.has_any_sessions():
-+        if (
-+            not history
-+            and not await self.async_session_store.has_any_sessions()
-+            and not _squire_concierge_active
-+        ):
+         if not history and not await self.async_session_store.has_any_sessions():
++            # (squire patch 005) Squire ships its own first-conversation flow
++            # (the `concierge` skill, driven deterministically by the
++            # pre_llm_call hook in bin/squire-concierge-hook.py). The note built
++            # below is a COMPETING directive in the exact same user-message
++            # sidecar: it caps the introduction at "one or two sentences max"
++            # and advertises /help. On a Haiku-class trial model that short,
++            # concrete instruction reliably beats our longer one — which is
++            # precisely how the first live tenant produced a two-line greeting
++            # and no onboarding at all.
++            #
++            # So while Squire's concierge is mid-flow, none of the three
++            # append sites below fire and the concierge owns the turn. Once
++            # concierge state reads `complete` — or the file is absent or
++            # unreadable, i.e. this is not a Squire tenant — upstream's
++            # behaviour is restored untouched.
++            #
++            # The read sits INSIDE this guard on purpose: the block runs once
++            # per tenant lifetime, so onboarding costs no stat() on any later
++            # turn.
++            _squire_concierge_active = False
++            try:
++                import json as _sq_json
++                _sq_state_path = _hermes_home / ".squire" / "concierge-state.json"
++                _sq_raw = _sq_json.loads(_sq_state_path.read_text(encoding="utf-8"))
++                _squire_concierge_active = (
++                    isinstance(_sq_raw, dict)
++                    and str(_sq_raw.get("state") or "").strip() != "complete"
++                )
++            except Exception:
++                # Fail OPEN to upstream behaviour; never let this check break
++                # the very first message.
++                _squire_concierge_active = False
++
              # Default first-contact note: a brief self-introduction.
              _intro_note = (
                  "[System note: This is the user's very first message ever. "
+@@ -17211,16 +17244,18 @@
+                     profile_build_mode(_onb_cfg) == "ask"
+                     and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
+                 ):
+-                    turn_sidecar_notes.append(profile_build_directive().strip())
++                    if not _squire_concierge_active:  # (squire patch 005)
++                        turn_sidecar_notes.append(profile_build_directive().strip())
+                     mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+-                else:
++                elif not _squire_concierge_active:  # (squire patch 005)
+                     turn_sidecar_notes.append(_intro_note)
+             except Exception as _pb_err:
+                 logger.debug(
+                     "Profile-build onboarding directive failed, using plain intro: %s",
+                     _pb_err,
+                 )
+-                turn_sidecar_notes.append(_intro_note)
++                if not _squire_concierge_active:  # (squire patch 005)
++                    turn_sidecar_notes.append(_intro_note)
+         
+         # One-time prompt if no home channel is set for this platform
+         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)

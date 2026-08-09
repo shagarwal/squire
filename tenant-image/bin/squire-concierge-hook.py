@@ -47,12 +47,42 @@ Every failure path here prints nothing and exits 0. A broken onboarding hook
 must degrade to "no onboarding", never to "no reply". This runs in front of
 every single message the user sends, forever — it is not allowed to be the
 reason a turn dies.
+
+WHOSE TURNS THIS FIRES ON
+-------------------------
+Only the user's own. Delegated subagents (tools/delegate_tool.py) and cron jobs
+(cron/scheduler.py) drive the same conversation loop and therefore the same
+`pre_llm_call` hook — and a subagent told to "say hello and introduce yourself"
+would greet nobody while burning the safety valve. This is not hypothetical: the
+`ask_first_job` step actively encourages starting real work mid-onboarding,
+which is exactly when delegation happens. Both are identified and skipped:
+subagents carry a non-empty ``parent_session_id`` (set in agent/agent_init.py;
+a TOP-LEVEL payload key per agent/shell_hooks.py:431) and cron turns carry
+``platform == "cron"`` (cron/scheduler.py:3518).
+
+KNOWN GAP: MULTIMODAL FIRST MESSAGES
+------------------------------------
+If the user's very first message is a photo or voice note rather than text, our
+injected context is silently dropped: ``compose_user_api_content``
+(agent/turn_context.py:53-75) returns None for non-string content, so nothing is
+appended to the user message. Patch 005 will meanwhile have suppressed
+upstream's own first-contact note — the one case where that patch is
+net-negative.
+
+The backstop is SOUL.md, whose mandate lives in the identity slot and is
+unaffected by content type. It is weaker than this hook (that weakness is why
+the hook exists), but it is not nothing, and the next text message re-fires this
+hook normally because the state file still says the step is unfinished. Accepted
+deliberately rather than papered over: opening a brand-new agent with a voice
+note is rare, and teaching the patch to distinguish content types would buy a
+rarer case at the price of a much more fragile patch.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -61,13 +91,18 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # The failure mode opposite to "no onboarding" is "endless onboarding": if the
 # agent never writes the state file, an unbounded hook would re-inject the same
-# directive on every turn forever — Groundhog Day, on a trial capped at 75
-# messages a day. So we count how many turns we have injected and give up.
+# directive on every turn forever — Groundhog Day, on a metered trial.
 #
-# 14 is comfortably more than the 6-state flow needs even with detours (the
-# user asking about price, a failed credential, a real task done mid-flow), and
-# far below the point where a stuck flow has burned the trial.
-MAX_INJECTED_TURNS = 14
+# The budget is PER STATE and resets whenever the state changes, because the
+# thing we actually want to detect is being STUCK, not being slow. A global
+# budget conflates the two: a user who chats for a while at each step, or who
+# asks a question mid-flow, would exhaust it having made perfect progress, and
+# every subagent or cron turn that slipped through would eat the same pool.
+#
+# 8 turns on a single step is already well past "they didn't understand the
+# question"; at that point continuing to push the same instruction is worse
+# than dropping it and letting the agent be useful.
+MAX_INJECTED_TURNS_PER_STATE = 8
 
 # ---------------------------------------------------------------------------
 # Per-state directives
@@ -104,16 +139,21 @@ short flowing lines with no bullet points, no headings and no bold:
    Use these and nothing else: you remember everything across every
    conversation, so they never have to repeat themselves; you can go off and do
    a thing and then follow up on your own later, including on a schedule; and
-   you always check with them first before anything that deletes, spends money,
-   or goes out to another person.
+   you check with them before anything that deletes, spends money, or goes out
+   to another person.
 3. Tell them the one thing they have to know: they are on a free 3-day trial
    running on Squire's shared AI, which is capped, and that connecting their own
    AI account is what unlocks the full thing — say you will walk them through it
    in a minute. Do not explain the trial further yet and do not list any prices.
 4. Ask exactly ONE question: what should you call them?
 
-Then stop and wait for their answer. Do not ask a second question. Do not
-mention slash commands or /help. Do not offer to build a profile of them.""",
+KEEP IT UNDER 120 WORDS, and under 8 short lines. This is a text message, not
+a landing page: a wall of text on message one is its own kind of failure, just
+as bad as saying nothing. Say each of the four things in a sentence or two and
+stop.
+
+Then wait for their answer. Do not ask a second question. Do not mention slash
+commands or /help. Do not offer to build a profile of them.""",
     "ask_name": """You are waiting to learn what to call this person. If their message contains a
 name, take it, use the short form, and thank them in half a sentence — do not
 make a production of it. Save it with the hindsight_retain tool. Then ask ONE
@@ -125,8 +165,17 @@ first and ask for their name once more, lightly. Never ask twice in a row.""",
     "ask_timezone": """You are waiting for this person's location or timezone. Convert whatever they
 give you (a city is a perfectly good answer) into an IANA timezone name such as
 Europe/London or America/Los_Angeles. Do three things: save it with
-hindsight_retain, write it into the `timezone:` key of ${HERMES_HOME}/config.yaml
-with the terminal tool, and confirm it back to them in a few words.
+hindsight_retain, confirm it back to them in a few words, and write ONLY the
+`timezone:` line of {config_file} with this exact command
+(edit the zone name, change nothing else — that file also holds the runtime's
+own settings and rewriting it wholesale would break them):
+
+    python3 - <<'PY'
+    import re, pathlib
+    p = pathlib.Path("{config_file}")
+    s = p.read_text()
+    p.write_text(re.sub(r'(?m)^timezone:.*$', 'timezone: "Europe/London"', s))
+    PY
 
 Then ask ONE question: what is one thing they would like you to take off their
 plate this week.""",
@@ -141,14 +190,13 @@ a form to get the thing they asked for.
 Do not ask a new question this turn. Let them react to the work.""",
     "trial_explainer": """Explain the trial, once, honestly, in under five lines, then stop.
 
-Only these facts, exactly: it is free for 3 days (72 hours) from signup with no
-card; it is capped at 75 messages a day; at 72 hours you stop answering and
-reply only with a link to subscribe; their data is kept for 14 days after that
-and then permanently destroyed unless they subscribe.
+Read the `facts` block in {skill_file} FIRST and state the
+trial's length, cost, usage limits and what happens at the end using the values
+written there. Those values are contractual and they change: never state a
+limit, a price or a duration from memory, and never round or soften one.
 
-Do not pitch. Do not quote any price unless they ask — if they do ask, the only
-numbers you may say are in ${HERMES_SKILL_DIR}/state-machine.yaml under `facts`.
-Do not ask a question this turn.""",
+Do not pitch. Do not quote a price unless they ask. Do not ask a question this
+turn.""",
     "connect_llm": """Now do the step that matters most: get them onto their own AI account.
 
 Frame it truthfully. Right now they are on Squire's shared trial brain, which is
@@ -157,7 +205,7 @@ means their AI costs go to their own provider and their conversations stop
 touching Squire's AI infrastructure entirely.
 
 Then ask which of these four they already have. Read
-${HERMES_SKILL_DIR}/state-machine.yaml under `providers` and use those honest
+{skill_file} under `providers` and use those honest
 labels:
 
   - an OpenAI API key (fully supported)
@@ -169,11 +217,15 @@ labels:
 Never soften, bury or omit that last warning to make the option look better. If
 they say "not now", accept it immediately without nagging and write the state as
 "complete".""",
-    "awaiting_credential": """This person is sending, or about to send, an AI account credential. Never let a
-credential travel through chat if you can avoid it — follow
-${HERMES_SKILL_DIR}/state-machine.yaml under `awaiting_credential`.
+    "awaiting_credential": """This person is sending, or about to send, an AI account credential.
 
-If they pasted an API key into the chat anyway: store it in ${HERMES_HOME}/.env
+THE ONE-TIME LINK DOES NOT EXIST YET. The tenant-served `/connect/<nonce>`
+endpoint ships in Phase 1C; until then there is no link to send, and you must
+never invent a URL. So ask them to paste the key here, and handle it exactly as
+below. Read {skill_file} under `awaiting_credential` for
+the detail.
+
+When they paste an API key into the chat: store it in {env_file}
 immediately, then DELETE their Telegram message right away without asking, then
 tell them once, plainly and without scolding, that the key worked, that you
 removed the message, and that a pasted key did travel through Telegram and
@@ -224,8 +276,28 @@ def _state_path() -> Path:
     return Path(state_dir) / "concierge-state.json"
 
 
+def _home() -> Path:
+    """The tenant's HERMES_HOME (Dockerfile sets it to the mounted volume)."""
+    return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _skill_file() -> str:
+    """Absolute path to state-machine.yaml, for quoting into directives.
+
+    NOT ``${HERMES_SKILL_DIR}``. That variable is substituted by hermes only
+    while loading *skill content* (skills/skill_commands.py, gated on
+    ``skills.template_vars``) — it is not an OS environment variable, so it
+    does not exist in the shell the agent's terminal tool runs in. A directive
+    saying "read ${HERMES_SKILL_DIR}/state-machine.yaml" therefore expands to
+    "/state-machine.yaml" and the model finds nothing. That mattered most in
+    `trial_explainer`, where the pointer to the authoritative `facts` block is
+    the guard rail against inventing prices and limits.
+    """
+    return str(_home() / "skills" / "concierge" / "state-machine.yaml")
+
+
 def _counter_path(state_file: Path) -> Path:
-    """Sibling file holding the injected-turn count for the safety valve.
+    """Sibling file holding the safety-valve counter, as "<state> <count>".
 
     Kept OUT of concierge-state.json on purpose: that file is written by the
     agent, and a hook that read-modify-writes the same file the agent is
@@ -235,16 +307,22 @@ def _counter_path(state_file: Path) -> Path:
     return state_file.with_name("concierge-hook-turns")
 
 
-def _bump_counter(path: Path) -> int:
-    """Increment and return the injected-turn counter. Never raises."""
-    count = 0
+def _bump_counter(path: Path, state: str) -> int:
+    """Count consecutive injections for `state`, resetting on any change."""
+    prev_state, count = "", 0
     try:
-        count = int(path.read_text(encoding="utf-8").strip() or "0")
+        parts = path.read_text(encoding="utf-8").split()
+        if len(parts) == 2:
+            prev_state, count = parts[0], int(parts[1])
     except Exception:
-        count = 0
-    count += 1
+        prev_state, count = "", 0
+
+    # Progress resets the budget. Anything else — including a legacy
+    # bare-integer counter file from an older image — starts a fresh count.
+    count = count + 1 if prev_state == state else 1
+
     try:
-        path.write_text(str(count), encoding="utf-8")
+        path.write_text(f"{state} {count}", encoding="utf-8")
     except Exception:
         # An unwritable counter must not stop onboarding — we just lose the
         # safety valve, which is the less bad of the two failures.
@@ -252,16 +330,36 @@ def _bump_counter(path: Path) -> int:
     return count
 
 
-def _build_context(state: str, state_file: Path) -> str:
+def _build_context(state: str, state_file: Path, raw: dict) -> str:
     """Assemble the injected directive for `state`."""
+    # Resolve paths to absolute literals. Done with str.replace rather than
+    # str.format so a stray brace anywhere in the copy can never raise — this
+    # runs in front of every message and must not be able to fail.
     directive = _DIRECTIVES[state]
+    for token, value in (
+        ("{skill_file}", _skill_file()),
+        ("{config_file}", str(_home() / "config.yaml")),
+        ("{env_file}", str(_home() / ".env")),
+    ):
+        directive = directive.replace(token, value)
+
     next_state = _NEXT_STATE.get(state, COMPLETION_STATE)
 
     # The literal write command matters. "Update the state file" is the kind of
-    # soft instruction a small model silently skips; a copy-pasteable command
-    # is not. Onboarding surviving a restart depends entirely on this landing.
-    write_cmd = (
-        "printf '%s' '{\"state\":\"" + next_state + "\"}' > " + str(state_file)
+    # soft instruction a small model silently skips; a copy-pasteable command is
+    # not. Onboarding surviving a restart depends entirely on this landing.
+    #
+    # It renders the file's CURRENT keys with only `state` advanced, so the
+    # command is complete on its own. An earlier version told the model to run a
+    # truncating `printf >` *and* to keep the file's existing keys — two
+    # contradictory instructions, in precisely the place we are engineering
+    # against silent skips. shlex.quote because a name like O'Brien would
+    # otherwise break out of the shell quoting.
+    payload = dict(raw)
+    payload["state"] = next_state
+    write_cmd = "printf '%s' {} > {}".format(
+        shlex.quote(json.dumps(payload, separators=(",", ":"), ensure_ascii=False)),
+        shlex.quote(str(state_file)),
     )
 
     return (
@@ -273,12 +371,15 @@ def _build_context(state: str, state_file: Path) -> str:
         "else conversational, and do not skip ahead to a later step.\n\n"
         f"{directive}\n\n"
         "When this step is done, record it by running exactly this with the "
-        "terminal tool, keeping any keys the file already has:\n"
+        "terminal tool:\n"
         f"    {write_cmd}\n"
-        "If you do not write that file, you will repeat this same step on the "
-        "next message and the person will notice.\n\n"
+        "That command already carries every key the file has. If you learned "
+        "something this turn (their name, their timezone), edit that value "
+        "inside the command before you run it.\n"
+        "If you do not run it, you will repeat this same step on the next "
+        "message and the person will notice.\n\n"
         "If they ask you to stop onboarding, or just start giving you real work "
-        "to do, then do the real work and write \"complete\" as the state "
+        "to do, then do the real work and set the state to \"complete\" "
         "instead. Never block someone at the front door.]"
     )
 
@@ -288,9 +389,22 @@ def main() -> int:
     # a broken pipe writing the payload — a hook that is supposed to be
     # invisible must not perturb the caller.
     try:
-        sys.stdin.read()
+        payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
-        pass
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # Onboarding is a conversation with a PERSON. Subagents and cron jobs run
+    # the same loop and fire the same hook; injecting "say hello and introduce
+    # yourself" into either produces a greeting nobody reads. Skip both. See the
+    # module docstring for where these two fields come from.
+    extra = payload.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    if str(payload.get("parent_session_id") or "").strip():
+        return 0
+    if str(extra.get("platform") or payload.get("platform") or "").strip().lower() == "cron":
+        return 0
 
     state_file = _state_path()
 
@@ -318,10 +432,10 @@ def main() -> int:
         # the safe answer; nagging with a directive we have no script for is not.
         return 0
 
-    if _bump_counter(_counter_path(state_file)) > MAX_INJECTED_TURNS:
+    if _bump_counter(_counter_path(state_file), state) > MAX_INJECTED_TURNS_PER_STATE:
         return 0
 
-    json.dump({"context": _build_context(state, state_file)}, sys.stdout)
+    json.dump({"context": _build_context(state, state_file, raw)}, sys.stdout)
     return 0
 
 

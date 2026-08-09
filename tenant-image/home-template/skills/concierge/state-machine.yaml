@@ -25,7 +25,21 @@ facts:
   trial_length: "3 days (72 hours) from signup"
   trial_cost: "free, no card"
   trial_model: "a fast, capable model on Squire's account"
-  trial_limits: "75 messages a day during the trial"
+  # THE SINGLE SOURCE for what the trial allows. Nothing else in this repo —
+  # not SKILL.md, not the injected directives in bin/squire-concierge-hook.py —
+  # restates these numbers. The hook points the agent at this key by absolute
+  # path instead of inlining it, so changing the allowance is a one-line edit
+  # here that cannot leave a stale copy behind saying something different.
+  # (That matters right now: the trial model is moving Haiku -> Sonnet, which
+  # changes how far the spend cap stretches.)
+  #
+  # Both halves are load-bearing and prd.md:118 lists them together: the
+  # per-day message count AND the hard spend cap, which can end the trial
+  # sooner. Quoting only the message count implies 75/day is reachable when it
+  # may not be — and a user who stops at far fewer has been misled by us.
+  trial_limits: >
+    75 messages a day, and a $2 total AI-usage budget for the whole trial —
+    whichever runs out first.
   trial_end_behaviour: >
     At 72 hours the agent stops answering and replies only with a link to
     subscribe. The tenant's data is kept for 14 days and then permanently
@@ -86,11 +100,16 @@ capabilities:
       Starter) and $HERMES_HOME/cron is created at boot.
   - id: approvals
     say: >
-      You always check first before anything that deletes, spends money, or
-      goes out to another person.
+      You check with them before anything that deletes, spends money, or goes
+      out to another person.
     real_because: >
       Upstream approval flow, kept at defaults deliberately (config.yaml
       "Approvals"), with cross-chat routing from patches 002/003.
+    # Deliberately "you check with them", NOT "you ALWAYS check first". The
+    # upstream default is approvals.mode: "smart" (config_defaults.py:2044) —
+    # an LLM guardian deciding per action, not a deterministic gate on a fixed
+    # list. "Always" would be a promise the runtime does not actually make, and
+    # the one time it silently didn't hold is the one time it would matter.
   - id: skills
     say: >
       You can be taught new skills, and you pick up the ones you have when they
@@ -239,10 +258,18 @@ states:
   awaiting_credential:
     goal: Get the credential in without it travelling through chat.
     say:
-      - Send the one-time link. It is served by their own container, so the
-        credential goes browser -> their agent and never through Squire's shared
-        services.
-      - Tell them the link is single-use and short-lived.
+      # NOT YET: the one-time link does not exist until Phase 1C. Leading with
+      # it (as this state used to) invites the agent to invent a URL, which is
+      # both a dead end for the user and a phishing-shaped thing for us to
+      # teach. The paste path below is the ONLY live path today.
+      - >-
+        There is no one-time link yet. Ask them to paste the key here and
+        handle it exactly as `on_paste_in_chat` says. Never invent a URL.
+      - >-
+        WHEN 1C SHIPS, this becomes: send the one-time link, served by their
+        own container, so the credential goes browser -> their agent and never
+        through Squire's shared services; tell them it is single-use and
+        short-lived.
     ask: null
     then: connected
     on_paste_in_chat:

@@ -122,15 +122,24 @@ hooks:
     - command: "/opt/squire/bin/squire-concierge-hook.py"
       timeout: 10
 
-# Shell hooks normally require an interactive consent prompt on first use. The
-# gateway has no TTY, so without this the hook above would silently never
-# register — a failure that looks exactly like the bug we are fixing.
+# Shell hooks normally require an interactive consent prompt on first use, and
+# the gateway has no TTY — so without an opt-in the hook above silently never
+# registers, a failure that looks exactly like the bug we are fixing.
 #
-# This is not a privilege boundary: the hook is baked into the image, and the
-# agent already has the `terminal` tool, so nothing here grants code execution
-# that was not already available. It does mean any hook later added to this file
-# is auto-accepted, which is why this file is image-managed.
-hooks_auto_accept: true
+# That opt-in is HERMES_ACCEPT_HOOKS=1, set in the Dockerfile rather than as
+# `hooks_auto_accept: true` here. This file is NOT image-managed: it is seeded
+# once and thereafter owned by the tenant (0644, hermes-owned, later boots only
+# top up files it lacks), hermes rewrites it during config migrations and via
+# upstream's onboarding `mark_seen`, and the agent itself edits `timezone:`. An
+# env var survives all of that; a config key does not.
+#
+# What auto-accept actually costs, stated plainly: first-use consent is skipped
+# for EVERY hook in this file, not only ours; those hooks persist across
+# restarts; and they execute outside the tool-approval path the user sees. It
+# is not a privilege escalation — the agent already has the `terminal` tool, so
+# arbitrary execution was always available — but it is a real widening of what
+# runs without anyone being asked, which is why the `hooks:` block above should
+# stay short and reviewed.
 
 # --- Approvals -------------------------------------------------------------
 # Left at upstream defaults deliberately. The dangerous-action approval flow is
