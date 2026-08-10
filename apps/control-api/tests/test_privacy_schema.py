@@ -81,6 +81,14 @@ EXPECTED_COLUMNS = {
         # not a credential, and the upgrade drill cannot verify a rollout without it.
         "image_ref",
         "dek_set",
+        # The deep-link owner-binding nonce (SQUIRE_BIND_NONCE / ?start=). A
+        # credential, but OURS and control-plane-minted, like bot.webhook_secret
+        # -- never user material, never conversation content. It must be stored:
+        # the t.me/?start= link is built from it after provisioning finishes,
+        # and a retry must reuse rather than rotate it. All it can unlock is the
+        # first owner binding on an EMPTY tenant, and delete_tenant nulls it so
+        # a recycled bot cannot carry it to its next tenant.
+        "bind_nonce",
         "trial_key_alias",
         "trial_key_active",
         "webhook_set",

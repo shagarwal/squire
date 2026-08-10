@@ -19,7 +19,7 @@ BOT_TOKEN = f"{BOT_ID}:AA-secret"
 LITELLM = "https://trial-proxy.squire.test"
 
 
-def seed_running_tenant() -> str:
+def seed_running_tenant(bind_nonce: str | None = None) -> str:
     """Insert a fully-provisioned tenant + bot directly (no state machine)."""
     with db.session_scope() as s:
         s.add(
@@ -45,6 +45,7 @@ def seed_running_tenant() -> str:
                 trial_key_alias="squire-trial-t-1",
                 trial_key_active=True,
                 webhook_set=True,
+                bind_nonce=bind_nonce,
             )
         )
         s.commit()
@@ -179,6 +180,18 @@ def test_get_tenant_exposes_status_but_no_secrets(client, auth):
     # The bot token is a Squire credential; it has no business leaving control-api.
     assert BOT_TOKEN not in r.text
     assert "dek" not in r.text.lower() or body.get("dek_set") is True
+
+
+def test_tenant_link_carries_the_bind_nonce_once_provisioned(client, auth):
+    """The ?start= deep link is THE handout path for the bind nonce: the tenant
+    only binds a /start carrying it, so a bare link would onboard the user into
+    upstream's pairing-code dead end. (Before set_variables mints a nonce the
+    link is bare — see test_create_tenant_returns_job_and_bot_link — which is
+    fine because that link is not yet tappable anyway.)"""
+    seed_running_tenant(bind_nonce="n0nce-abc123")
+    r = client.get("/internal/tenants/t-1", headers=auth)
+    assert r.status_code == 200
+    assert r.json()["telegram_link"] == "https://t.me/squire_alpha_bot?start=n0nce-abc123"
 
 
 def test_get_unknown_tenant_404s(client, auth):

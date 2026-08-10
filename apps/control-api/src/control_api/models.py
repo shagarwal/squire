@@ -148,6 +148,17 @@ class Tenant(SQLModel, table=True):
     # A flag, never the key itself. The DEK lives only as a Railway service variable.
     dek_set: bool = False
 
+    # Deep-link owner-binding nonce (tenant variable SQUIRE_BIND_NONCE, deep link
+    # `?start=<nonce>`). Unlike the DEK this IS stored: the t.me link is built
+    # from this row every time the tenant is served, after provisioning has
+    # finished, so the value must be re-readable — and a provisioning retry must
+    # reuse it, or the link already handed out stops working. It is a
+    # control-plane-minted pairing credential like `Bot.webhook_secret` (ours,
+    # not the user's): all it can ever unlock is the FIRST owner binding on an
+    # empty, brand-new tenant. Cleared by `delete_tenant` so a recycled pool bot
+    # never carries the previous tenant's nonce forward.
+    bind_nonce: str | None = None
+
     # We revoke trial keys *by alias* so the key material never enters this DB.
     trial_key_alias: str | None = None
     trial_key_active: bool = False
