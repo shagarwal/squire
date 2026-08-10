@@ -133,6 +133,12 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         # heartbeat, which is what lets /fleet report the fleet's real image and
         # lets the upgrade drill skip tenants already on the target.
         "SQUIRE_IMAGE_REF",
+        # Deep-link owner-binding nonce: without it, the previous owner of a
+        # RECYCLED pool bot can bind themselves to the next tenant provisioned
+        # on that bot (autopair binds the first human sender on an empty
+        # store). The tenant only binds a /start that carries this value, and
+        # the real user receives it via the t.me/<bot>?start=<nonce> link.
+        "SQUIRE_BIND_NONCE",
     }
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
@@ -149,6 +155,15 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         assert provisioning.get_tenant(s, tenant_id).image_ref == sent["SQUIRE_IMAGE_REF"]
     # DEK is exactly 32 random bytes, base64 encoded.
     assert len(base64.b64decode(sent["SQUIRE_DEK"])) == 32
+    # The bind nonce is persisted on the tenant row (the ?start= deep link is
+    # built from it after provisioning) and must be what the tenant was handed.
+    # token_urlsafe(32) -> 43 chars of Telegram's [A-Za-z0-9_-] start-payload
+    # alphabet, comfortably under its 64-char limit.
+    nonce = sent["SQUIRE_BIND_NONCE"]
+    assert len(nonce) >= 32
+    assert all(c.isalnum() or c in "-_" for c in nonce), nonce
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).bind_nonce == nonce
 
 
 @respx.mock
@@ -655,9 +670,17 @@ def test_stop_and_delete_tenant(pool_bot, fake_railway):
     assert "deploymentStop" in fake_railway.operations()
 
     with db.session_scope() as s:
+        # Provisioning minted a bind nonce; deletion must not leave it behind.
+        assert provisioning.get_tenant(s, tenant_id).bind_nonce
+
+    with db.session_scope() as s:
         tenant = provisioning.delete_tenant(s, tenant_id)
         assert tenant.status == TenantStatus.DELETED
         assert tenant.railway_service_id is None
+        # The bind nonce dies with the tenant: the pool bot is recycled, and a
+        # surviving nonce would let this tenant's owner (or anyone holding the
+        # old ?start= link) bind themselves to the bot's NEXT tenant.
+        assert tenant.bind_nonce is None
         # Bot returns to the pool for reuse (PRD §4 bot supply).
         bot = s.get(Bot, BOT_ID)
         assert bot.status == BotStatus.AVAILABLE
@@ -829,6 +852,9 @@ def test_last_error_never_leaks_secrets_from_the_variables_payload(pool_bot, fak
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_WEBHOOK_SECRET",
         "INTERNAL_API_TOKEN",
+        # The bind nonce is a pairing credential: leaked, it lets anyone bind
+        # themselves as owner of this tenant before the real user taps Start.
+        "SQUIRE_BIND_NONCE",
     ):
         assert captured[name] not in error, f"{name} value leaked into last_error"
     assert "[REDACTED]" in error
@@ -856,6 +882,34 @@ def test_retry_after_set_variables_failure_keeps_the_same_dek(pool_bot, fake_rai
         provisioning._step_set_variables(s, tenant, provisioning.ProvisionClients.build())
     second = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
     assert "SQUIRE_DEK" not in second, "a set DEK must never be rotated by a retry"
+
+
+@respx.mock
+def test_retry_after_set_variables_failure_keeps_the_same_bind_nonce(pool_bot, fake_railway):
+    """Same retry discipline as the DEK, different mechanics: the nonce IS stored
+    (the ?start= deep link is built from the row), so a retry re-sends the SAME
+    value rather than omitting it. Rotating it would hand the user a link the
+    tenant no longer accepts."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        tenant_id, job_id = tenant.id, job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    first = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert first["SQUIRE_BIND_NONCE"]
+
+    # Re-run the step directly, as a retry of a resumed job would.
+    with db.session_scope() as s:
+        tenant = provisioning.get_tenant(s, tenant_id)
+        provisioning._step_set_variables(s, tenant, provisioning.ProvisionClients.build())
+    second = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert second["SQUIRE_BIND_NONCE"] == first["SQUIRE_BIND_NONCE"], (
+        "a retry must reuse the stored nonce, never rotate it"
+    )
+    with db.session_scope() as s:
+        assert provisioning.get_tenant(s, tenant_id).bind_nonce == first["SQUIRE_BIND_NONCE"]
 
 
 @respx.mock

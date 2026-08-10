@@ -1,7 +1,9 @@
 """Secret generation.
 
 The only cryptographic thing control-api does in v0 is *mint* secrets and forget
-them. Nothing here ever reaches the database.
+them. Nothing here ever reaches the database — with one deliberate exception:
+the deep-link bind nonce is stored on the tenant row (see `generate_bind_nonce`
+and `models.Tenant.bind_nonce` for why that is safe and necessary).
 """
 
 from __future__ import annotations
@@ -33,6 +35,22 @@ def generate_webhook_secret() -> str:
 
     Telegram allows 1-256 chars of `A-Z a-z 0-9 _ -`, which is exactly the
     URL-safe base64 alphabet, so `token_urlsafe` is always valid.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def generate_bind_nonce() -> str:
+    """The tenant's one-time owner-binding nonce (`SQUIRE_BIND_NONCE`).
+
+    Travels twice: to the tenant as a Railway variable, and to the user inside
+    the `https://t.me/<bot>?start=<nonce>` deep link. The tenant's autopair
+    refuses to bind an owner unless the first `/start` carries this value, which
+    is what stops the previous owner of a RECYCLED pool bot from binding
+    themselves to the bot's next tenant.
+
+    Telegram start payloads allow up to 64 chars of `A-Z a-z 0-9 _ -` — exactly
+    the URL-safe base64 alphabet, so `token_urlsafe(32)` (43 chars) is always a
+    valid payload.
     """
     return secrets.token_urlsafe(32)
 

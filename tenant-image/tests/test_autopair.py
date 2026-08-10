@@ -42,6 +42,11 @@ from squire_autopair import (  # noqa: E402
 
 failures: list[str] = []
 
+# Sections 1-10 exercise the legacy (nonce-less) behaviour, so they must run in
+# unauthenticated mode regardless of what the invoking shell has exported.
+# Section 11 sets/clears the variable around each of its own assertions.
+os.environ.pop("SQUIRE_BIND_NONCE", None)
+
 
 def check(label: str, cond: bool, detail: str = "") -> None:
     if cond:
@@ -221,10 +226,14 @@ u = dm(1, text="/start@SquireBot")
 defang_start_command(u)
 check("/start@Bot handled", u["message"]["text"] == "start", u["message"]["text"])
 
+# SECURITY: the deep-link payload IS the bind nonce when ?start= auth is on, and
+# the defanged text becomes a real user turn — transcript AND Hindsight memory.
+# Keeping the payload would persist a live pairing credential in both. The click
+# carried nothing the agent needs to see, so the payload is always dropped.
 u = dm(1, text="/start ref_abc123")
 defang_start_command(u)
-check("deep-link payload preserved",
-      u["message"]["text"] == "start ref_abc123", u["message"]["text"])
+check("deep-link payload stripped (nonce must not enter the transcript)",
+      u["message"]["text"] == "start", u["message"]["text"])
 
 # The bot_command entity must go with the slash, or adapters still see a command.
 u = dm(1, text="/start")
@@ -239,21 +248,35 @@ defang_start_command(u)
 check("entity covering only the slash is dropped",
       "entities" not in u["message"], u["message"].get("entities"))
 
-# Surviving entities must SHIFT LEFT: we removed one character from the front of
-# the text and entity offsets are absolute indices. An earlier version of this
-# test asserted the UNshifted offsets and so encoded the off-by-one as correct.
+# With the payload stripped, "/start ref_abc" -> "start" deletes far more than
+# the single leading slash (delta != 1), so the remap arithmetic cannot apply and
+# entities are dropped rather than mis-shifted — same honest fallback as the
+# "/start@Bot" case below.
 u = dm(1, text="/start ref_abc")
 u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
                             {"type": "code", "offset": 7, "length": 7}]
 defang_start_command(u)
-check("command entity dropped, later entities shift left by one",
-      u["message"]["entities"] == [{"type": "code", "offset": 6, "length": 7}],
+check("payload deletion drops entities rather than mis-shift",
+      "entities" not in u["message"], u["message"].get("entities"))
+check("payload deletion still yields bare 'start'",
+      u["message"]["text"] == "start", u["message"]["text"])
+
+# Surviving entities must SHIFT LEFT on the one edit that still qualifies for the
+# remap: a bare "/start", where exactly the slash (delta == 1) was removed. An
+# earlier version of this test asserted the UNshifted offsets and so encoded the
+# off-by-one as correct.
+u = dm(1, text="/start")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
+                            {"type": "italic", "offset": 1, "length": 5}]
+defang_start_command(u)
+check("bare /start: later entities shift left by one",
+      u["message"]["entities"] == [{"type": "italic", "offset": 0, "length": 5}],
       u["message"].get("entities"))
 # The real assertion behind the arithmetic: the span still covers the same text.
 txt = u["message"]["text"]
 ent = u["message"]["entities"][0]
-check("shifted entity still spans 'ref_abc'",
-      txt[ent["offset"]:ent["offset"] + ent["length"]] == "ref_abc",
+check("shifted entity still spans 'start'",
+      txt[ent["offset"]:ent["offset"] + ent["length"]] == "start",
       repr(txt[ent["offset"]:ent["offset"] + ent["length"]]))
 
 # An entity anchored at 0 covered the slash, so it shrinks rather than moves.
@@ -273,8 +296,8 @@ u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 16},
 defang_start_command(u)
 check("/start@Bot drops entities rather than mis-shift",
       "entities" not in u["message"], u["message"].get("entities"))
-check("/start@Bot text still defanged", u["message"]["text"] == "start ref",
-      u["message"]["text"])
+check("/start@Bot text still defanged and payload-stripped",
+      u["message"]["text"] == "start", u["message"]["text"])
 
 # Malformed entities are dropped (documented), not passed through.
 u = dm(1, text="/start")
@@ -332,6 +355,132 @@ for attempt in range(20):
 else:
     check("exactly one winner across 20 x 8-thread races", True)
     check("store agrees with the reported winner", True)
+
+print("== 11. deep-link bind nonce gates binding when configured ==")
+# Pool bots are RECYCLED between tenants, and the previous owner keeps the bot
+# chat forever. With trust-on-first-use alone, that previous owner can message
+# the recycled bot the moment the next tenant's store is empty and silently
+# become ITS owner. The nonce closes that: control-api provisions the tenant
+# with SQUIRE_BIND_NONCE and hands the real user a t.me/<bot>?start=<nonce>
+# link, so only the person holding the link can bind.
+import contextlib  # noqa: E402
+import hmac as _hmac  # noqa: E402
+import io  # noqa: E402
+
+import squire_autopair as _autopair  # noqa: E402
+from squire_autopair import (  # noqa: E402
+    BIND_NONCE_ENV,
+    configured_bind_nonce,
+    extract_start_payload,
+)
+
+NONCE = "tok_urlsafe_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"  # stand-in for token_urlsafe(32)
+
+check("env var name is the interface contract", BIND_NONCE_ENV == "SQUIRE_BIND_NONCE")
+
+# --- extract_start_payload is a pure parser -------------------------------
+check("payload extracted from /start <p>",
+      extract_start_payload(dm(1, text="/start abc")) == "abc")
+check("payload extracted from /start@Bot <p>",
+      extract_start_payload(dm(1, text="/start@SquireBot abc")) == "abc")
+check("bare /start has no payload",
+      extract_start_payload(dm(1, text="/start")) is None)
+check("ordinary text has no payload",
+      extract_start_payload(dm(1, text="hello")) is None)
+check("other commands have no payload",
+      extract_start_payload(dm(1, text="/help abc")) is None)
+check("edited_message payload extracted",
+      extract_start_payload({"edited_message": dm(1, text="/start abc")["message"]}) == "abc")
+check("non-dict update has no payload", extract_start_payload([]) is None)
+
+# --- configured_bind_nonce reads the environment --------------------------
+os.environ.pop(BIND_NONCE_ENV, None)
+check("unset env reads as no nonce", configured_bind_nonce() is None)
+# An empty value is treated as UNSET, not as a nonce of "": failing closed on a
+# misconfigured-empty variable would brick provisioning for that tenant.
+os.environ[BIND_NONCE_ENV] = ""
+check("empty env reads as no nonce", configured_bind_nonce() is None)
+os.environ[BIND_NONCE_ENV] = NONCE
+check("set env reads back the nonce", configured_bind_nonce() == NONCE)
+
+# --- correct payload binds -------------------------------------------------
+os.environ[BIND_NONCE_ENV] = NONCE
+h = fresh_home()
+got = maybe_bind_owner(h, dm(111, text=f"/start {NONCE}"))
+check("correct nonce payload binds", got == "111", f"got {got!r}")
+check("store written for correct nonce", list(read_store(h)) == ["111"])
+
+# @Bot deep links produce "/start@Bot <payload>" in some clients; still valid.
+h = fresh_home()
+got = maybe_bind_owner(h, dm(112, text=f"/start@SquireBot {NONCE}"))
+check("correct nonce via /start@Bot binds", got == "112", f"got {got!r}")
+
+# --- everything else must NOT bind, and must say so loudly ----------------
+for label, update in (
+    ("wrong payload", dm(222, text="/start wrong-guess")),
+    ("bare /start", dm(333, text="/start")),
+    ("ordinary text", dm(444, text="hello")),
+):
+    h = fresh_home()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        got = maybe_bind_owner(h, update)
+    check(f"{label} does not bind when a nonce is configured", got is None, f"got {got!r}")
+    check(f"{label} writes no store", not approved_path(h).exists())
+    out = buf.getvalue()
+    check(f"{label} logs the refusal loudly", "nonce" in out.lower(), repr(out))
+    check(f"{label} log never contains the nonce itself", NONCE not in out, repr(out))
+
+# The sender-shape gate still runs FIRST: a group message carrying the correct
+# nonce must not bind — otherwise pasting the link into a group hands ownership
+# to whoever relays it.
+h = fresh_home()
+g = group_msg(555)
+g["message"]["text"] = f"/start {NONCE}"
+check("group message with correct nonce does not bind",
+      maybe_bind_owner(h, g) is None)
+
+# --- a wrong guess must not consume the one-shot ---------------------------
+# The empty-store precondition is what makes binding at-most-once; a failed
+# nonce attempt leaves the store empty, so the REAL owner's link still works.
+h = fresh_home()
+with contextlib.redirect_stdout(io.StringIO()):
+    maybe_bind_owner(h, dm(666, text="/start wrong"))
+got = maybe_bind_owner(h, dm(777, text=f"/start {NONCE}"))
+check("owner still binds after an attacker's failed guess", got == "777", f"got {got!r}")
+
+# --- the comparison is timing-safe ----------------------------------------
+# Behavioural timing assertions are flaky by nature, so assert the mechanism:
+# the accept decision must flow through hmac.compare_digest.
+calls: list[tuple] = []
+_real_compare = _hmac.compare_digest
+
+def _spy_compare(a, b):
+    calls.append((a, b))
+    return _real_compare(a, b)
+
+_autopair.hmac.compare_digest = _spy_compare
+try:
+    h = fresh_home()
+    check("bind still works through compare_digest",
+          maybe_bind_owner(h, dm(888, text=f"/start {NONCE}")) == "888")
+    check("payload comparison goes through hmac.compare_digest", len(calls) > 0)
+finally:
+    _autopair.hmac.compare_digest = _real_compare
+
+# --- unset nonce keeps today's behaviour exactly (open mode) ---------------
+# Deliberately NOT fail-closed: if the control-api side of this contract lands
+# out of order (old control-api, new tenant image), failing closed would brick
+# provisioning for every new tenant. Unset means legacy trust-on-first-use,
+# announced loudly so a fleet audit can find unauthenticated tenants.
+del os.environ[BIND_NONCE_ENV]
+h = fresh_home()
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    got = maybe_bind_owner(h, dm(999))
+check("unset nonce still binds first contact (legacy)", got == "999", f"got {got!r}")
+check("unset nonce logs unauthenticated mode",
+      "unauthenticated mode" in buf.getvalue(), repr(buf.getvalue()))
 
 print()
 if failures:

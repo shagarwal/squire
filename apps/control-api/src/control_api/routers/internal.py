@@ -96,7 +96,12 @@ def _tenant_response(session: Session, tenant: Tenant, **extra) -> dict:
         "status": tenant.status,
         "bot_id": tenant.bot_id,
         "bot_username": bot.username if bot else None,
-        "telegram_link": provisioning.telegram_link(bot.username) if bot else None,
+        # Carries ?start=<bind_nonce> once provisioning has minted one -- the
+        # tenant's autopair only binds the owner from a /start with that payload,
+        # so this link is the credential handout path, not just a convenience.
+        "telegram_link": (
+            provisioning.telegram_link(bot.username, tenant.bind_nonce) if bot else None
+        ),
         "internal_url": tenant.internal_url,
         "railway_service_id": tenant.railway_service_id,
         "dek_set": tenant.dek_set,

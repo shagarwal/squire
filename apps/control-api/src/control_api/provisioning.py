@@ -223,7 +223,18 @@ def telegram_webhook_url(bot_id: int, settings: Settings | None = None) -> str:
     return f"{settings.ingress_public_url.rstrip('/')}/telegram/{bot_id}"
 
 
-def telegram_link(username: str) -> str:
+def telegram_link(username: str, bind_nonce: str | None = None) -> str:
+    """The deep link the user taps to meet their agent.
+
+    With a nonce, `?start=` makes the tap send "/start <nonce>", which is the
+    only message the tenant's autopair will bind an owner from. No URL-encoding
+    needed: `generate_bind_nonce` output is already within Telegram's
+    `[A-Za-z0-9_-]` start-payload alphabet. A bare link (nonce still None, i.e.
+    set_variables has not run yet) is served as-is -- it is not tappable into a
+    live tenant at that point anyway.
+    """
+    if bind_nonce:
+        return f"https://t.me/{username}?start={bind_nonce}"
     return f"https://t.me/{username}"
 
 
@@ -484,6 +495,19 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
 
     dek = crypto.generate_dek() if not tenant.dek_set else None
 
+    # Deep-link bind nonce: generate-if-absent, reuse-if-present -- the same
+    # retry discipline as the DEK guard below, with one deliberate difference:
+    # the nonce IS persisted (models.Tenant.bind_nonce), because the
+    # `?start=<nonce>` link is built from the row every time the tenant is
+    # served, after this job is long done. Reuse on retry matters for the same
+    # reason rotation would hurt the DEK: a link already handed out must keep
+    # working. Persist BEFORE the upsert so Railway can never hold a nonce the
+    # DB has lost -- the reverse ordering would strand the tenant with a nonce
+    # no link will ever carry.
+    if not tenant.bind_nonce:
+        tenant.bind_nonce = crypto.generate_bind_nonce()
+        _touch(session, tenant)
+
     variables = {
         "TENANT_ID": tenant.id,
         "TELEGRAM_BOT_TOKEN": bot.token,
@@ -509,6 +533,11 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # first `--roll` would restart the entire fleet to move it onto the image it
         # was already provisioned with. `redeploy_tenant` overwrites this.
         "SQUIRE_IMAGE_REF": tenant.image_ref or settings.tenant_image,
+        # The tenant's autopair only binds an owner when the first /start
+        # carries this value (delivered to the user via the ?start= deep link).
+        # Closes the recycled-bot hole: a pool bot's previous owner keeps the
+        # bot chat forever and would otherwise be first-in on the next tenant.
+        "SQUIRE_BIND_NONCE": tenant.bind_nonce,
     }
     # 32 random bytes, base64. Generated only if we have not already set one: a
     # retry must not rotate the key out from under a volume already encrypted with
@@ -536,6 +565,9 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         bot.webhook_secret,
         trial_key,
         settings.internal_api_token,
+        # A leaked bind nonce lets its holder become the tenant's owner before
+        # the real user taps Start.
+        tenant.bind_nonce,
     ):
         register_step_secret(secret)
 
@@ -942,6 +974,10 @@ def delete_tenant(
     tenant.internal_url = None
     tenant.image_ref = None
     tenant.dek_set = False
+    # The bot just went back to the pool; a surviving nonce (in this audit row,
+    # or in a still-circulating ?start= link) must never be able to bind anyone
+    # to the bot's NEXT tenant -- that tenant mints its own at set_variables.
+    tenant.bind_nonce = None
     tenant.webhook_set = False
     _touch(session, tenant)
     session.refresh(tenant)
