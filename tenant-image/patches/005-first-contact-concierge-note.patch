@@ -63,3 +63,59 @@ diff --git a/gateway/run.py b/gateway/run.py
          
          # One-time prompt if no home channel is set for this platform
          # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+@@ -17258,6 +17293,55 @@
+                             home_env = "set"
+                 except Exception:
+                     pass
++            # (squire patch 005) Squire tenants are single-user Telegram DMs
++            # provisioned per person: the chat this message arrived in IS the
++            # home channel, always, and there is nothing for the user to
++            # choose. Upstream's prompt asks them to run /sethome — a surface
++            # Squire does not sell — and because it fires on the first message
++            # of a fresh session it was the FIRST thing a new user saw, ahead
++            # of the concierge greeting itself.
++            #
++            # So set it instead of asking. That turns a papered-over annoyance
++            # into a feature: cron briefings and cross-platform delivery work
++            # out of the box with no user action. Done through upstream's own
++            # persist_home_channel/HomeChannel rather than by writing config by
++            # hand, so the on-disk shape stays whatever upstream expects.
++            #
++            # Gated on the concierge state file existing, i.e. "this is a
++            # Squire tenant" — the same detection the suppression above uses.
++            # Any other deployment keeps upstream's prompt untouched.
++            if not home_env and source.chat_id:
++                try:
++                    if (_hermes_home / ".squire" / "concierge-state.json").exists():
++                        from gateway.config import (
++                            HomeChannel as _SqHomeChannel,
++                            persist_home_channel as _sq_persist_home,
++                        )
++                        _sq_home = _SqHomeChannel(
++                            platform=source.platform,
++                            chat_id=str(source.chat_id),
++                            name="Squire",
++                        )
++                        _sq_persist_home(_sq_home)
++                        # Make it visible to THIS process too, not just on
++                        # disk: the gateway holds its config in memory and
++                        # would otherwise go on believing no home is set.
++                        try:
++                            _sq_pc = self.config.platforms.get(source.platform)
++                            if _sq_pc is not None:
++                                _sq_pc.home_channel = _sq_home
++                        except Exception:
++                            pass
++                        home_env = "set"
++                        logger.info(
++                            "squire: adopted this chat as the %s home channel",
++                            platform_name,
++                        )
++                except Exception:
++                    # Never let this cost the user their first message.
++                    # Falling through just restores upstream's prompt.
++                    logger.debug("squire home-channel adoption failed", exc_info=True)
++
+             if not home_env:
+                 # Slack dispatches all Hermes commands through a single
+                 # parent slash command `/hermes`; bare `/sethome` is not

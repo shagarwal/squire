@@ -150,3 +150,14 @@ squire-004-dm-read-receipt	scripts/whatsapp-bridge/bridge_helpers.js	isGroup ? {
 upstream-onboarding-profile-build	gateway/run.py	profile_build_mode(	required
 patch-005-anchor	gateway/run.py	First-message onboarding -- only on the very first interaction ever	required
 squire-005-concierge-suppress	gateway/run.py	_squire_concierge_active	required
+#
+#       005 also ADOPTS the tenant's DM as the home channel instead of letting
+#       upstream ask the user to run /sethome. That prompt fires on the first
+#       message of a fresh session, so it was the first thing a new user saw —
+#       ahead of the greeting — and it advertises a surface Squire does not
+#       sell. Setting it also makes cron briefings work with no user action.
+#       The upstream anchor is the prompt text itself: if upstream reworks that
+#       block, our insertion point is gone and the user starts seeing /sethome
+#       again, which is invisible without this row.
+upstream-sethome-prompt	gateway/run.py	No home channel is set for	required
+squire-005-home-channel	gateway/run.py	adopted this chat as the	required
