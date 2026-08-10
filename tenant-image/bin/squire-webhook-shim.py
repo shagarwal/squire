@@ -88,10 +88,15 @@ AUTOPAIR_ENABLED = (os.environ.get("SQUIRE_AUTOPAIR") or "true").lower() in (
 # quietly falls back to the pairing gate.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from squire_autopair import defang_start_command, maybe_bind_owner
+    from squire_autopair import (
+        defang_start_command,
+        maybe_bind_owner,
+        strip_start_payload,
+    )
 except ImportError:  # pragma: no cover - defensive
     maybe_bind_owner = None
     defang_start_command = None
+    strip_start_payload = None
 
 # Telegram updates are small; the largest realistic body is a long message with
 # a big entity list. 2 MiB is generous and stops an unbounded read.
@@ -360,34 +365,74 @@ class Handler(BaseHTTPRequestHandler):
                 "upstream pairing). If this is a real first contact, ingress is "
                 "not stamping X-Telegram-Bot-Api-Secret-Token.")
 
-        if may_bind:
+        # Parse the update ONCE for the two in-place rewrites below (owner
+        # binding, then payload hygiene). Parsed when binding might run — legacy
+        # first contact can bind from ANY private message, not just /start — or
+        # when the body could carry a /start. The bytes probe keeps the
+        # overwhelmingly common case (an ordinary message on an established
+        # tenant with binding not in play) unparsed and forwarded
+        # byte-for-byte verbatim, which is the contract ingress is built
+        # against. b"\\/start" covers the legal JSON escape of the slash;
+        # Telegram itself never emits it, but the payload strip must not be
+        # dodgeable by re-encoding.
+        update = None
+        if may_bind or b"/start" in body or b"\\/start" in body:
             try:
-                update = json.loads(body.decode("utf-8"))
+                parsed = json.loads(body.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                update = None
-            if isinstance(update, dict):
-                bound = maybe_bind_owner(HERMES_HOME, update)
-                if bound:
-                    # Only on the update that bound the owner. Upstream swallows
-                    # "/start" as a platform ping (run.py:14961 returns ""), so
-                    # without this the deep-link tap authorizes the owner and
-                    # then answers with silence — worse than the pairing code it
-                    # replaced. See defang_start_command for why this is a slash
-                    # strip and not a synthesised greeting.
-                    if defang_start_command(update):
-                        body = json.dumps(update).encode("utf-8")
-                        log("first contact: /start relayed as text so the "
-                            "concierge greeting can fire")
-                    # Deliberately does NOT log the Telegram user id. It is the
-                    # tenant owner's account identifier, this output goes to a
-                    # shared log aggregator, and the heartbeat holds no user ids
-                    # by design — this must not become the exception.
-                    # Logged, deliberately NOT counted. _COUNTERS is a fixed
-                    # three-outcome set that squire-heartbeat.py forwards to
-                    # control-api; adding a key here would both KeyError and
-                    # widen the metrics contract to report a per-tenant lifecycle
-                    # event that control-api has no need to know.
-                    log("first contact: bound tenant owner (id redacted)")
+                parsed = None
+            if isinstance(parsed, dict):
+                update = parsed
+
+        bound = None
+        if may_bind and update is not None:
+            # maybe_bind_owner needs the raw text: when a bind nonce is
+            # configured, the /start payload IS the credential it verifies —
+            # so binding runs BEFORE the payload hygiene below removes it.
+            bound = maybe_bind_owner(HERMES_HOME, update)
+            if bound:
+                # Deliberately does NOT log the Telegram user id. It is the
+                # tenant owner's account identifier, this output goes to a
+                # shared log aggregator, and the heartbeat holds no user ids
+                # by design — this must not become the exception.
+                # Logged, deliberately NOT counted. _COUNTERS is a fixed
+                # three-outcome set that squire-heartbeat.py forwards to
+                # control-api; adding a key here would both KeyError and
+                # widen the metrics contract to report a per-tenant lifecycle
+                # event that control-api has no need to know.
+                log("first contact: bound tenant owner (id redacted)")
+
+        # The /start payload must not survive into the forwarded body on ANY
+        # path — bound or not. It may be the tenant's LIVE bind nonce (the
+        # owner re-tapping the ?start= deep link once bound, SQUIRE_AUTOPAIR
+        # off, an unreadable store, an unauthenticated delivery), and whatever
+        # the gateway receives becomes a user turn in the transcript and in
+        # Hindsight memory — a credential must never land there. Two rewrites,
+        # mutually exclusive:
+        #   * bound      -> defang: "/start <p>" becomes the text "start", so
+        #     the concierge greeting can fire. Upstream swallows "/start" as a
+        #     platform ping (run.py:14961 returns "") and an empty response is
+        #     never sent — without this the deep-link tap authorizes the owner
+        #     and then answers with silence. See defang_start_command for why
+        #     this is a slash strip and not a synthesised greeting.
+        #   * not bound  -> strip: "/start <p>" becomes "/start", which KEEPS
+        #     upstream's swallow-the-ping semantics for an established chat. A
+        #     payload-less /start is untouched, so ordinary traffic still
+        #     forwards verbatim.
+        mutated = False
+        if update is not None:
+            if bound and defang_start_command is not None:
+                if defang_start_command(update):
+                    mutated = True
+                    log("first contact: /start relayed as text so the "
+                        "concierge greeting can fire")
+            elif strip_start_payload is not None and strip_start_payload(update):
+                mutated = True
+                # Payload and sender id deliberately absent from the log line.
+                log("stripped deep-link payload from a non-binding /start "
+                    "before forwarding")
+        if mutated:
+            body = json.dumps(update).encode("utf-8")
 
         conn = None
         try:

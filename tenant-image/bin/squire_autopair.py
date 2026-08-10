@@ -108,6 +108,16 @@ KNOWN LIMITS, stated so nobody discovers them the hard way
   it. For the intended flow (rebinding a tenant to a new owner) that is the
   useful behaviour; it is documented here because it is not the behaviour the
   phrase "first contact" implies on its own.
+* REVOKE + NONCE: RE-ARMED, BUT ONLY FOR THE OLD LINK. When SQUIRE_BIND_NONCE
+  is configured, revoking the sole owner re-arms binding as above — but the
+  nonce is still required, control-api has no rotation path (redeploy does not
+  re-run set_variables; only delete_tenant clears it), and the holder of the
+  original ?start= link is, by construction, the owner who was just revoked.
+  So a revoke can only ever re-bind the OLD owner; handing the tenant to a NEW
+  owner requires delete + re-provision (which mints a fresh nonce). Strictly
+  safer than the legacy open re-arm, where the next authenticated sender —
+  whoever they were — won, but it means `pairing revoke` is not a rebinding
+  tool on a nonce-provisioned tenant.
 """
 
 from __future__ import annotations
@@ -436,6 +446,75 @@ def defang_start_command(update: dict) -> bool:
     return True
 
 
+def strip_start_payload(update: dict) -> bool:
+    """Remove the deep-link payload from a /start, in place, KEEPING the command.
+
+    Returns True if the update was modified.
+
+    The not-bound counterpart to defang_start_command. defang runs only on the
+    single update that bound the owner; every other /start passing through the
+    shim (the owner re-tapping the ?start= link once bound, SQUIRE_AUTOPAIR
+    off, an unreadable store, an unauthenticated delivery) forwards as a
+    command — upstream swallows "/start" as a platform ping, which is the
+    correct behaviour for an established chat. But the payload on those
+    messages may be the LIVE nonce, and a verbatim forward would write the
+    pairing credential into the transcript and Hindsight memory. So: the
+    command survives, the payload never does.
+
+    "/start <p>" -> "/start"; "/start@Bot <p>" -> "/start@Bot" (minimal edit —
+    the @Bot suffix is not secret and dropping it here would change command
+    routing semantics that are not ours to change). A payload-less /start is
+    left byte-for-byte untouched so the shim's verbatim-forward contract for
+    ordinary traffic holds.
+    """
+    if not isinstance(update, dict):
+        return False
+    msg = update.get("message") or update.get("edited_message")
+    if not isinstance(msg, dict):
+        return False
+    text = msg.get("text")
+    if not isinstance(text, str):
+        return False
+
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return False
+    head, _, rest = stripped.partition(" ")
+    name = head[1:].split("@", 1)[0].lower()
+    if name != "start":
+        return False
+    if not rest.strip():
+        return False  # no payload -> no edit
+
+    msg["text"] = head
+
+    # The kept text is the original's leading command token. When the original
+    # had no leading whitespace, head is a strict PREFIX of it, so entities
+    # wholly inside the prefix (the bot_command itself) keep their offsets and
+    # only entities reaching into the deleted tail are dropped. With leading
+    # whitespace the offsets no longer line up — drop them all rather than emit
+    # wrong ones, the same honesty rule as defang's non-delta-1 cases.
+    # Malformed entries are dropped for the same reason as in defang.
+    entities = msg.get("entities")
+    if isinstance(entities, list):
+        kept = []
+        if text.lstrip() == text:
+            for e in entities:
+                if not isinstance(e, dict):
+                    continue  # malformed entity dropped
+                offset = e.get("offset")
+                length = e.get("length")
+                if not isinstance(offset, int) or not isinstance(length, int):
+                    continue  # malformed entity dropped
+                if offset >= 0 and offset + length <= len(head):
+                    kept.append(e)
+        if kept:
+            msg["entities"] = kept
+        else:
+            msg.pop("entities", None)
+    return True
+
+
 def maybe_bind_owner(hermes_home: str | os.PathLike, update: dict,
                      platform: str = PLATFORM) -> str | None:
     """Bind the sender as owner iff no user is approved yet.
@@ -481,10 +560,14 @@ def maybe_bind_owner(hermes_home: str | os.PathLike, update: dict,
                 payload.encode("utf-8"), nonce.encode("utf-8")
             ):
                 # Loud, because on an empty store this is either the real user
-                # holding a stale/wrong link (operator: rotate + resend) or a
-                # recycled bot's previous owner knocking. Never log the payload
-                # or the sender id — the payload may be a nonce for some other
-                # tenant, and this stream reaches a shared log aggregator.
+                # holding a wrong/mangled link or a recycled bot's previous
+                # owner knocking. There is NO rotation path in control-api
+                # (redeploy does not re-run set_variables; only delete_tenant
+                # clears the nonce), so the operator remedies are: re-serve the
+                # SAME link via GET /internal/tenants/{id}, or delete and
+                # re-provision the tenant. Never log the payload or the sender
+                # id — the payload may be a nonce for some other tenant, and
+                # this stream reaches a shared log aggregator.
                 _log(
                     "bind nonce configured but first contact did not present "
                     "it: NOT binding (falling back to upstream pairing). "

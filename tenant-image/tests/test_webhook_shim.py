@@ -390,6 +390,44 @@ try:
               fwd2["message"]["text"] == "/start", fwd2["message"].get("text"))
         check("second update otherwise intact",
               fwd2["message"]["from"]["id"] == 999999, fwd2["message"]["from"])
+
+    # --- nonce hygiene: the payload must not survive on ANY non-bound path --
+    # The owner re-taps the t.me/<bot>?start=<nonce> deep link after binding.
+    # The store is non-empty so nothing binds — but the raw body carries the
+    # LIVE nonce, and forwarding it verbatim would write the credential into
+    # the transcript and Hindsight memory. The payload is stripped while the
+    # message stays a command ("/start"), keeping upstream's platform-ping
+    # semantics for an established chat.
+    retap = json.loads(json.dumps(first))
+    retap["update_id"] = 902
+    retap["message"]["text"] = "/start retap-live-nonce"
+    received.clear()
+    status, _ = post("/webhook/telegram", retap, headers=AUTH)
+    check("re-tap after bind still delivers", status == 200, status)
+    check("re-tap after bind: payload absent from forwarded body",
+          received and "retap-live-nonce" not in received[0]["body"],
+          received[0]["body"] if received else "nothing forwarded")
+    if received:
+        fwdr = json.loads(received[0]["body"])
+        check("re-tap after bind: /start still a command",
+              fwdr["message"]["text"] == "/start", fwdr["message"].get("text"))
+
+    # An unauthenticated delivery may never bind, but it is still forwarded —
+    # and a nonce riding on it (e.g. an ingress that dropped the secret header
+    # on the real first tap) must be stripped there too.
+    unauth = json.loads(json.dumps(first))
+    unauth["update_id"] = 903
+    unauth["message"]["text"] = "/start unauth-live-nonce"
+    received.clear()
+    status, _ = post("/webhook/telegram", unauth)
+    check("unauthenticated payload update still delivered", status == 200, status)
+    check("unauthenticated path: payload absent from forwarded body",
+          received and "unauth-live-nonce" not in received[0]["body"],
+          received[0]["body"] if received else "nothing forwarded")
+    if received:
+        fwdu = json.loads(received[0]["body"])
+        check("unauthenticated path: /start still a command",
+              fwdu["message"]["text"] == "/start", fwdu["message"].get("text"))
 finally:
     proc.terminate()
     proc.wait(timeout=10)
@@ -430,11 +468,69 @@ try:
         fwd3 = json.loads(received[0]["body"])
         check("opt-out forwards /start verbatim",
               fwd3["message"]["text"] == "/start", fwd3["message"].get("text"))
+
+    # Payload hygiene is independent of the autopair switch: a deep-link tap
+    # on an opted-out tenant still carries the nonce, and it must still die at
+    # the shim rather than reach the transcript.
+    optout2 = json.loads(json.dumps(optout))
+    optout2["update_id"] = 951
+    optout2["message"]["text"] = "/start optout-live-nonce"
+    received.clear()
+    status, _ = post("/webhook/telegram", optout2,
+                     headers={"X-Telegram-Bot-Api-Secret-Token": SECRET})
+    check("opt-out payload update still delivers", status == 200, status)
+    check("opt-out: payload absent from forwarded body",
+          received and "optout-live-nonce" not in received[0]["body"],
+          received[0]["body"] if received else "nothing forwarded")
+    if received:
+        fwd4 = json.loads(received[0]["body"])
+        check("opt-out: /start still a command",
+              fwd4["message"]["text"] == "/start", fwd4["message"].get("text"))
 finally:
     proc.terminate()
     proc.wait(timeout=10)
     adapter3.shutdown()
     adapter3.server_close()
+
+print("== corrupt approved store: refuses to bind, payload still never forwards ==")
+# maybe_bind_owner bails out early on an unreadable store (it cannot prove the
+# store is empty). The payload strip must not depend on how far binding got.
+received.clear()
+home3 = tempfile.mkdtemp()
+approved3 = pathlib.Path(home3) / "platforms" / "pairing" / "telegram-approved.json"
+approved3.parent.mkdir(parents=True)
+approved3.write_text("{ this is not json")
+adapter4 = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), FakeAdapter)
+adapter4.daemon_threads = True
+threading.Thread(target=adapter4.serve_forever, daemon=True).start()
+proc = run({"SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH, "HERMES_HOME": home3})
+try:
+    corrupt = {
+        "update_id": 960,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 888001, "is_bot": False, "first_name": "owner"},
+            "chat": {"id": 888001, "type": "private"},
+            "text": "/start corrupt-live-nonce",
+        },
+    }
+    status, _ = post("/webhook/telegram", corrupt,
+                     headers={"X-Telegram-Bot-Api-Secret-Token": SECRET})
+    check("corrupt store still delivers", status == 200, status)
+    check("corrupt store left untouched",
+          approved3.read_text() == "{ this is not json", approved3.read_text())
+    check("corrupt store: payload absent from forwarded body",
+          received and "corrupt-live-nonce" not in received[0]["body"],
+          received[0]["body"] if received else "nothing forwarded")
+    if received:
+        fwd5 = json.loads(received[0]["body"])
+        check("corrupt store: /start still a command",
+              fwd5["message"]["text"] == "/start", fwd5["message"].get("text"))
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    adapter4.shutdown()
+    adapter4.server_close()
 
 print()
 if failures:

@@ -320,6 +320,69 @@ check("non-text message untouched",
       defang_start_command({"message": {"chat": {"type": "private"}}}) is False)
 check("non-dict untouched", defang_start_command([]) is False)
 
+# --- strip_start_payload: the NOT-bound counterpart to defang ---------------
+# defang runs only on the update that bound the owner. Every other /start (the
+# owner re-tapping the deep link once bound, autopair disabled, corrupt store,
+# unauthenticated delivery) forwards as a COMMAND — upstream swallows it as a
+# platform ping — but its payload may be the LIVE nonce and must never survive
+# into the forwarded body.
+from squire_autopair import strip_start_payload  # noqa: E402
+
+u = dm(1, text="/start N0NCE-abc")
+check("strip: returns True when a payload was removed", strip_start_payload(u) is True)
+check("strip: stays a command", u["message"]["text"] == "/start", u["message"]["text"])
+
+u = dm(1, text="/start@SquireBot N0NCE-abc")
+strip_start_payload(u)
+check("strip: @Bot suffix kept, payload gone (minimal edit)",
+      u["message"]["text"] == "/start@SquireBot", u["message"]["text"])
+
+# No payload -> no edit: bare /start must keep forwarding byte-for-byte verbatim
+# (test_webhook_shim.py pins that contract on the non-bound paths).
+for label, text in (("bare /start", "/start"), ("bare /start@Bot", "/start@SquireBot"),
+                    ("ordinary text", "hello"), ("another command", "/help abc"),
+                    ("start mid-sentence", "please /start it")):
+    u = dm(1, text=text)
+    check(f"strip: {label} untouched",
+          strip_start_payload(u) is False and u["message"]["text"] == text,
+          u["message"]["text"])
+check("strip: non-text message untouched",
+      strip_start_payload({"message": {"chat": {"type": "private"}}}) is False)
+check("strip: non-dict untouched", strip_start_payload([]) is False)
+
+# The kept text is a strict prefix of the original, so entities fully inside it
+# (the bot_command itself) keep their offsets; anything reaching into the
+# deleted payload is dropped rather than left pointing at nothing.
+u = dm(1, text="/start N0NCE-abc")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 6},
+                            {"type": "code", "offset": 7, "length": 9}]
+strip_start_payload(u)
+check("strip: bot_command entity survives unmoved",
+      u["message"]["entities"] == [{"type": "bot_command", "offset": 0, "length": 6}],
+      u["message"].get("entities"))
+
+u = dm(1, text="/start N0NCE-abc")
+u["message"]["entities"] = [{"type": "bold", "offset": 0, "length": 16}]
+strip_start_payload(u)
+check("strip: entity spanning into the payload is dropped",
+      "entities" not in u["message"], u["message"].get("entities"))
+
+# Leading whitespace means the kept command is NOT a prefix of the original
+# text, so offsets no longer line up — drop entities, same honesty rule as
+# defang's non-delta-1 cases. Malformed entities are dropped likewise.
+u = dm(1, text="  /start N0NCE-abc")
+u["message"]["entities"] = [{"type": "bot_command", "offset": 2, "length": 6}]
+strip_start_payload(u)
+check("strip: leading whitespace drops entities",
+      "entities" not in u["message"] and u["message"]["text"] == "/start",
+      (u["message"]["text"], u["message"].get("entities")))
+
+u = dm(1, text="/start N0NCE-abc")
+u["message"]["entities"] = [{"type": "code", "offset": "x", "length": 3}, "not-a-dict"]
+strip_start_payload(u)
+check("strip: malformed entities dropped",
+      "entities" not in u["message"], u["message"].get("entities"))
+
 print("== 10. concurrent first contacts: exactly ONE caller may be told it won ==")
 # The shim is a ThreadingHTTPServer, so this genuinely runs concurrently. The
 # store came out single-owner even before the lock — every writer was racing to
