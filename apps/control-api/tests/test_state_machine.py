@@ -647,6 +647,47 @@ def test_create_tenant_is_idempotent_per_email(pool_bot, fake_railway):
         assert (tenant_b.id, job_b.id) == ids
 
 
+@respx.mock
+def test_create_tenant_ignores_deleted_rows_for_the_same_email(pool_bot, fake_railway):
+    """Re-signup after churn must mint a fresh tenant, not return the corpse.
+
+    Deleted tenants are retained as audit rows (delete_tenant crypto-shreds the
+    service/volume but keeps the row), so the per-email idempotency lookup MUST
+    exclude them: matching a deleted row hands the caller a tenant with no bot,
+    no service, and a DONE-for-the-wrong-lifetime job — the CLI prints
+    "status deleted / OPEN None" and no provisioning ever runs. Found live on
+    staging 2026-08-10 re-provisioning an email whose first tenant had been
+    crypto-shredded."""
+    mock_all(fake_railway)
+    respx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    with db.session_scope() as s:
+        tenant_a, job_a = provisioning.create_tenant(s, email="alpha@squire.test")
+        first_id, first_job = tenant_a.id, job_a.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, first_job)
+    with db.session_scope() as s:
+        provisioning.stop_tenant(s, first_id)
+        provisioning.delete_tenant(s, first_id)
+
+    with db.session_scope() as s:
+        tenant_b, job_b = provisioning.create_tenant(s, email="alpha@squire.test")
+        second_id = tenant_b.id
+        assert second_id != first_id, "deleted audit row must not satisfy the dedupe"
+        assert tenant_b.status == TenantStatus.PROVISIONING
+        # The audit row survives alongside the new tenant, address tombstoned
+        # (original recoverable for Phase 1E abuse checks, slot freed).
+        audit = provisioning.get_tenant(s, first_id)
+        assert audit.status == TenantStatus.DELETED
+        assert audit.email == f"deleted.{first_id}.alpha@squire.test"
+
+    # And the idempotency contract still holds for the NEW (live) tenant.
+    with db.session_scope() as s:
+        tenant_c, _ = provisioning.create_tenant(s, email="alpha@squire.test")
+        assert tenant_c.id == second_id
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle beyond provisioning
 # ---------------------------------------------------------------------------

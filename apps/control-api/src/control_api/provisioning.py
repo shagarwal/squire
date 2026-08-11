@@ -302,7 +302,16 @@ def create_tenant(session: Session, email: str) -> tuple[Tenant, ProvisionJob]:
     a second pool bot. Returns the existing tenant + its most recent job instead.
     """
     email = email.strip().lower()
-    existing = session.exec(select(Tenant).where(Tenant.email == email)).first()
+    # Deleted tenants are retained as audit rows (crypto-shred keeps the row),
+    # so the idempotency lookup must skip them: a churned-and-returning email
+    # would otherwise match its own corpse — no bot, no service, no job that
+    # advance_job will touch — and re-signup would be a silent dead end.
+    existing = session.exec(
+        select(Tenant).where(
+            Tenant.email == email,
+            Tenant.status != TenantStatus.DELETED,
+        )
+    ).first()
     if existing is not None:
         job = session.exec(
             select(ProvisionJob)
@@ -968,6 +977,18 @@ def delete_tenant(
         session.delete(beat)
 
     tenant.status = TenantStatus.DELETED
+    # Free the email for re-signup while keeping the audit trail. The row is
+    # retained (see docstring) and `email` is UNIQUE, so leaving the address in
+    # place would make a churned user's re-signup a permanent dead end: the
+    # create_tenant dedupe skips deleted rows, and the INSERT then dies on the
+    # constraint. Tombstoning as `deleted.<tenant_id>.<original>` keeps the
+    # original address recoverable for abuse checks (Phase 1E: one trial per
+    # identity) and cannot collide (tenant ids are unique). The Phase 1G GDPR
+    # erasure flow is the place that scrubs the address entirely -- deletion
+    # here is lifecycle, not necessarily a legal erasure request. Guarded so a
+    # re-run of delete_tenant does not stack prefixes.
+    if not tenant.email.startswith("deleted."):
+        tenant.email = f"deleted.{tenant.id}.{tenant.email}"
     tenant.bot_id = None
     tenant.railway_service_id = None
     tenant.railway_volume_id = None
