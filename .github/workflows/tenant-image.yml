@@ -353,6 +353,15 @@ jobs:
         # load-bearing as the mechanical ones.
         run: python3 tenant-image/tests/test_concierge_onboarding.py
 
+      - name: Identity-refresh TTL (patch 006 — what lets a tenant sleep)
+        if: steps.present.outputs.exists == 'true'
+        # Upstream's webhook-mode identity refresh (get_me every 300s, forever)
+        # kept every tenant awake and nullified the serverless-sleep half of the
+        # G1 cost model. Patch 006 gates it behind SQUIRE_TELEGRAM_IDENTITY_TTL;
+        # this suite applies the patch for real, checks the guard structurally,
+        # and pins the fail-safe env semantics plus the baked-0 image default.
+        run: python3 tenant-image/tests/test_identity_refresh_ttl.py
+
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
         # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,

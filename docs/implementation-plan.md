@@ -82,7 +82,7 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 > #### 2. THEN: Gate G1 — the architectural decision Phase 0 exists to make
 > Measured idle RSS on a live tenant: **~1.3GB vs the 512MB target** (Hindsight local embeddings + CPU torch + embedded PG + gateway). Both levers are built but unpulled:
 > - Point `HINDSIGHT_API_EMBEDDINGS_PROVIDER` at a cloud embedder (knob exposed in the image, currently unset) — biggest single win.
-> - Confirm Railway serverless sleep actually engages. **Suspicion worth testing first:** our own 300s heartbeat may keep every tenant permanently awake, which would nullify the sleep half of the cost model entirely. `SQUIRE_HEARTBEAT_INTERVAL` is the knob; `HEARTBEAT_STALE_SECONDS` must move with it.
+> - Confirm Railway serverless sleep actually engages. **Root cause found (2026-08-10, live):** upstream's Telegram adapter runs an identity-refresh loop in webhook mode — a `get_me()` HTTPS call every 300s, forever — so no tenant ever looked idle. Patch 006 gates it behind `SQUIRE_TELEGRAM_IDENTITY_TTL` (image default `0` = loop never starts; unset = upstream's 300s). Our own 300s heartbeat was a contributing factor, already raised to 1800s on staging — `SQUIRE_HEARTBEAT_INTERVAL` is that knob and `HEARTBEAT_STALE_SECONDS` must move with it. Re-run the quiet-gap sleep check on a tenant running the patched image.
 > Then measure real $/tenant/mo and p95 wake latency across tenants. **Pass = ≤$3/tenant AND p95 wake ≤8s → stay on Railway. Fail → tenant data plane moves to Hetzner.**
 >
 > #### 3. THEN: the rest of Phase 0's exit criteria

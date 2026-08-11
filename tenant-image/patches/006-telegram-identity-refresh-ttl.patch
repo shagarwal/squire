@@ -1,0 +1,53 @@
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -4172,9 +4172,27 @@
+                 identity_task = getattr(self, "_bot_identity_refresh_task", None)
+                 if identity_task and not identity_task.done():
+                     identity_task.cancel()
+-                self._bot_identity_refresh_task = asyncio.ensure_future(
+-                    self._bot_identity_refresh_loop()
+-                )
++                # (squire patch 006) A TTL <= 0 means the refresh loop is never
++                # started. The loop's get_me() every TTL seconds is permanent
++                # outbound HTTPS traffic; on a serverless platform that sleeps
++                # only after a quiet window (Railway: ~10 min) it keeps every
++                # webhook-mode tenant awake 24/7. Squire controls its pool
++                # bots' usernames, so the BotFather-rename detection the loop
++                # exists for buys nothing there. Inbound-triggered rechecks
++                # (_schedule_bot_identity_recheck) still work when disabled:
++                # they only fire while handling a message, i.e. while the
++                # container is awake anyway.
++                if self._BOT_IDENTITY_TTL_SECONDS > 0:
++                    self._bot_identity_refresh_task = asyncio.ensure_future(
++                        self._bot_identity_refresh_loop()
++                    )
++                else:
++                    logger.info(
++                        "[%s] Telegram identity refresh disabled "
++                        "(SQUIRE_TELEGRAM_IDENTITY_TTL <= 0); a BotFather "
++                        "rename will not be noticed until restart",
++                        self.name,
++                    )
+ 
+             # Command-menu registration, DM-topic setup, and the status
+             # indicator each make Bot API calls that can stall for certain
+@@ -7976,7 +7994,17 @@
+     # is matched by identity, never by shape.
+     _FOREIGN_BOT_HANDLE_RE = re.compile(r"[a-z0-9_]{2,29}bot", re.IGNORECASE)
+     # How long an observed identity is trusted before the heartbeat re-checks.
+-    _BOT_IDENTITY_TTL_SECONDS = 300.0
++    #
++    # (squire patch 006) Overridable via SQUIRE_TELEGRAM_IDENTITY_TTL (seconds,
++    # float). UNSET keeps upstream's 300.0 on purpose: image and env rollouts
++    # are not atomic, and this patch must not change behaviour for a non-Squire
++    # user of the tree until the variable is explicitly set. A value <= 0
++    # disables the webhook-mode refresh loop at its launch site in connect()
++    # — see the comment there. env_float (module import above) fails safe:
++    # empty or malformed values fall back to the default rather than raising
++    # here, which matters because this line runs when the class body is
++    # evaluated at import time.
++    _BOT_IDENTITY_TTL_SECONDS = env_float("SQUIRE_TELEGRAM_IDENTITY_TTL", 300.0)
+ 
+     def _current_bot_username(self) -> str:
+         """Return this bot's live @username (lowercased, no leading ``@``).
