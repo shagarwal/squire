@@ -478,6 +478,29 @@ ENV SQUIRE_SECRETS_TMPFS=/dev/shm/squire \
 ENV TELEGRAM_WEBHOOK_PORT=8443 \
     TELEGRAM_WEBHOOK_HOST=127.0.0.1
 
+# --- Identity refresh OFF: this is what lets a tenant sleep (Gate G1) --------
+# Patch 006 makes upstream's webhook-mode identity refresh loop — a get_me()
+# HTTPS call to api.telegram.org every 300s, forever, to catch BotFather
+# renames — controllable via this knob. Railway's serverless sleep needs ~10
+# quiet minutes, so with the loop running no tenant EVER sleeps and the
+# scale-to-zero half of the cost model (~$12/mo always-on vs $1-2 sleeping) is
+# dead on arrival. Diagnosed live on staging 2026-08-10: the tenant stayed
+# awake even after SQUIRE_HEARTBEAT_INTERVAL was raised past the sleep window;
+# this loop was the remaining outbound traffic.
+#
+# 0 = the loop is never started (patch 006's launch-site guard logs one line).
+# Safe for Squire because pool-bot usernames are OURS — no user can BotFather-
+# rename them out from under mention routing. Inbound-triggered identity
+# rechecks survive: they fire only while a message is being handled, i.e. while
+# the container is awake anyway, so they cost sleep nothing.
+#
+# The patch's own default (variable unset) is upstream's 300s — deliberately,
+# so a patched tree without this ENV (out-of-order image/config rollout, or a
+# non-Squire consumer of the patch) behaves exactly like upstream. The baked 0
+# here is the Squire policy; per-tenant override remains possible via Railway
+# variables like every other ENV in this file.
+ENV SQUIRE_TELEGRAM_IDENTITY_TTL=0
+
 # --- Hindsight (docs/reference/hindsight-optimization-guide.md) -------------
 # The guide's systemd-unit knobs, translated to this container. Cgroup limits
 # from the guide are NOT set here: on Railway the whole service is one cgroup,

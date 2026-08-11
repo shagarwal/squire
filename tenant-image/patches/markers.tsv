@@ -161,3 +161,27 @@ squire-005-concierge-suppress	gateway/run.py	_squire_concierge_active	required
 #       again, which is invisible without this row.
 upstream-sethome-prompt	gateway/run.py	No home channel is set for	required
 squire-005-home-channel	gateway/run.py	adopted this chat as the	required
+
+# 006 — serverless-sleep identity refresh TTL (plugins/platforms/telegram/
+#       adapter.py), added 2026-08-10 after the Gate G1 sleep investigation.
+#
+#       In webhook mode upstream runs _bot_identity_refresh_loop(): a get_me()
+#       HTTPS call to api.telegram.org every _BOT_IDENTITY_TTL_SECONDS (300s),
+#       forever, to catch BotFather renames. Railway's serverless sleep needs
+#       ~10 quiet minutes, so that one loop keeps every tenant awake 24/7 and
+#       single-handedly nullifies the scale-to-zero half of the Phase 0 cost
+#       model (~$12/mo always-on vs $1-2 sleeping). Squire controls its pool
+#       bots' usernames, so rename detection buys nothing here.
+#
+#       The patch makes the TTL overridable via SQUIRE_TELEGRAM_IDENTITY_TTL
+#       (unset -> upstream's 300.0, so non-Squire users of the tree see no
+#       change; <= 0 -> the loop is never started). The Dockerfile bakes the
+#       variable to 0.
+#
+#       The upstream-anchor row proves the loop we gate still exists: if a
+#       refactor renames or removes it, the patch could "apply" somewhere
+#       harmless while the launch site regrows an ungated ensure_future — and
+#       tenants silently stop sleeping, which no test after build time can see.
+patch-006-anchor	plugins/platforms/telegram/adapter.py	async def _bot_identity_refresh_loop(	required
+squire-006-identity-ttl-env	plugins/platforms/telegram/adapter.py	SQUIRE_TELEGRAM_IDENTITY_TTL	required
+squire-006-identity-skip	plugins/platforms/telegram/adapter.py	Telegram identity refresh disabled	required
