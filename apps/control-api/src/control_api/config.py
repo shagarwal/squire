@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     control_api_url: str = "http://localhost:8080"
     # What TENANTS are told to call. Should be the Railway private-network address
     # (http://control-api.railway.internal:8080): tenant -> control-api traffic
-    # (heartbeats every 5 minutes from every container, trial-key revocation) has
+    # (a heartbeat from every container, trial-key revocation) has
     # no business leaving the private network, crossing the public internet, and
     # being billed as egress on both ends. Falls back to the public URL when unset,
     # so a half-configured environment still works rather than silently pointing
@@ -77,11 +77,23 @@ class Settings(BaseSettings):
     tenant_service_name_prefix: str = "tenant-"
 
     # -- Fleet heartbeat (Task 0.6) -----------------------------------------
-    # A tenant beats every SQUIRE_HEARTBEAT_INTERVAL seconds (300 in the image).
-    # 900 = three missed beats before `/fleet` calls a tenant stale: long enough to
-    # ride out one redeploy or a sleeping serverless container waking up, short
-    # enough that the upgrade drill notices a canary that never came back.
-    heartbeat_stale_seconds: float = 900.0
+    # SQUIRE_HEARTBEAT_INTERVAL handed to every provisioned tenant. The image's
+    # own default stays 300 (fine for dev/self-hosted, where nothing sleeps), but
+    # a provisioned tenant lives on Railway, where serverless sleep only engages
+    # after ~10 quiet minutes with no outbound traffic. A 300s beat punches
+    # through that window forever, keeping every tenant permanently awake -- and
+    # sleep is the whole Railway economics bet (Gate G1, `railway_tenant_sleep`
+    # above). 1800s clears the window with margin; verified live on staging
+    # 2026-08-12 together with patch 006 (identity-refresh loop off).
+    tenant_heartbeat_interval_seconds: int = 1800
+    # 5400 = three missed beats at the provisioned interval before `/fleet` calls
+    # a tenant stale: long enough to ride out one redeploy or a serverless wake,
+    # short enough that the upgrade drill notices a canary that never came back.
+    # KNOWN LIMITATION: a tenant that Railway has put to sleep stops beating
+    # entirely and WILL read stale here even though it is perfectly healthy --
+    # /fleet cannot tell "asleep" from "dead" until it consults Railway's own
+    # service state (out of scope for this change).
+    heartbeat_stale_seconds: float = 5400.0
 
     # -- Ingress ------------------------------------------------------------
     # Telegram webhooks are registered as `<ingress_public_url>/telegram/<bot_id>`.
