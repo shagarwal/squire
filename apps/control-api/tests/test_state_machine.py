@@ -139,6 +139,10 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         # store). The tenant only binds a /start that carries this value, and
         # the real user receives it via the t.me/<bot>?start=<nonce> link.
         "SQUIRE_BIND_NONCE",
+        # Sleep-compatible beat (Gate G1): overrides the image's 300s default,
+        # which would keep every tenant awake past Railway's ~10-minute
+        # outbound-quiet sleep window forever.
+        "SQUIRE_HEARTBEAT_INTERVAL",
     }
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
@@ -170,8 +174,8 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
 def test_tenants_are_pointed_at_the_private_control_api_when_one_is_configured(
     pool_bot, fake_railway, monkeypatch
 ):
-    """Tenant -> control-api traffic (a heartbeat from every container every five
-    minutes, plus trial-key revocation) should stay on Railway's private network
+    """Tenant -> control-api traffic (a periodic heartbeat from every container,
+    plus trial-key revocation) should stay on Railway's private network
     rather than leaving it and being billed as egress at both ends."""
     from control_api import config
 
@@ -187,6 +191,51 @@ def test_tenants_are_pointed_at_the_private_control_api_when_one_is_configured(
 
         sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
         assert sent["CONTROL_API_URL"] == "http://control-api.railway.internal:8080"
+    finally:
+        config.get_settings.cache_clear()
+
+
+@respx.mock
+def test_tenants_are_provisioned_with_a_sleep_compatible_heartbeat_interval(
+    pool_bot, fake_railway
+):
+    """Gate G1: Railway's serverless sleep only engages after ~10 quiet minutes of
+    no outbound traffic. The tenant image's built-in default (300s) beats right
+    through that window, so every tenant would stay awake forever and the cost
+    model dies. Provisioning must therefore hand every tenant an interval longer
+    than the sleep window -- 1800s by default."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        provisioning.advance_job(s, job_id)
+
+    sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    # Railway variables are strings, like PORT above.
+    assert sent["SQUIRE_HEARTBEAT_INTERVAL"] == "1800"
+
+
+@respx.mock
+def test_tenant_heartbeat_interval_follows_the_configured_setting(
+    pool_bot, fake_railway, monkeypatch
+):
+    """The interval is a setting, not a constant: if Railway's sleep window ever
+    changes, ops must be able to retune the fleet without a code change."""
+    from control_api import config
+
+    monkeypatch.setenv("TENANT_HEARTBEAT_INTERVAL_SECONDS", "3600")
+    config.get_settings.cache_clear()
+    try:
+        mock_all(fake_railway)
+        with db.session_scope() as s:
+            _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+            job_id = job.id
+        with db.session_scope() as s:
+            provisioning.advance_job(s, job_id)
+
+        sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+        assert sent["SQUIRE_HEARTBEAT_INTERVAL"] == "3600"
     finally:
         config.get_settings.cache_clear()
 

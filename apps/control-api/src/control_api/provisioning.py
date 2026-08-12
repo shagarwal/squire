@@ -530,7 +530,7 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         "ANTHROPIC_BASE_URL": settings.effective_trial_base_url,
         "ANTHROPIC_API_KEY": trial_key or "",
         # The PRIVATE address when one is configured (see `control_api_internal_url`).
-        # Every tenant beats every 5 minutes; there is no reason for that to leave
+        # Every tenant beats regularly; there is no reason for that to leave
         # Railway's private network and be billed as egress at both ends.
         "CONTROL_API_URL": settings.effective_control_api_url,
         "INTERNAL_API_TOKEN": settings.internal_api_token,
@@ -547,6 +547,13 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # Closes the recycled-bot hole: a pool bot's previous owner keeps the
         # bot chat forever and would otherwise be first-in on the next tenant.
         "SQUIRE_BIND_NONCE": tenant.bind_nonce,
+        # Override the image's 300s heartbeat default: Railway's serverless sleep
+        # only engages after ~10 outbound-quiet minutes, so a 5-minute beat keeps
+        # every tenant permanently awake and destroys the cost model (Gate G1).
+        # 1800s clears the sleep window with margin -- verified live on staging
+        # with patch 006 (identity-refresh loop off). The image default stays 300
+        # for dev/self-hosted, where nothing sleeps.
+        "SQUIRE_HEARTBEAT_INTERVAL": str(settings.tenant_heartbeat_interval_seconds),
     }
     # 32 random bytes, base64. Generated only if we have not already set one: a
     # retry must not rotate the key out from under a volume already encrypted with
