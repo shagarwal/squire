@@ -73,6 +73,15 @@ telegram:
   # native typing indicator already covers "I'm working on it", and ingress
   # sends one on wake. Do not re-enable without user-facing evidence.
   reactions: false
+  # Upstream broadcasts "♻️ Gateway online — Hermes is back and ready." to
+  # every home channel on EVERY boot (run.py _send_home_channel_startup_
+  # notifications, gated only by this flag, default true). Patch 005 makes the
+  # owner's DM the home channel, and Railway serverless sleep makes boot a
+  # routine event — so with the default, every wake would message the user raw
+  # operator text. Same product rule as SQUIRE_SHUTDOWN_NOTICES=0 in the
+  # Dockerfile: infrastructure lifecycle is invisible to end users.
+  # (2026-08-13, founder feedback after "Gateway shutting down" reached a DM.)
+  gateway_restart_notification: false
 
 display:
   platforms:
