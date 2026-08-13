@@ -48,6 +48,16 @@ def _env(tmp_path, monkeypatch) -> Iterator[None]:
         "PROVISION_WORKER_ENABLED": "false",
         # Zero backoff keeps retry tests fast; the backoff *math* is tested separately.
         "PROVISION_BACKOFF_BASE_SECONDS": "0",
+        # TestClient runs BackgroundTasks inline, so the wake-typing loop's
+        # sleeps would be REAL sleeps inside every test request that hits
+        # /internal/wake-typing. Zero the interval (same trick as the Railway
+        # volume-probe delay above); the schedule *math* is tested separately
+        # by driving _typing_loop with an injected sleep.
+        "WAKE_TYPING_INTERVAL_SECONDS": "0",
+        # Pin the repeat count rather than inheriting the code default, so the
+        # endpoint test asserting "5 sends" tests config plumbing, not a magic
+        # number that happens to match.
+        "WAKE_TYPING_REPEATS": "5",
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)

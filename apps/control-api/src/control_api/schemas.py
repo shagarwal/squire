@@ -23,6 +23,32 @@ class TenantByBotResponse(BaseModel):
     webhook_secret: str
 
 
+class WakeTypingRequest(BaseModel):
+    """POST /internal/wake-typing -- ingress's typing-on-wake nudge.
+
+    Both fields are Telegram ROUTING identifiers, not content: bot_id is the
+    same public id that names the webhook path, chat_id is where the typing
+    indicator must appear. Neither is persisted or logged by the handler.
+
+    `extra="forbid"` for the same reason as HeartbeatRequest: an ids-only
+    channel must stay structurally ids-only -- an ingress build that tried to
+    attach message text would get a 422, not a quietly widening pipe.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bot_id: int
+    chat_id: int
+
+
+class WakeTypingResponse(BaseModel):
+    """202 body. Deliberately tiny -- ingress fires and forgets, so nobody
+    reads this beyond tests; it exists to give the contract a pinned shape."""
+
+    bot_id: int
+    accepted: bool
+
+
 class CreateTenantRequest(BaseModel):
     """POST /internal/tenants.
 

@@ -14,6 +14,8 @@ Everything here is behind the shared `INTERNAL_API_TOKEN` bearer.
 from __future__ import annotations
 
 import logging
+import time
+from typing import Callable
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlmodel import Session, func, select
@@ -44,6 +46,8 @@ from control_api.schemas import (
     SkippedBot,
     TenantByBotResponse,
     TenantResponse,
+    WakeTypingRequest,
+    WakeTypingResponse,
 )
 
 log = logging.getLogger(__name__)
@@ -81,6 +85,94 @@ def tenant_by_bot(bot_id: int, session: Session = Depends(get_session)) -> Tenan
         internal_url=tenant.internal_url,
         webhook_secret=bot.webhook_secret,
     )
+
+
+# ---------------------------------------------------------------------------
+# Typing-on-wake nudge
+#
+# ingress fires this (fire-and-forget) the moment it buffers an update for an
+# unreachable -- almost always sleeping -- tenant. The tenant takes ~15-20s to
+# wake, and without this the user stares at a silent chat and concludes the bot
+# is dead. Ingress cannot send the typing action itself: bot tokens live HERE
+# and in tenant containers, never in ingress (Gate G2), so ingress hands us
+# routing ids only and we do the Telegram call.
+# ---------------------------------------------------------------------------
+
+
+def _typing_loop(
+    token: str,
+    chat_id: int,
+    repeats: int,
+    interval_seconds: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """BackgroundTask: keep sendChatAction("typing") alive through the wake.
+
+    Telegram shows "typing..." for ~5s per call, so one call cannot cover a
+    ~15-20s wake: we re-send every `interval_seconds` up to `repeats` times
+    and then stop unconditionally -- if the tenant still is not up by then,
+    pretending it is about to answer becomes a lie.
+
+    Runs in Starlette's background threadpool AFTER the 202 was sent, so no
+    failure here can reach the caller; everything is swallowed and logged
+    (count only -- no chat_id, and never the token). It stops on the first
+    Telegram failure rather than retrying: a chat that refused a typing action
+    (blocked bot, deleted chat) will refuse the next four identically.
+
+    `sleep` is injectable so tests can pin the schedule without real waiting.
+    """
+    telegram = TelegramClient()
+    bot_id = bot_id_from_token(token)  # for logs -- never log the token itself
+    for attempt in range(repeats):
+        if attempt:
+            sleep(interval_seconds)
+        try:
+            telegram.send_chat_action(token, chat_id, action="typing")
+        except Exception:  # noqa: BLE001 -- must never escape a BackgroundTask
+            log.warning(
+                "wake-typing sendChatAction failed for bot %s (attempt %d/%d)",
+                bot_id,
+                attempt + 1,
+                repeats,
+            )
+            return
+
+
+@router.post(
+    "/wake-typing",
+    response_model=WakeTypingResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def wake_typing(
+    payload: WakeTypingRequest,
+    background: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> WakeTypingResponse:
+    """Show "typing..." in a chat while its sleeping tenant wakes.
+
+    202 immediately; the sendChatAction loop runs as a background task. A
+    Telegram-side failure is deliberately invisible to ingress -- the nudge is
+    best-effort UX, and ingress swallows failures anyway. Only an unknown
+    bot_id is an error (404, same convention as the by-bot lookup): ingress
+    only nudges for bots it just resolved, so a miss means real drift.
+
+    Privacy: chat_id is routing metadata (where to draw the indicator). It is
+    passed straight through to Telegram -- never persisted (no table has a
+    column for it; see test_privacy_schema) and never logged.
+    """
+    bot = session.get(Bot, payload.bot_id)
+    if bot is None:
+        raise HTTPException(status_code=404, detail="bot not registered")
+
+    settings = get_settings()
+    background.add_task(
+        _typing_loop,
+        bot.token,
+        payload.chat_id,
+        settings.wake_typing_repeats,
+        settings.wake_typing_interval_seconds,
+    )
+    return WakeTypingResponse(bot_id=payload.bot_id, accepted=True)
 
 
 # ---------------------------------------------------------------------------
