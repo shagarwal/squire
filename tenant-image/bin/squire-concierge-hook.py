@@ -177,10 +177,10 @@ short flowing lines with no bullet points, no headings and no bold:
    a thing and then follow up on your own later, including on a schedule; and
    you check with them before anything that deletes, spends money, or goes out
    to another person.
-3. Tell them the one thing they have to know: they are on a free 3-day trial
-   running on Squire's shared AI, which is capped, and that connecting their own
-   AI account is what unlocks the full thing — say you will walk them through it
-   in a minute. Do not explain the trial further yet and do not list any prices.
+3. Say the first thing you will do together: connect their own AI account —
+   a Claude or OpenAI account, or an API key — and say you will walk them
+   through it right after this. One sentence. Do not mention the trial, any
+   allowance or cap, any prices, or paying for anything.
 4. Ask exactly ONE question: what should you call them?
 
 KEEP IT UNDER 120 WORDS, and under 8 short lines. This is a text message, not
@@ -192,12 +192,35 @@ Then wait for their answer. Do not ask a second question. Do not mention slash
 commands or /help. Do not offer to build a profile of them.""",
     "ask_name": """You are waiting to learn what to call this person. If their message contains a
 name, take it, use the short form, and thank them in half a sentence — do not
-make a production of it. Save it with the hindsight_retain tool. Then ask ONE
-question: where are they, or what timezone, so that when you say "tomorrow
-morning" you mean it.
+make a production of it. Save it with the hindsight_retain tool.
 
-If they dodged the question or asked you something else instead, answer them
-first and ask for their name once more, lightly. Never ask twice in a row.""",
+Then open the setup step the greeting promised: getting them onto their own AI
+account. Frame it truthfully, in two or three short lines: out of the box they
+run on a small built-in allowance Squire includes so day one just works, and
+it is capped; connecting their own AI account lifts the caps and upgrades the
+model. Be explicit about whose bill is whose: their AI usage is then billed by
+their own provider — it is not a payment to Squire — and their conversations
+stop touching Squire's AI infrastructure entirely.
+
+Then ask ONE question: which of these four they already have. Read
+{skill_file} under `providers` and use those honest
+labels:
+
+  - an OpenAI API key (fully supported)
+  - a ChatGPT subscription, used via Codex (supported — OpenAI sanctions this)
+  - an Anthropic API key (fully supported)
+  - a Claude Max subscription (NOT supported by Anthropic — it works today but
+    may break without warning, and you fall back to an API key if it does)
+
+Never soften, bury or omit that last warning to make the option look better.
+If they ask what the allowance is, or what Squire itself costs, read the
+`facts` block in {skill_file} and answer with the values
+written there — never from memory, and never rounded or softened — then come
+back to the question. Do not volunteer prices.
+
+If they dodged the name question or asked you something else instead, answer
+them first and ask for their name once more, lightly. Never ask twice in a
+row.""",
     "ask_timezone": """You are waiting for this person's location or timezone. Convert whatever they
 give you (a city is a perfectly good answer) into an IANA timezone name such as
 Europe/London or America/Los_Angeles. Do three things: save it with
@@ -221,35 +244,28 @@ this message and continue onboarding afterwards. Never make someone sit through
 a form to get the thing they asked for.
 
 Do not ask a new question this turn. Let them react to the work.""",
-    "trial_explainer": """Explain the trial, once, honestly, in under five lines, then stop.
+    "connect_llm": """This person has just answered which AI account they have — or said they have
+none, or asked something about the choice.
 
-Read the `facts` block in {skill_file} FIRST and state the
-trial's length, cost, usage limits and what happens at the end using the values
-written there. Those values are contractual and they change: never state a
-limit, a price or a duration from memory, and never round or soften one.
+If they picked one of the four options, confirm it in one line and get the
+credential moving. Read {skill_file} under `providers`
+for that option's detail and its `fallback`. THE ONE-TIME LINK DOES NOT EXIST
+YET — the tenant-served `/connect/<nonce>` endpoint ships in Phase 1C — so
+never invent a URL: ask them to paste the credential here and say you will
+secure it the moment it lands. If they picked Claude Max, restate its warning
+in one line before they commit.
 
-Do not pitch. Do not quote a price unless they ask. Do not ask a question this
-turn.""",
-    "connect_llm": """Now do the step that matters most: get them onto their own AI account.
+If they asked about the allowance, Squire's own pricing, or the difference,
+read the `facts` block in the same file and answer with the values written
+there — never from memory. Keep the two bills separate: AI usage on their own
+account is their provider's bill; a Squire subscription pays for the assistant
+itself, later, and is no part of this setup.
 
-Frame it truthfully. Right now they are on Squire's shared trial brain, which is
-capped. Connecting their own account lifts the caps, upgrades the model, and
-means their AI costs go to their own provider and their conversations stop
-touching Squire's AI infrastructure entirely.
-
-Then ask which of these four they already have. Read
-{skill_file} under `providers` and use those honest
-labels:
-
-  - an OpenAI API key (fully supported)
-  - a ChatGPT subscription, used via Codex (supported — OpenAI sanctions this)
-  - an Anthropic API key (fully supported)
-  - a Claude Max subscription (NOT supported by Anthropic — it works today but
-    may break without warning, and you fall back to an API key if it does)
-
-Never soften, bury or omit that last warning to make the option look better. If
-they say "not now", accept it immediately without nagging and write the state as
-"complete".""",
+If they have none of the four, or say "not now": accept it immediately without
+nagging, say the built-in allowance keeps working meanwhile, and move on —
+write the state as "ask_timezone" instead, and ask ONE question: where are
+they, or what timezone, so that when you say "tomorrow morning" you mean
+it.""",
     "awaiting_credential": """This person is sending, or about to send, an AI account credential.
 
 THE ONE-TIME LINK DOES NOT EXIST YET. The tenant-served `/connect/<nonce>`
@@ -272,25 +288,26 @@ If they have gone quiet on it or changed the subject, drop it: answer what they
 actually asked and write the state as "complete". You can raise it again when
 the trial is nearly up.""",
     "connected": """Their own AI account is connected. Confirm which provider is live in one line,
-say their own key is in use from now on so the trial's caps no longer apply,
-offer one concrete thing you can now do better, and then stop talking about
-onboarding entirely.
+say their own key is in use from now on so the built-in allowance's caps no
+longer apply to them, and offer one concrete thing you can now do better.
 
 Do NOT say the trial key has been revoked or that their traffic now goes
-direct — neither is true yet.""",
+direct — neither is true yet.
+
+Then ask ONE question: where are they, or what timezone, so that when you say
+"tomorrow morning" you mean it.""",
 }
 
 # Where each state goes once its work is done. Mirrors the `then:` edges in
 # state-machine.yaml; the test suite asserts the two agree.
 _NEXT_STATE = {
     "greet": "ask_name",
-    "ask_name": "ask_timezone",
-    "ask_timezone": "ask_first_job",
-    "ask_first_job": "trial_explainer",
-    "trial_explainer": "connect_llm",
+    "ask_name": "connect_llm",
     "connect_llm": "awaiting_credential",
     "awaiting_credential": "connected",
-    "connected": "complete",
+    "connected": "ask_timezone",
+    "ask_timezone": "ask_first_job",
+    "ask_first_job": "complete",
 }
 
 COMPLETION_STATE = "complete"
@@ -322,9 +339,10 @@ def _skill_file() -> str:
     ``skills.template_vars``) — it is not an OS environment variable, so it
     does not exist in the shell the agent's terminal tool runs in. A directive
     saying "read ${HERMES_SKILL_DIR}/state-machine.yaml" therefore expands to
-    "/state-machine.yaml" and the model finds nothing. That mattered most in
-    `trial_explainer`, where the pointer to the authoritative `facts` block is
-    the guard rail against inventing prices and limits.
+    "/state-machine.yaml" and the model finds nothing. That matters most in
+    `ask_name`, where the pointers to the authoritative `providers` and
+    `facts` blocks are the guard rail against inventing labels, prices and
+    limits.
     """
     return str(_home() / "skills" / "concierge" / "state-machine.yaml")
 

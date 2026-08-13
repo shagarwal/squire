@@ -431,7 +431,7 @@ for st, ctx in all_ctx.items():
         "${" not in ctx and "{skill_file}" not in ctx,
         [tok for tok in ("${HERMES_SKILL_DIR}", "${HERMES_HOME}", "{skill_file}") if tok in ctx],
     )
-for st in ("trial_explainer", "connect_llm", "awaiting_credential"):
+for st in ("ask_name", "connect_llm", "awaiting_credential"):
     check(
         f"`{st}` points at state-machine.yaml by absolute path",
         "/skills/concierge/state-machine.yaml" in all_ctx[st],
@@ -669,6 +669,33 @@ check("every state is reachable from the initial state", seen == set(states), f"
 check("the flow terminates at the completion state", terminated)
 check("the completion state is terminal", states[completion].get("then") is None)
 
+# Founder feedback 2026-08-13: connect-first. The ORDER is the product decision
+# now, so pin it exactly — a reorder that slides a trial pitch back in front of
+# the connect step must fail this build, not slip through as "still 8 states".
+EXPECTED_ORDER = [
+    "greet", "ask_name", "connect_llm", "awaiting_credential",
+    "connected", "ask_timezone", "ask_first_job", "complete",
+]
+_walk, _cur = [], initial
+for _ in range(len(states) + 2):
+    _walk.append(_cur)
+    if _cur == completion:
+        break
+    _cur = states[_cur].get("then")
+check("the connect-first order is pinned exactly", _walk == EXPECTED_ORDER, str(_walk))
+check(
+    "LLM connection is the first substantive step after the name exchange",
+    hook._NEXT_STATE.get("ask_name") == "connect_llm",
+)
+check(
+    "the standalone trial-explainer state is gone from both sides",
+    "trial_explainer" not in states and "trial_explainer" not in hook._DIRECTIVES,
+)
+check(
+    "connecting resumes onboarding rather than ending it",
+    hook._NEXT_STATE.get("connected") == "ask_timezone",
+)
+
 
 print()
 print("== 5. the greeting has actual substance ==")
@@ -678,7 +705,6 @@ greet = states["greet"]
 
 greet_blob = flat(json.dumps(greet))
 greet_directive = flat(greet_ctx)
-trial_directive = context_for("trial_explainer")
 caps = {c["id"]: flat(c["say"]) for c in MACHINE["capabilities"]}
 # What the agent will actually read on turn one: the greet script plus the
 # capability lines it is told to draw from.
@@ -708,10 +734,30 @@ for label, blob in [
         f"greet ({label}) promises to check before dangerous actions",
         "check with them first" in blob or "before anything that deletes" in blob,
     )
-    check(f"greet ({label}) tells them about the trial", "trial" in blob)
+    # Founder feedback 2026-08-13: the greeting must not open with the trial,
+    # pricing, or payment — that mixing is what made message one read like a
+    # bill. The ban must be a LIVE instruction in the copy, not just an
+    # absence: an absence is one careless rewrite away from silently coming
+    # back, an instruction has to be deleted on purpose.
     check(
-        f"greet ({label}) tells them what they must DO next",
-        "own ai account" in blob,
+        f"greet ({label}) explicitly forbids mentioning the trial",
+        "do not mention the trial" in blob,
+    )
+    check(
+        f"greet ({label}) extends the ban to prices and payment",
+        "prices, or paying for anything" in blob,
+    )
+    check(
+        f"greet ({label}) carries no affirmative trial pitch",
+        "3-day trial" not in blob and "squire's shared ai" not in blob,
+    )
+    check(
+        f"greet ({label}) says the FIRST thing to do is connect their own AI",
+        "first" in blob and "own ai account" in blob,
+    )
+    check(
+        f"greet ({label}) names the accounts concretely (Claude/OpenAI)",
+        "claude" in blob and "openai" in blob,
     )
     check(f"greet ({label}) asks their name", "call" in blob)
     # /help is upstream's onboarding surface, not Squire's. It is not enough for
@@ -790,20 +836,48 @@ check(
     "75 messages a day" in facts["trial_limits"],
 )
 check(
-    "the trial directive does NOT inline the message count",
+    "no directive inlines the per-day message count",
     not any(
         "75 message" in d or "75/day" in d for d in hook._DIRECTIVES.values()
     ),
 )
+# trial_explainer is gone; the allowance framing at the provider-options step
+# (ask_name) is now the place trial mechanics surface, and it inherits the
+# same guard rails: facts by absolute path, nothing from memory, answer-only.
+_pitch = all_ctx["ask_name"]
 check(
-    "the trial directive points at the facts block by absolute path",
-    "/skills/concierge/state-machine.yaml" in trial_directive
-    and "`facts`" in trial_directive,
-    trial_directive[:160],
+    "the allowance pitch points at the facts block by absolute path",
+    "/skills/concierge/state-machine.yaml" in _pitch and "`facts`" in _pitch,
+    _pitch[:160],
 )
 check(
-    "the trial directive forbids stating limits from memory",
-    "from memory" in trial_directive.lower(),
+    "the pitch forbids stating limits or prices from memory",
+    "from memory" in _pitch.lower(),
+)
+check(
+    "the pitch keeps prices answer-only",
+    "do not volunteer prices" in flat(_pitch),
+)
+# The founder's actual complaint: LLM usage costs and paying for Squire were
+# presented as one thing. The separation must now be explicit in the copy.
+check(
+    "the pitch separates provider billing from paying Squire",
+    "billed by their own provider" in flat(_pitch)
+    and "not a payment to squire" in flat(_pitch),
+)
+check(
+    "the four honest labels are presented where the options are",
+    "fully supported" in flat(_pitch)
+    and "not supported by anthropic" in flat(_pitch)
+    and "openai sanctions this" in flat(_pitch),
+)
+check(
+    "declining the connect step continues onboarding instead of ending it",
+    '"ask_timezone"' in all_ctx["connect_llm"],
+)
+check(
+    "the choice step still bans inventing a URL",
+    "never invent a url" in flat(all_ctx["connect_llm"]),
 )
 # prd.md:118 lists the spend cap alongside the message count. Quoting only the
 # message count implies 75/day is reachable when the $2 cap may end the trial
@@ -861,6 +935,23 @@ check(
     "the connected directive does not claim the trial key was revoked",
     "revoked" not in hook._DIRECTIVES["connected"].lower()
     or "do not say" in hook._DIRECTIVES["connected"].lower(),
+)
+
+# Dropping the standalone trial explainer must not drop the honest disclosure
+# itself: the end-of-trial mechanics stay in facts for whenever they are asked
+# about, and `complete` still names the one moment they get said unprompted.
+check(
+    "trial end behaviour stays in facts, answer-only",
+    "72 hours" in facts["trial_end_behaviour"]
+    and "14 days" in facts["trial_end_behaviour"],
+)
+check(
+    "complete still re-raises the connect step near trial expiry",
+    "12 hours" in flat(json.dumps(states["complete"])),
+)
+check(
+    "complete states the end-of-trial mechanics when it does re-raise",
+    "trial_end_behaviour" in json.dumps(states["complete"]),
 )
 
 
