@@ -36,6 +36,26 @@ usage that it slept. If it did not, raise SQUIRE_HEARTBEAT_INTERVAL above the
 sleep window or gate beats on activity since the last one. See the matching note
 in tenant-image/Dockerfile.
 
+AWAKE UNTIL BOUND (fix/awake-until-bound)
+-----------------------------------------
+Live testing (2026-08) settled the "unverified assumption" above the expensive
+way: outbound beats DO count as activity for Railway's serverless sleep, which
+is why provisioned tenants carry SQUIRE_HEARTBEAT_INTERVAL=1800 — beat slower
+than the ~10 min quiet window so the tenant can sleep. But that same setting
+put a freshly provisioned tenant to sleep ~13 min after boot, BEFORE its owner
+ever tapped the Telegram deep link — so the owner's very first message ate a
+~15 s cold-start on top of LLM latency, and the silence read as "it didn't
+work". A tenant that has never met its owner must not be asleep.
+
+So the cadence is now bind-aware: while the approved-owner store is EMPTY
+(nobody has tapped the link), beat every min(configured, 300) seconds — that
+outbound traffic keeps the container warm, so the first tap lands instantly.
+The moment an owner is bound (checked cheaply every loop iteration, so a bind
+mid-life flips the cadence without a restart), the configured slow interval
+applies unchanged and the tenant earns its sleep. SQUIRE_UNBOUND_AWAKE_HOURS
+caps the warm window so an abandoned signup cannot burn container-hours
+forever.
+
 EVERY COLLECTOR FAILS INDEPENDENTLY
 -----------------------------------
 Each one returns None on any error and the field is simply omitted. A tenant that
@@ -49,7 +69,12 @@ INTERNAL_API_TOKEN           shared service-to-service bearer (unset => disabled
 TENANT_ID                    identifies the tenant (unset => disabled)
 SQUIRE_IMAGE_REF             image this container is running; set by control-api's
                              redeploy endpoint, and what the upgrade drill verifies
-SQUIRE_HEARTBEAT_INTERVAL    seconds between beats (default 300)
+SQUIRE_HEARTBEAT_INTERVAL    seconds between beats once an owner is bound
+                             (default 300; provisioned tenants get 1800)
+SQUIRE_UNBOUND_AWAKE_HOURS   how long an owner-less tenant stays on the fast
+                             cadence before giving up and sleeping (default 48)
+HERMES_HOME                  mounted volume; where the autopair approved-owner
+                             store lives (default /opt/data)
 PORT                         webhook shim's port, scraped for update counters
 HINDSIGHT_API_PORT           memory daemon health port (default 9177)
 SQUIRE_VOLUME                mounted volume, for the disk gauge (default /opt/data)
@@ -109,6 +134,38 @@ IMAGE_REF = os.environ.get("SQUIRE_IMAGE_REF", "")
 
 INTERVAL = _env_number("SQUIRE_HEARTBEAT_INTERVAL", 300, int)
 HTTP_TIMEOUT = _env_number("SQUIRE_HEARTBEAT_TIMEOUT", 15.0, float)
+
+# --- Awake-until-bound cadence ----------------------------------------------
+# While no owner is bound, beat at least this often. Railway's serverless sleep
+# engages after ~10 minutes of quiet and outbound traffic resets that clock
+# (verified live 2026-08 — see AWAKE UNTIL BOUND in the module docstring), so a
+# beat every <=5 minutes keeps an owner-less tenant warm for its first tap.
+UNBOUND_BEAT_CEILING = 300
+
+# Runaway cap: an abandoned signup must not keep a container awake forever.
+# 48h default = a generous trial window for a slow owner to tap the link, after
+# which the tenant falls back to the configured slow cadence and sleeps (wake-
+# on-tap still works via the shim's probe fix). The product answer for owners
+# who never said hello is the Phase-1B "never-said-hello" email nudge
+# (docs/implementation-plan.md §1B), not container-hours burned on standby.
+UNBOUND_AWAKE_HOURS = _env_number("SQUIRE_UNBOUND_AWAKE_HOURS", 48, float)
+
+# Same `or` form as the shim: HERMES_HOME set-but-empty must not silently point
+# the store lookup at a relative path.
+HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
+
+# "Bound" is decided exactly the way the autopair machinery decides it: the
+# approved-owner store on the volume. Import squire_autopair by path (same
+# pattern as squire-webhook-shim.py) rather than trusting cwd — supervisord
+# starts us from an unspecified directory. If the import fails we treat the
+# tenant as BOUND, i.e. the configured slow cadence: fail toward the cheap
+# mode (tenant sleeps, wake-on-tap still works), never toward burn.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from squire_autopair import approved_path, load_approved
+except ImportError:  # pragma: no cover - defensive
+    approved_path = None
+    load_approved = None
 
 SHIM_PORT = _env_number("PORT", 8080, int)
 SHIM_HOST = os.environ.get("SQUIRE_HEARTBEAT_SHIM_HOST", "127.0.0.1")
@@ -392,6 +449,74 @@ def beat() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------------------
+# Cadence — fast while unbound, configured once an owner exists
+# ---------------------------------------------------------------------------
+
+
+def owner_bound() -> bool:
+    """True once the approved-owner store has at least one entry.
+
+    Cheap (one small file read) because run_loop calls this every iteration: a
+    bind mid-life must flip the cadence without a restart. Any doubt — import
+    failed, store unreadable/corrupt — reads as BOUND so we fail toward the
+    cheap slow cadence, never toward keeping a container awake on bad data.
+    """
+    if approved_path is None or load_approved is None:
+        return True
+    try:
+        # load_approved returns {} for a missing file (the genuinely-unbound
+        # case) but RAISES on an unreadable or corrupt one — exactly the
+        # distinction we want, since only a positively-empty store means fast.
+        return bool(load_approved(approved_path(HERMES_HOME)))
+    except Exception:
+        return True
+
+
+def current_interval() -> int:
+    """Seconds until the next beat, re-decided before every wait.
+
+    Bound: the configured interval, unchanged. Unbound: min(configured, 300)
+    so the tenant stays warm for its owner's first tap — until container
+    uptime passes SQUIRE_UNBOUND_AWAKE_HOURS, after which the configured slow
+    interval applies and the abandoned signup is allowed to sleep. Uptime is
+    this process's clock; supervisord starts it at container boot, and a
+    heartbeat restart resetting the window is an acceptable coarseness.
+    """
+    if owner_bound():
+        return INTERVAL
+    if time.monotonic() - START_MONOTONIC > UNBOUND_AWAKE_HOURS * 3600:
+        return INTERVAL
+    return min(INTERVAL, UNBOUND_BEAT_CEILING)
+
+
+def run_loop(stop: threading.Event) -> None:
+    """Beat until stopped, re-checking the bound-aware cadence each iteration.
+
+    Extracted from main() so the tests can drive it with a fake stop event and
+    observe the chosen delays without real sleeping.
+    """
+    # First beat immediately: the upgrade drill's whole verification depends on
+    # a freshly redeployed tenant reporting its image within seconds, not
+    # within a full interval.
+    beat()
+    last_interval = None
+    while not stop.is_set():
+        interval = current_interval()
+        if interval != last_interval:
+            # One line per cadence change, not per beat: this is the live
+            # signal that an owner bound (fast -> slow) or the unbound cap
+            # kicked in.
+            log(f"cadence: beating every ~{interval}s")
+            last_interval = interval
+        # Jitter so a fleet that all redeployed together does not then beat in
+        # lockstep forever after. +/-10% is enough to smear the herd.
+        delay = interval * random.uniform(0.9, 1.1)
+        if stop.wait(delay):
+            break
+        beat()
+
+
 def main(argv: list[str]) -> int:
     once = "--once" in argv[1:]
 
@@ -413,18 +538,9 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    log(f"beating every {INTERVAL}s to {CONTROL_API_URL}/internal/heartbeat")
-    # First beat immediately: the upgrade drill's whole verification depends on a
-    # freshly redeployed tenant reporting its image within seconds, not within a
-    # full interval.
-    beat()
-    while not stop.is_set():
-        # Jitter so a fleet that all redeployed together does not then beat in
-        # lockstep forever after. +/-10% is enough to smear the herd.
-        delay = INTERVAL * random.uniform(0.9, 1.1)
-        if stop.wait(delay):
-            break
-        beat()
+    log(f"beating to {CONTROL_API_URL}/internal/heartbeat "
+        f"(bound interval {INTERVAL}s, unbound ceiling {UNBOUND_BEAT_CEILING}s)")
+    run_loop(stop)
 
     log("stopping")
     return 0
