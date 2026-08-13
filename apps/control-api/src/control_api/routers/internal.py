@@ -122,7 +122,17 @@ def _typing_loop(
     `sleep` is injectable so tests can pin the schedule without real waiting.
     """
     telegram = TelegramClient()
-    bot_id = bot_id_from_token(token)  # for logs -- never log the token itself
+    # For logs -- never log the token itself. Guarded because
+    # bot_id_from_token raises ValueError CONTAINING a token fragment on a
+    # malformed token; if that escaped the BackgroundTask, uvicorn's traceback
+    # log would carry it -- exactly what this function promises never happens.
+    # (Tokens are getMe-validated at registration, so this is a belt-and-braces
+    # guard, not an expected path.)
+    try:
+        bot_id = bot_id_from_token(token)
+    except ValueError:
+        log.warning("wake-typing: malformed bot token in registry, skipping")
+        return
     for attempt in range(repeats):
         if attempt:
             sleep(interval_seconds)
