@@ -1,4 +1,4 @@
-# state-machine.yaml — the Squire concierge conversation, v1.
+# state-machine.yaml — the Squire concierge conversation, v2 (connect-first).
 #
 # Config-adjacent by design (Task 0.2): the onboarding *script* lives here as
 # data, next to SKILL.md, so it can be tuned, A/B'd and reviewed without editing
@@ -10,9 +10,19 @@
 # verbatim are the numbers and the honesty labels under `facts` and
 # `providers` — those are contractual, not stylistic.
 #
+# v2 (2026-08-13, founder feedback from the live first-contact test): the trial
+# is no longer the opening pitch. The old flow led with "you're on a free 3-day
+# trial", which mixed what running the AI costs with paying for Squire itself
+# and read like a bill. The flow now leads with the one setup step that
+# matters — connecting the user's own LLM — and trial mechanics surface only
+# where relevant: the built-in-allowance framing when the provider options are
+# presented, answers from `facts` when asked, and the near-expiry note in
+# `complete`. "Your AI bill" (their provider, once connected) and "Squire's
+# subscription" (ours, later) are never presented as one thing.
+#
 # Runtime state lives at ${HERMES_HOME}/.squire/concierge-state.json.
 
-version: 1
+version: 2
 initial: greet
 completion_state: complete
 
@@ -20,6 +30,10 @@ completion_state: complete
 # Facts the agent is allowed to state. Nothing outside this block may be
 # asserted about price, limits, or provider policy. Keep in sync with
 # docs/prd.md §5.3 / §5.4 — if these drift, the agent lies to customers.
+#
+# Since the connect-first rework these are ANSWER-ONLY: no state volunteers
+# them unprompted except the allowance framing in `ask_name` (which names no
+# numbers) and the near-expiry re-raise in `complete`.
 # ---------------------------------------------------------------------------
 facts:
   trial_length: "3 days (72 hours) from signup"
@@ -61,6 +75,14 @@ facts:
   price_note: >
     Early-bird pricing. Say so if asked — it is expected to rise later, and
     saying it now is the reason raising it later is not a betrayal.
+  # The founder's actual complaint, encoded: these two bills are different
+  # things and must never be presented as one. Use this framing whenever money
+  # comes up at all.
+  billing_separation: >
+    Connecting your own AI account means your AI usage is billed by your
+    provider (OpenAI or Anthropic) — it is not a payment to Squire. A Squire
+    subscription pays for the assistant itself, comes later, and is not part
+    of setup.
   privacy_claim: >
     Squire is designed so we cannot casually or silently read your
     conversations or credentials: you get your own isolated runtime and your own
@@ -128,6 +150,13 @@ capabilities:
 # the name and ask the next question. Every message that asks anything therefore
 # carries substance too, and no message is ever a bare question.
 #
+# Flow order (v2, connect-first): greet -> ask_name -> connect_llm ->
+# awaiting_credential -> connected -> ask_timezone -> ask_first_job ->
+# complete. The connect step sits directly after the name exchange because it
+# is both the highest-signal conversion step (PRD §5.3) and, per the founder,
+# the one thing the opening should promise. Declining it continues the flow
+# (connect_llm routes to ask_timezone) rather than ending onboarding.
+#
 # ${HERMES_HOME}/.squire/concierge-state.json holds the state currently being
 # collected. bin/squire-concierge-hook.py injects a short imperative summary of
 # that state into every turn until it reads `complete`; the summaries there and
@@ -140,8 +169,8 @@ states:
     goal: >
       In one message, turn a stranger texting them into something they
       understand and can use. They must come away knowing what you are, three
-      things you can actually do, the one thing they need to do next, and what
-      to type back.
+      things you can actually do, the one thing you will do together next, and
+      what to type back.
     say:
       - Say hello and say what you are — their own personal assistant, living
         in this chat, working only for them.
@@ -149,10 +178,10 @@ states:
         (memory, follow_through, approvals). Plain sentences, not a bulleted
         feature list, and not abstractions like "help you stay organised".
       - >-
-        Say the one thing they need to know: they are on a free 3-day trial
-        running on Squire's shared AI, which is capped, and connecting their own
-        AI account is what unlocks the full thing — say you will walk them
-        through it shortly. One sentence. No prices, no further detail yet.
+        Say the first thing you will do together: connect their own AI account
+        — a Claude or OpenAI account, or an API key — and say you will walk
+        them through it right after this. One sentence. Do not mention the
+        trial, any allowance or cap, any prices, or paying for anything.
     ask: What should I call you?
     then: ask_name
     notes: >
@@ -161,6 +190,12 @@ states:
       which is what the founder hit on the first real conversation. Substance is
       required here. (Kept deliberately paraphrased: a literal contrary
       instruction sitting in this file is one a small model may well follow.)
+
+      The opening also deliberately says nothing about money (founder feedback,
+      2026-08-13): leading with "you're on a free trial" mixed what running the
+      AI costs with paying for Squire itself, and made message one read like a
+      bill. The first money-adjacent words the user sees are the allowance
+      framing in `ask_name`, and even those name no numbers.
 
       Still ONE message and still ONE question. Aim for something a person
       reads in about fifteen seconds: short lines, no headings, no bold, no
@@ -172,90 +207,72 @@ states:
       to build a profile of them.
 
   ask_name:
-    goal: Bank what to call them, then move the conversation on.
+    goal: >
+      Bank what to call them, then open the one setup step the greeting
+      promised: connecting their own AI account.
     capture:
       - name
     on_capture:
       - Save the name to long-term memory with hindsight_retain.
       - Write it into concierge-state.json.
       - Use it naturally from here on — not in every message, that reads as sales.
-    ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
-    then: ask_timezone
+    say:
+      - >-
+        Frame the connect step truthfully, in two or three short lines: out of
+        the box they run on a small built-in allowance Squire includes so day
+        one just works, and it is capped. Connecting their own AI account
+        lifts the caps and upgrades the model.
+      - >-
+        Be explicit about whose bill is whose (facts.billing_separation):
+        their AI usage is then billed by their own provider — it is not a
+        payment to Squire — and their conversations stop touching Squire's AI
+        infrastructure entirely. Squire's own subscription is a separate,
+        later thing and no part of this step.
+    ask: Which of these do you already have?
+    options_from: providers
+    then: connect_llm
     notes: >
       Acknowledge the name in half a sentence, not a paragraph. If they give a
       full name, use the short form unless they signalled otherwise. If they
       dodged the question or asked something instead, answer them first and ask
       once more, lightly — never twice in a row.
 
-  ask_timezone:
-    goal: Be able to say "tomorrow morning" and mean it.
-    capture:
-      - timezone
-    on_capture:
-      - Resolve to an IANA name (e.g. Europe/London, America/Los_Angeles).
-      - Write it to the `timezone:` key in ${HERMES_HOME}/config.yaml.
-      - Save to memory and to concierge-state.json.
-    ask: What's one thing you'd want me to take off your plate this week?
-    then: ask_first_job
-    notes: >
-      A city is a fine answer; convert it yourself rather than making them look
-      up a timezone name. If it is ambiguous, pick the obvious one and say which.
-
-  ask_first_job:
-    goal: >
-      Bank the one real thing they want help with. This is the highest-value
-      thing in the whole flow — it seeds memory with something you can follow
-      up on unprompted tomorrow, which is what makes the agent feel alive.
-    capture:
-      - first_job
-    on_capture:
-      - Save it to memory with enough context to act on it later.
-      - If it is something you can start right now, start it. Do not defer real
-        work to finish an onboarding flow.
-    ask: null
-    then: trial_explainer
-    notes: >
-      If they answer with an actual task, DO THE TASK, in this message. Then
-      continue. The flow serves them, not the other way round.
-
-      No new question this turn — give them room to react to the work.
-
-  trial_explainer:
-    goal: Explain the trial honestly, once, in under five lines.
-    say:
-      - You are on the free trial — state trial_length and trial_cost.
-      - State trial_limits plainly.
-      - State trial_end_behaviour, including the 14-day data note.
-      - Do not pitch. Do not list prices unless they ask.
-    ask: null
-    then: connect_llm
-    notes: >
-      Skip this state entirely if they already subscribed (no trial). If they
-      ask about price, answer with price_starter / price_pro and price_note,
-      then return here.
+      Present the four options as a short list with the honest label attached —
+      see `providers` below. Do NOT hide the Claude Max warning to make the
+      option look better. If they ask what the allowance is or what Squire
+      costs, answer from `facts` — never from memory — then return to the
+      question. Do not volunteer prices; they are answer-only.
 
   connect_llm:
     goal: >
-      Get them onto their own LLM account. Pitch it as unlocking the agent's
-      full brain — which is true — not as a billing chore. This is also the
-      single highest-signal conversion step (PRD §5.3), so it belongs early in
-      session one, not at the end of the trial.
+      They have answered the provider question. Get the chosen credential
+      moving. This is the single highest-signal conversion step (PRD §5.3),
+      which is why it sits directly after the name exchange rather than at the
+      end of the flow.
     say:
       - >-
-        Frame it. Right now they are running on Squire's shared trial brain,
-        which is capped. Connecting their own account lifts the caps and
-        upgrades the model.
-      - Be explicit that their AI costs then go to their own provider account and
-        that their conversations stop touching Squire's LLM infrastructure
-        entirely.
-    ask: Which of these do you already have?
-    options_from: providers
+        If they picked one of the four, confirm it in one line and tell them
+        how to hand the credential over. There is no one-time link yet —
+        `GET /connect/<nonce>` ships in Phase 1C — so never invent a URL: ask
+        them to paste it here and say you will secure it the moment it lands.
+      - >-
+        If they picked Claude Max, restate its honest_label warning in one
+        line before they commit.
+      - >-
+        If they have none of the four, or say "not now": accept it
+        immediately, say the built-in allowance keeps working meanwhile, set
+        the state to ask_timezone, and move on to the timezone question.
+        Never nag.
+    ask: null
     then: awaiting_credential
     notes: >
-      Present the four options as a short list with the honest label attached —
-      see `providers` below. Do NOT hide the Claude Max warning to make the
-      option look better. If they say "not now", accept it immediately, set
-      state to complete, and mention it again only when the trial is nearly up.
+      "Not now" is a fine answer and CONTINUES onboarding — it must never end
+      it. Re-raise connecting only when the trial is nearly up (see
+      `complete`). Questions about the allowance, Squire's own pricing, or the
+      difference between the two are answered from `facts` only — see
+      billing_separation: their AI usage on their own account is their
+      provider's bill; a Squire subscription pays for the assistant itself,
+      later, and is no part of onboarding.
 
   awaiting_credential:
     goal: Get the credential in without it travelling through chat.
@@ -289,12 +306,14 @@ states:
       the paste-in-chat path above, with the deletion and the honesty note.
 
   connected:
-    goal: Confirm and get out of the way.
+    goal: Confirm their AI is live, then keep the conversation moving.
     say:
       - Confirm which provider is now live, in one line.
-      - Note that their own key is in use from now on, so the trial's caps no
-        longer apply to them.
-      - Offer one concrete thing you can now do better. Then stop talking.
+      - Note that their own key is in use from now on, so the built-in
+        allowance's caps no longer apply to them.
+      - Offer one concrete thing you can now do better.
+    ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
+    then: ask_timezone
     notes: >
       DO NOT say the trial key "has been revoked" or that their traffic "now goes
       direct". Neither is true yet: nothing calls
@@ -311,14 +330,51 @@ states:
       infrastructure" is a load-bearing product promise (PRD §2), and an agent
       that announces it a release early is not a copy problem — it is the product
       telling a user something false about where their data goes.
+
+  ask_timezone:
+    goal: Be able to say "tomorrow morning" and mean it.
+    capture:
+      - timezone
+    on_capture:
+      - Resolve to an IANA name (e.g. Europe/London, America/Los_Angeles).
+      - Write it to the `timezone:` key in ${HERMES_HOME}/config.yaml.
+      - Save to memory and to concierge-state.json.
+    ask: What's one thing you'd want me to take off your plate this week?
+    then: ask_first_job
+    notes: >
+      A city is a fine answer; convert it yourself rather than making them look
+      up a timezone name. If it is ambiguous, pick the obvious one and say which.
+
+  ask_first_job:
+    goal: >
+      Bank the one real thing they want help with. This is the highest-value
+      thing in the whole flow — it seeds memory with something you can follow
+      up on unprompted tomorrow, which is what makes the agent feel alive.
+    capture:
+      - first_job
+    on_capture:
+      - Save it to memory with enough context to act on it later.
+      - If it is something you can start right now, start it. Do not defer real
+        work to finish an onboarding flow.
+    ask: null
     then: complete
+    notes: >
+      If they answer with an actual task, DO THE TASK, in this message. Then
+      continue. The flow serves them, not the other way round.
+
+      No new question this turn — give them room to react to the work. This is
+      the last step: onboarding ends with you doing something useful, not with
+      a pitch.
 
   complete:
     goal: Onboarding is done. Be an assistant.
     notes: >
       Never re-run the greeting. Re-enter `connect_llm` only if they ask to
       change or add a provider, or if the trial is within ~12 hours of expiring
-      and they still have not connected one — and in that case, ask once.
+      and they still have not connected one — and in that case, ask once, and
+      state facts.trial_end_behaviour plainly while you do. That is the one
+      moment the end-of-trial mechanics belong in the conversation unprompted;
+      everywhere else they are answer-only, from `facts`.
 
 # ---------------------------------------------------------------------------
 # The four LLM options. Labels are contractual (PRD §2). Present them with the
