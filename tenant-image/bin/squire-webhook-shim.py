@@ -220,10 +220,17 @@ def _is_loopback(client_address) -> bool:
     return bool(mapped and mapped.is_loopback)
 
 
-def _gateway_listening() -> bool:
-    """Cheap TCP probe of the adapter's webhook listener."""
+def _gateway_listening(timeout: float = 1.0) -> bool:
+    """Cheap TCP probe of the adapter's webhook listener.
+
+    A bare connect + close: proves something is accepting on the port without
+    consuming a request from the gateway's webhook queue (an HTTP request here
+    would be processed as a webhook). Used by /health (reported, not gated on)
+    and as the pre-side-effect guard in do_POST — the caller there passes a
+    shorter timeout so a booting container answers ingress quickly.
+    """
     try:
-        with socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=1.0):
+        with socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=timeout):
             return True
     except OSError:
         return False
@@ -327,6 +334,37 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length)
+
+        # --- Side-effect atomicity: no upstream, no side effects ------------
+        # The autopair block below performs a DURABLE write (owner binding) and
+        # in-place body rewrites, and only afterwards does the relay discover
+        # whether the gateway is listening. On a serverless wake the user's tap
+        # IS the boot trigger, so ingress routinely delivers the buffered
+        # first-contact "/start <nonce>" while the gateway is still booting.
+        # Without this probe the shim would bind the owner, 503 the delivery,
+        # and then ingress's REDELIVERY of the same update would take the
+        # non-binding path — stripping the payload and forwarding a bare
+        # "/start", which upstream swallows as a platform ping. Net effect: the
+        # owner's first contact produced silence (live incident, staging tenant
+        # c559d1c9, 2026-08-13).
+        #
+        # So: probe the upstream FIRST, on every forwarded update. If it is not
+        # accepting, answer the same retryable 503 the relay would have — just
+        # decided before anything mutated — and let ingress redeliver. Bind,
+        # rewrite, and relay then all happen on one successful delivery. The
+        # existing post-relay 503 path stays as the backstop for the
+        # probe-passed-then-died race, whose window this shrinks from the whole
+        # boot (~30s) to milliseconds. Body already read above: required to
+        # keep the HTTP/1.1 keep-alive connection parseable, and harmless.
+        if not _gateway_listening(timeout=0.5):
+            log("upstream not ready, declining before side effects")
+            count("updates_failed")
+            self._respond(
+                503,
+                {"error": "gateway not ready"},
+                extra_headers=(("Retry-After", "2"),),
+            )
+            return
 
         # Bind the owner BEFORE forwarding. Ordering is the whole trick: upstream's
         # PairingStore.is_approved() re-reads the approved JSON on every call with

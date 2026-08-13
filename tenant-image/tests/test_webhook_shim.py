@@ -532,6 +532,135 @@ finally:
     adapter4.shutdown()
     adapter4.server_close()
 
+print("== wake-race first contact: NO side effects before upstream is reachable ==")
+# The live incident (staging tenant c559d1c9, 2026-08-13 00:31 UTC): the user's
+# deep-link tap IS what wakes the container from serverless sleep, so ingress
+# delivers the buffered first-contact "/start <nonce>" while the gateway is
+# still booting. The shim used to bind the owner FIRST (a durable write), THEN
+# discover the relay fails -> 503. On ingress's redelivery the store was
+# non-empty, so the non-binding path stripped the payload and forwarded a bare
+# "/start", which upstream swallows as a platform ping -> the owner's first
+# contact produced silence. The fix: probe the upstream BEFORE any side effect;
+# if it is not listening, answer 503 untouched and let redelivery carry
+# bind + defang + relay together on one successful delivery.
+received.clear()
+home4 = tempfile.mkdtemp()
+approved4 = pathlib.Path(home4) / "platforms" / "pairing" / "telegram-approved.json"
+# Deliberately NO fake adapter running yet — that is the whole point. Mirror
+# the incident exactly: a nonce-provisioned tenant (staging c559d1c9 was one).
+proc = run({
+    "SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH,
+    "HERMES_HOME": home4,
+    "SQUIRE_BIND_NONCE": "wake-live-nonce",
+})
+try:
+    AUTH = {"X-Telegram-Bot-Api-Secret-Token": SECRET}
+    wake = {
+        "update_id": 970,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 555001, "is_bot": False, "first_name": "owner"},
+            "chat": {"id": 555001, "type": "private"},
+            "text": "/start wake-live-nonce",
+        },
+    }
+
+    # --- delivery while the gateway is still booting ------------------------
+    status, _ = post("/webhook/telegram", wake, headers=AUTH)
+    check("upstream down: first contact answers 503", status == 503, status)
+    check("upstream down: owner NOT bound (store still empty)",
+          not approved4.exists(), str(approved4))
+
+    # An ordinary text message while down: 503 too, nothing mutated. This
+    # already held via the relay-exception path; pinned so the probe can never
+    # make it worse.
+    plain = {
+        "update_id": 971,
+        "message": {
+            "message_id": 2,
+            "from": {"id": 555001, "is_bot": False, "first_name": "owner"},
+            "chat": {"id": 555001, "type": "private"},
+            "text": "hello",
+        },
+    }
+    status, _ = post("/webhook/telegram", plain, headers=AUTH)
+    check("upstream down: ordinary message answers 503", status == 503, status)
+    check("upstream down: still no owner bound", not approved4.exists(), str(approved4))
+    _, metrics = get("/metrics")
+    check("upstream down: both counted failed, nothing forwarded/rejected",
+          metrics == {"updates_forwarded": 0, "updates_failed": 2,
+                      "updates_rejected": 0}, metrics)
+
+    # --- ingress redelivers the SAME update once the gateway is up ----------
+    adapter5 = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), FakeAdapter)
+    adapter5.daemon_threads = True
+    threading.Thread(target=adapter5.serve_forever, daemon=True).start()
+    try:
+        status, _ = post("/webhook/telegram", wake, headers=AUTH)
+        check("redelivery with upstream up -> 200", status == 200, status)
+        check("redelivery bound the owner", approved4.exists(), str(approved4))
+        if approved4.exists():
+            store4 = json.loads(approved4.read_text())
+            check("redelivery bound the sender's id",
+                  list(store4) == ["555001"], list(store4))
+        check("redelivery reached the gateway", len(received) == 1, len(received))
+        # The greeting-triggering relay: bind + defang on the SAME delivery.
+        # "start" as text, not "/start" as a command — a bare command here is
+        # exactly the silence the incident produced.
+        if received:
+            fwdw = json.loads(received[0]["body"])
+            check("redelivery: /start defanged to text 'start'",
+                  fwdw["message"]["text"] == "start", fwdw["message"].get("text"))
+            check("redelivery: nonce absent from forwarded body",
+                  "wake-live-nonce" not in received[0]["body"], received[0]["body"])
+    finally:
+        adapter5.shutdown()
+        adapter5.server_close()
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    out = proc.stdout.read() if proc.stdout else ""
+    check("probe decline is logged distinctly",
+          "declining before side effects" in out, out[-300:])
+    check("nonce absent from logs", "wake-live-nonce" not in out, out[-300:])
+
+print("== probe-passed-then-died race: existing 503 backstop still holds ==")
+# A listener that ACCEPTS the TCP connect (so the pre-probe passes) but closes
+# the connection immediately (so the HTTP relay dies). In this window the side
+# effects MAY already have run — that is accepted: it is today's entire
+# boot-length (~30s) exposure reduced to the milliseconds between probe and
+# relay, and the existing exception path still answers a retryable 503 rather
+# than dropping the update.
+racer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+racer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+racer.bind(("127.0.0.1", UPSTREAM_PORT))
+racer.listen(8)
+
+
+def _accept_and_slam():
+    while True:
+        try:
+            conn, _ = racer.accept()
+        except OSError:  # racer closed -> test section over
+            return
+        conn.close()
+
+
+threading.Thread(target=_accept_and_slam, daemon=True).start()
+proc = run({"SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH})
+try:
+    status, _ = post("/webhook/telegram", {"update_id": 980,
+                                           "message": {"text": "hello"}})
+    check("probe passes but relay dies -> still retryable 503",
+          status == 503, status)
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    racer.close()
+    out = proc.stdout.read() if proc.stdout else ""
+    check("race path went through the relay backstop, not the probe",
+          "upstream unavailable" in out, out[-300:])
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
