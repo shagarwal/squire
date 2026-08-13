@@ -362,6 +362,17 @@ jobs:
         # and pins the fail-safe env semantics plus the baked-0 image default.
         run: python3 tenant-image/tests/test_identity_refresh_ttl.py
 
+      - name: Shutdown notices are silenced (patch 005 — sleep must be quiet)
+        if: steps.present.outputs.exists == 'true'
+        # The flip side of the sleep work: once a tenant sleeps, Railway
+        # SIGTERMs it after every idle period and upstream's stop() messaged
+        # every user "⚠️ Gateway shutting down" (live incident, 2026-08-13).
+        # Patch 005 gates all shutdown/restart notices behind
+        # SQUIRE_SHUTDOWN_NOTICES; this suite applies the gate hunk for real,
+        # checks it structurally, and pins the default-quiet env semantics
+        # plus the baked-0 image default.
+        run: python3 tenant-image/tests/test_shutdown_notices_gate.py
+
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
         # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,

@@ -1,7 +1,48 @@
 diff --git a/gateway/run.py b/gateway/run.py
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -17186,6 +17186,39 @@
+@@ -9138,6 +9138,40 @@
+         messages can be delivered. Best-effort: individual send failures are
+         logged and swallowed so they never block the shutdown sequence.
+         """
++        # (squire patch 005) Squire tenants run on Railway serverless sleep:
++        # ~13 quiet minutes after the user's last message the platform
++        # SIGTERMs the container, which lands here via stop(). The code below
++        # then messages the active chat AND the home channel with
++        # "⚠️ Gateway shutting down — Your current task will be interrupted."
++        # — and patch 005 adopts the owner's DM as the home channel, so every
++        # routine idle-sleep would ping every user with raw operator text ten
++        # minutes after they went quiet (observed live, 2026-08-13). Sleep is
++        # not an incident for this product; it is the billing model, and the
++        # audience is non-technical.
++        #
++        # So gate ALL user-facing shutdown/restart notices — the per-active-
++        # session ping and the home-channel broadcast alike, both of which
++        # only this method sends (stop() has no other send site) — behind one
++        # env var. Polarity, chosen deliberately and DEFAULT-QUIET:
++        #
++        #   SQUIRE_SHUTDOWN_NOTICES unset / empty / "0"  -> send NOTHING
++        #   any other value                              -> upstream behaviour
++        #                                                   entirely unchanged
++        #
++        # Default-quiet is safe even where the var is absent (dev shells,
++        # out-of-order rollouts): a self-hosted hermes without Squire's env
++        # never runs this patch overlay in the first place, and the tenant
++        # image still bakes SQUIRE_SHUTDOWN_NOTICES=0 explicitly in the
++        # Dockerfile so the policy is visible rather than implied by absence.
++        # When the gate is OPEN, everything downstream — dedup, the drain
++        # suppress_notification marker, per-platform
++        # gateway_restart_notification — runs exactly as upstream wrote it.
++        if os.environ.get("SQUIRE_SHUTDOWN_NOTICES", "0").strip() in ("", "0"):
++            logger.info(
++                "squire: user-facing shutdown notices suppressed "
++                "(SQUIRE_SHUTDOWN_NOTICES is unset/0)"
++            )
++            return
+         active = self._snapshot_running_agents()
+         restart_source = self._restart_command_source if self._restart_requested else None
+ 
+@@ -17186,6 +17220,39 @@
          # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
          # system-prompt diff and agent rebuild.
          if not history and not await self.async_session_store.has_any_sessions():
@@ -41,7 +82,7 @@ diff --git a/gateway/run.py b/gateway/run.py
              # Default first-contact note: a brief self-introduction.
              _intro_note = (
                  "[System note: This is the user's very first message ever. "
-@@ -17211,16 +17244,18 @@
+@@ -17211,16 +17278,18 @@
                      profile_build_mode(_onb_cfg) == "ask"
                      and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                  ):
@@ -63,7 +104,7 @@ diff --git a/gateway/run.py b/gateway/run.py
          
          # One-time prompt if no home channel is set for this platform
          # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-@@ -17258,6 +17293,55 @@
+@@ -17258,6 +17327,55 @@
                              home_env = "set"
                  except Exception:
                      pass

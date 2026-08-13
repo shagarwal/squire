@@ -501,6 +501,24 @@ ENV TELEGRAM_WEBHOOK_PORT=8443 \
 # variables like every other ENV in this file.
 ENV SQUIRE_TELEGRAM_IDENTITY_TTL=0
 
+# --- Shutdown notices OFF: sleep is routine, not an incident -----------------
+# The flip side of the sleep work above: once a tenant CAN sleep, Railway
+# SIGTERMs it ~13 quiet minutes after the user's last message, and upstream's
+# stop() then sends "⚠️ Gateway shutting down — Your current task will be
+# interrupted." to active chats AND the home channel — which patch 005 sets to
+# the owner's DM. Observed live 2026-08-13: a user got that raw operator text
+# ten minutes after going quiet, and would again on EVERY idle period. Patch
+# 005's gate in _notify_active_sessions_of_shutdown makes those notices
+# conditional on this knob.
+#
+# 0 (or unset/empty) = send nothing; any other value = upstream behaviour
+# unchanged. The patch already defaults to quiet when the variable is absent —
+# the explicit 0 here exists so the policy is visible in the image definition
+# rather than implied by an absent var, and so a per-tenant Railway override
+# (set it to 1 while debugging a tenant) is discoverable like every other ENV
+# in this file.
+ENV SQUIRE_SHUTDOWN_NOTICES=0
+
 # --- Hindsight (docs/reference/hindsight-optimization-guide.md) -------------
 # The guide's systemd-unit knobs, translated to this container. Cgroup limits
 # from the guide are NOT set here: on Railway the whole service is one cgroup,

@@ -161,6 +161,26 @@ squire-005-concierge-suppress	gateway/run.py	_squire_concierge_active	required
 #       again, which is invisible without this row.
 upstream-sethome-prompt	gateway/run.py	No home channel is set for	required
 squire-005-home-channel	gateway/run.py	adopted this chat as the	required
+#
+#       005 also GATES the shutdown/restart notifications (added 2026-08-13
+#       after a live incident): Railway's serverless sleep SIGTERMs a tenant
+#       ~13 quiet minutes after the user's last message, and upstream's
+#       _notify_active_sessions_of_shutdown — the ONLY user-facing send in
+#       stop() — then messages active chats and the home channel with
+#       "⚠️ Gateway shutting down — Your current task will be interrupted."
+#       Since 005 adopts the owner's DM as the home channel, every routine
+#       idle-sleep pinged every user with raw operator text. The gate is an
+#       early return at the top of that method: SQUIRE_SHUTDOWN_NOTICES
+#       unset/empty/"0" -> nothing is sent; any other value -> upstream
+#       behaviour untouched. The Dockerfile bakes the variable to 0.
+#
+#       The upstream-anchor row proves the method we gate still exists: if a
+#       refactor renames it or splits the sends across stop(), the hunk could
+#       "apply" somewhere harmless while a regrown send site starts messaging
+#       sleeping users again — invisible without this row.
+upstream-shutdown-notify	gateway/run.py	async def _notify_active_sessions_of_shutdown(	required
+squire-005-shutdown-notices-env	gateway/run.py	SQUIRE_SHUTDOWN_NOTICES	required
+squire-005-shutdown-quiet	gateway/run.py	shutdown notices suppressed	required
 
 # 006 — serverless-sleep identity refresh TTL (plugins/platforms/telegram/
 #       adapter.py), added 2026-08-10 after the Gate G1 sleep investigation.
