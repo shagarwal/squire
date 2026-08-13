@@ -77,3 +77,26 @@ def test_delete_webhook():
         return_value=httpx.Response(200, json={"ok": True, "result": True})
     )
     assert TelegramClient().delete_webhook(TOKEN) is True
+
+
+@respx.mock
+def test_send_chat_action_payload():
+    route = respx.post(f"{BASE}/sendChatAction").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": True})
+    )
+    ok = TelegramClient().send_chat_action(TOKEN, chat_id=555, action="typing")
+    assert ok is True
+
+    sent = json.loads(route.calls.last.request.read())
+    assert sent == {"chat_id": 555, "action": "typing"}
+
+
+@respx.mock
+def test_send_chat_action_raises_on_blocked_chat():
+    respx.post(f"{BASE}/sendChatAction").mock(
+        return_value=httpx.Response(
+            403, json={"ok": False, "description": "Forbidden: bot was blocked"}
+        )
+    )
+    with pytest.raises(TelegramError, match="blocked"):
+        TelegramClient().send_chat_action(TOKEN, chat_id=555)

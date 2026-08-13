@@ -1,8 +1,9 @@
 """Telegram Bot API client.
 
-Only three calls are needed in Phase 0: validate a pool token (`getMe`), point a
-bot at ingress (`setWebhook`), and unhook it when a tenant is deleted
-(`deleteWebhook`).
+Four calls: validate a pool token (`getMe`), point a bot at ingress
+(`setWebhook`), unhook it when a tenant is deleted (`deleteWebhook`), and keep
+a chat looking alive while its sleeping tenant wakes (`sendChatAction`, used by
+the /internal/wake-typing nudge).
 """
 
 from __future__ import annotations
@@ -92,3 +93,13 @@ class TelegramClient:
     def delete_webhook(self, token: str) -> bool:
         """Unhook a bot so it can safely go back in the pool."""
         return bool(self._call(token, "deleteWebhook", {"drop_pending_updates": True}))
+
+    def send_chat_action(self, token: str, chat_id: int, action: str = "typing") -> bool:
+        """Show a chat action ("typing...") in the given chat.
+
+        Used by the typing-on-wake nudge (/internal/wake-typing): a sleeping
+        tenant takes ~15-20s to wake, and this is what keeps the chat looking
+        alive in the meantime. Telegram displays the action for ~5s per call,
+        so the caller repeats it on an interval.
+        """
+        return bool(self._call(token, "sendChatAction", {"chat_id": chat_id, "action": action}))

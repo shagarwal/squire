@@ -9,9 +9,12 @@ Railway private networking. Failures fall into the buffer-and-wake path
 
 Structural privacy guarantee: this module never passes the request body (or
 any parsed Telegram payload field) into ingress.logging.log_event(). The
-body only ever flows as opaque bytes into the forwarder and the retry
-buffer. If auditing this claim: grep this file (and buffer.py, forwarder.py)
-for `log_event(` and confirm every call site only supplies
+body flows as opaque bytes into the forwarder and the retry buffer, plus one
+deliberate, documented exception: the typing-on-wake nudge (ingress.wake_nudge)
+parses chat.id out of a *buffered* update IN MEMORY ONLY, and that value goes
+solely into an outbound request to control-api -- never into a log. If
+auditing this claim: grep this file (and buffer.py, forwarder.py,
+wake_nudge.py) for `log_event(` and confirm every call site only supplies
 bot_id/tenant_id/status_code/latency_ms/queue_depth -- log_event()'s
 signature doesn't even accept anything else (see ingress/logging.py).
 """
@@ -31,6 +34,7 @@ from .config import Settings, load_settings
 from .forwarder import forward_update
 from .logging import log_event
 from .tenant_cache import TenantCache, TenantLookupError
+from .wake_nudge import WakeNudger
 
 
 def create_app(
@@ -65,6 +69,11 @@ def create_app(
 
     buffer = RetryBuffer(settings, _do_forward, clock=clock)
 
+    # Typing-on-wake: when an update lands in the buffer (sleeping tenant),
+    # nudge control-api to show "typing..." in the chat during the wake.
+    # Fire-and-forget; can neither delay nor fail the buffer path.
+    nudger = WakeNudger(client, settings)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         retry_task = asyncio.create_task(buffer.run_forever())
@@ -86,6 +95,7 @@ def create_app(
     app.state.settings = settings
     app.state.cache = cache
     app.state.buffer = buffer
+    app.state.nudger = nudger
     app.state.client = client
 
     @app.get("/healthz", tags=["ops"])
@@ -171,8 +181,20 @@ def create_app(
         # Forward failed -- most likely a sleeping/restarting tenant.
         # Buffer-and-wake: tell Telegram we're fine, let the background
         # retry worker redeliver once the tenant is reachable again.
+        # (Depth is read BEFORE enqueue so the nudger below can tell whether
+        # this update starts a new wake episode -- 0 -> 1 -- or joins one.)
+        depth_before = buffer.queue_depth(tenant.tenant_id)
         buffer.enqueue(tenant.tenant_id, tenant.internal_url, bot_id, body,
                        tenant.webhook_secret)
+        # Typing-on-wake nudge: fire-and-forget, one per (bot, chat) per
+        # episode. on_buffered never raises and only schedules a background
+        # task, so the response below is not delayed.
+        nudger.on_buffered(
+            bot_id=bot_id,
+            tenant_id=tenant.tenant_id,
+            body=body,
+            queue_depth_before=depth_before,
+        )
         log_event(
             "forward_failed_buffered",
             bot_id=bot_id,

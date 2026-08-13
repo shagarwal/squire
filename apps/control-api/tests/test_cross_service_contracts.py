@@ -91,6 +91,60 @@ def test_tenant_port_matches_the_images_port(settings, dockerfile_env):
     assert str(settings.tenant_port) == dockerfile_env["PORT"]
 
 
+# ---------------------------------------------------------------------------
+# ingress -> control-api: the typing-on-wake nudge
+#
+# Same drift-catching idea as the Dockerfile pins above, applied to the other
+# service in this repo: ingress fire-and-forgets POST /internal/wake-typing
+# {bot_id, chat_id} when it buffers an update for a sleeping tenant. The route
+# path and the two payload keys are agreed between apps/ingress/src/ingress/
+# wake_nudge.py and control_api.routers.internal with nothing but this test
+# connecting them -- and because the nudge is deliberately fire-and-forget
+# (ingress swallows every failure), a drifted path would 404 SILENTLY forever:
+# no error anywhere, just users staring at silent chats again.
+# ---------------------------------------------------------------------------
+
+INGRESS_WAKE_NUDGE = (
+    Path(__file__).resolve().parents[3] / "apps" / "ingress" / "src" / "ingress" / "wake_nudge.py"
+)
+
+
+@pytest.fixture(scope="module")
+def wake_nudge_source() -> str:
+    if not INGRESS_WAKE_NUDGE.is_file():  # pragma: no cover - not in this checkout
+        pytest.skip(f"ingress not present at {INGRESS_WAKE_NUDGE}")
+    return INGRESS_WAKE_NUDGE.read_text(encoding="utf-8")
+
+
+def test_ingress_nudges_the_route_control_api_serves(client, wake_nudge_source):
+    assert "/internal/wake-typing" in wake_nudge_source, (
+        "ingress's wake nudge no longer targets /internal/wake-typing; "
+        "if the path moved, move control-api's route with it (and vice versa)."
+    )
+    # Probe the route over HTTP rather than introspecting app.routes (FastAPI
+    # nests included routers, so route objects are awkward to enumerate): an
+    # unauthenticated POST must hit the internal-token guard (401), which
+    # simultaneously proves the route exists AND that it is behind auth. A
+    # missing route would 404 here.
+    assert client.post("/internal/wake-typing", json={}).status_code == 401, (
+        "control-api no longer serves /internal/wake-typing (or serves it "
+        "unauthenticated) but ingress still nudges it -- a removed route would "
+        "404 silently forever (the nudge path swallows failures by design)."
+    )
+
+
+def test_ingress_nudge_payload_keys_match_the_request_schema(wake_nudge_source):
+    from control_api.schemas import WakeTypingRequest
+
+    # The exact json= literal ingress sends, pinned as source text.
+    assert '{"bot_id": bot_id, "chat_id": chat_id}' in wake_nudge_source, (
+        "ingress's nudge payload literal changed; update this pin and confirm "
+        "the keys still match WakeTypingRequest."
+    )
+    # WakeTypingRequest forbids extras, so key drift on either side = 422s.
+    assert set(WakeTypingRequest.model_fields) == {"bot_id", "chat_id"}
+
+
 def test_tenant_image_is_pinned_to_an_explicit_tag():
     """`:latest` makes /fleet and the upgrade drill blind.
 

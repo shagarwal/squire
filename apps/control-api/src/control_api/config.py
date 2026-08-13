@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     # -- Telegram -----------------------------------------------------------
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_timeout_seconds: float = 20.0
+    # Typing-on-wake nudge (/internal/wake-typing): how many times to fire
+    # sendChatAction("typing") per nudge, and the spacing between them.
+    # Telegram shows the action for ~5s per call; 5 sends 4s apart keep the
+    # indicator unbroken for ~21s -- the whole of a ~15-20s tenant wake.
+    wake_typing_repeats: int = 5
+    wake_typing_interval_seconds: float = 4.0
 
     # -- Provisioning state machine ----------------------------------------
     provision_max_attempts: int = 5

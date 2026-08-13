@@ -46,6 +46,14 @@ class Settings:
     retry_give_up_seconds: float = 300.0  # ~5 minutes
     retry_loop_interval: float = 1.0  # how often the background worker wakes up
 
+    # Typing-on-wake nudge (see ingress.wake_nudge). The nudge is pure UX with
+    # a strict sub-second budget: if control-api can't take the POST quickly,
+    # give up -- never let it back up behind the buffer path.
+    wake_nudge_timeout: float = 1.0
+    # Cap on distinct (bot_id, chat_id) pairs tracked per tenant per wake
+    # episode -- a blunt memory guard, same spirit as tenant_cache_max_entries.
+    wake_nudge_max_chats_per_episode: int = 32
+
 
 def load_settings() -> Settings:
     """Build Settings from the real process environment.
@@ -67,4 +75,8 @@ def load_settings() -> Settings:
         retry_max_delay=float(os.environ.get("INGRESS_RETRY_MAX_DELAY", "30")),
         retry_give_up_seconds=float(os.environ.get("INGRESS_RETRY_GIVE_UP_SECONDS", "300")),
         retry_loop_interval=float(os.environ.get("INGRESS_RETRY_LOOP_INTERVAL", "1")),
+        wake_nudge_timeout=float(os.environ.get("INGRESS_WAKE_NUDGE_TIMEOUT", "1")),
+        wake_nudge_max_chats_per_episode=int(
+            os.environ.get("INGRESS_WAKE_NUDGE_MAX_CHATS_PER_EPISODE", "32")
+        ),
     )
