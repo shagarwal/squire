@@ -272,6 +272,166 @@ rc, out = run_once(CONTROL_API_URL="http://127.0.0.1:18095")
 check("unreachable control-api does not crash the emitter", rc == 1, rc)
 check("says it could not reach control-api", "could not reach control-api" in out, out)
 
+print("== awake-until-bound cadence (fix/awake-until-bound) ==")
+# An UNBOUND tenant (approved-owner store empty — nobody has tapped the deep
+# link yet) must beat every min(configured, 300)s so Railway's serverless sleep
+# (~10 min inbound-quiet window) never engages before the owner's first tap.
+# Once BOUND, the configured slow interval applies unchanged. These tests import
+# the emitter as a module and drive the cadence logic directly — no real
+# sleeping, no network.
+import importlib.util
+
+
+def load_emitter(name, env_extra=None):
+    """Import the emitter under a controlled environment.
+
+    Interval/env constants are read at import time, so each scenario that needs
+    different env gets its own module instance. Env is restored afterwards so
+    the earlier subprocess-based sections are unaffected.
+    """
+    saved = {}
+    for key, value in (env_extra or {}).items():
+        saved[key] = os.environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        spec = importlib.util.spec_from_file_location(name, EMITTER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return mod
+
+
+def check_call(label, fn, expect):
+    """check(), but a raised exception (e.g. missing attribute while the
+    feature does not exist yet) is a FAIL rather than a crashed test run —
+    fail-first must still report the later sections."""
+    try:
+        got = fn()
+    except Exception as exc:  # noqa: BLE001 - deliberate: report, don't crash
+        check(label, False, f"raised {exc!r}")
+        return
+    check(label, got == expect, got)
+
+
+def write_approved(home, body='{"123456": {"approved_at": 1}}'):
+    """Create the same store squire_autopair writes (modern path, telegram)."""
+    pairing = os.path.join(home, "platforms", "pairing")
+    os.makedirs(pairing, exist_ok=True)
+    with open(os.path.join(pairing, "telegram-approved.json"), "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+
+hb = load_emitter("hb_cadence", {"SQUIRE_HEARTBEAT_INTERVAL": "1800",
+                                 "SQUIRE_UNBOUND_AWAKE_HOURS": None})
+
+with tempfile.TemporaryDirectory() as home:
+    hb.HERMES_HOME = home
+    check_call("unbound tenant beats fast: min(1800, 300) == 300",
+               lambda: hb.current_interval(), 300)
+
+    # A configured interval already faster than the ceiling is kept as-is.
+    hb.INTERVAL = 120
+    check_call("configured interval below the ceiling wins: min(120, 300) == 120",
+               lambda: hb.current_interval(), 120)
+    hb.INTERVAL = 1800
+
+    # Bind the owner the way squire_autopair does; cadence must flip to slow.
+    write_approved(home)
+    check_call("bound tenant uses the configured interval unchanged",
+               lambda: hb.current_interval(), 1800)
+
+with tempfile.TemporaryDirectory() as home:
+    hb.HERMES_HOME = home
+    # Runaway cap: an abandoned signup (unbound past SQUIRE_UNBOUND_AWAKE_HOURS,
+    # default 48h) must fall back to the slow interval — never awake forever.
+    real_start = getattr(hb, "START_MONOTONIC", None)
+    hb.START_MONOTONIC = time.monotonic() - 49 * 3600
+    check_call("unbound past the 48h cap falls back to the slow interval",
+               lambda: hb.current_interval(), 1800)
+    if real_start is not None:
+        hb.START_MONOTONIC = real_start
+    check_call("sanity: same store, uptime under the cap, fast again",
+               lambda: hb.current_interval(), 300)
+
+    # A store that exists but cannot be parsed must fail toward the CHEAP mode
+    # (slow beat / tenant sleeps), never toward burn.
+    write_approved(home, body="{corrupt json!!")
+    check_call("unreadable store reads as bound -> slow interval",
+               lambda: hb.current_interval(), 1800)
+
+with tempfile.TemporaryDirectory() as home:
+    hb.HERMES_HOME = home
+    # If the squire_autopair import failed at startup, the emitter must degrade
+    # to the plain configured cadence (treat as bound), not crash or burn.
+    saved_load = getattr(hb, "load_approved", "missing")
+    saved_path = getattr(hb, "approved_path", "missing")
+    hb.load_approved = None
+    hb.approved_path = None
+    check_call("autopair import failure degrades to the slow interval",
+               lambda: hb.current_interval(), 1800)
+    hb.load_approved = saved_load
+    hb.approved_path = saved_path
+
+# Malformed cap env falls back to the 48h default instead of crashing —
+# same _env_number discipline as every other numeric knob in this file.
+hb_bad_env = load_emitter("hb_bad_cap", {"SQUIRE_UNBOUND_AWAKE_HOURS": "banana"})
+check_call("SQUIRE_UNBOUND_AWAKE_HOURS=banana falls back to the 48h default",
+           lambda: hb_bad_env.UNBOUND_AWAKE_HOURS, 48)
+
+print("== cadence flips mid-loop, without a restart ==")
+# The loop must re-check bound-ness EVERY iteration: an owner who taps the deep
+# link three hours after provisioning flips the running loop from fast to slow
+# with no restart. Driven with a fake stop event so no real time passes.
+
+
+class FakeStop(threading.Event):
+    """Records each wait() delay; runs one scripted action per iteration and
+    stops the loop when the script is exhausted."""
+
+    def __init__(self, actions):
+        super().__init__()
+        self.actions = list(actions)
+        self.delays = []
+
+    def wait(self, timeout=None):
+        self.delays.append(timeout)
+        if not self.actions:
+            self.set()
+            return True
+        self.actions.pop(0)()
+        return False
+
+
+with tempfile.TemporaryDirectory() as home:
+    hb.HERMES_HOME = home
+    hb.beat = lambda: True  # no network during the loop test
+    stop = FakeStop([
+        lambda: None,                  # iteration 1: still unbound
+        lambda: write_approved(home),  # owner binds mid-life
+        lambda: None,                  # iteration 3: now bound
+    ])
+    try:
+        hb.run_loop(stop)
+        delays = stop.delays
+        # Jitter is +/-10%, so assert bands rather than exact values.
+        check("loop exists and recorded delays", len(delays) == 4, delays)
+        fast = delays[:2]
+        slow = delays[2:]
+        check("unbound iterations wait ~300s (270..330 with jitter)",
+              all(d is not None and 270 <= d <= 330 for d in fast), delays)
+        check("post-bind iterations wait ~1800s (1620..1980 with jitter)",
+              all(d is not None and 1620 <= d <= 1980 for d in slow), delays)
+    except Exception as exc:  # noqa: BLE001 - fail-first reporting, not a crash
+        check("run_loop(stop) drives the cadence", False, f"raised {exc!r}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
