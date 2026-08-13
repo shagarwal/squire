@@ -805,6 +805,85 @@ check(
 
 
 print()
+print("== 5b. the formatting verdict is encoded, and the copy is structured ==")
+
+# Founder feedback 2026-08-13 (live v0.1.6 test): the intro and the connect
+# pitch were "just a block of text" — warmth and structure were requested,
+# including bold. Before touching copy, what actually renders was verified
+# against the pristine upstream v2026.8.3 tree rather than assumed:
+#
+#   Tenant replies go through upstream's Telegram platform adapter. send()
+#   (plugins/platforms/telegram/adapter.py:4415) runs format_message()
+#   (:7583) — a standard-markdown -> MarkdownV2 converter — then calls
+#   bot.send_message(parse_mode=ParseMode.MARKDOWN_V2) (:4544; streaming
+#   edits :4866), falling back to stripped plain text when MarkdownV2
+#   parsing fails (:4552-4558).
+#
+# Net verdict, which these pins keep the copy honest about: **double
+# asterisks** render as bold and are the ONE marker to rely on; underscore
+# emphasis is never converted (it renders as literal underscores), and
+# headings/tables convert into blocks too heavy for a chat message. A copy
+# rewrite that starts using unsupported syntax — or bans bold again — must
+# fail this build.
+for st, ctx in all_ctx.items():
+    body = flat(ctx)
+    check(f"`{st}` names the one working bold syntax (**...**)", "**" in ctx)
+    check(f"`{st}` bans underscore emphasis by name", "_underscores_" in ctx)
+    check(
+        f"`{st}` bans headings and tables in chat copy",
+        "headings" in body and "tables" in body,
+    )
+
+# The greet must now ASK for structure, not merely stop banning it.
+greet_flat = flat(greet_ctx)
+check(
+    "greet no longer forbids bold outright",
+    "no bold" not in greet_flat and "no bold" not in flat(json.dumps(states["greet"])),
+)
+check(
+    "greet asks for blank-line spacing instead of a paragraph block",
+    "blank line" in greet_flat and "paragraph block" in greet_flat,
+)
+check(
+    "greet puts each capability example on its own line",
+    "its own short line" in greet_flat,
+)
+check(
+    "greet keeps emoji sparing, not confetti",
+    "one or two emoji" in greet_flat,
+)
+
+# The connect pitch: a friendly menu, not a settings page — one option per
+# line, label bolded, description in plain language.
+_pitch_flat = flat(all_ctx["ask_name"])
+check(
+    "the connect pitch is framed as a friendly menu, not a settings page",
+    "friendly menu" in _pitch_flat and "settings page" in _pitch_flat,
+)
+check("the connect pitch puts one option per line", "one per line" in _pitch_flat)
+for lbl in (
+    "**openai api key**",
+    "**chatgpt subscription**",
+    "**anthropic api key**",
+    "**claude max subscription**",
+):
+    check(f"the connect pitch bolds the {lbl} label", lbl in _pitch_flat)
+
+# The YAML mirror carries the same verdict WITH its evidence, so the next
+# copy pass starts from the finding instead of re-deriving or guessing it.
+_fmt = MACHINE.get("formatting") or {}
+check("state-machine.yaml documents the formatting verdict", bool(_fmt))
+check(
+    "the verdict cites the adapter evidence by file and line",
+    "plugins/platforms/telegram/adapter.py" in str(_fmt) and "4544" in str(_fmt),
+)
+check(
+    "the hook documents the same verdict for maintainers",
+    "MarkdownV2" in HOOK.read_text(encoding="utf-8"),
+)
+
+
+print()
 print("== 6. honesty rules survive the rewrite ==")
 
 facts = MACHINE["facts"]

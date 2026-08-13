@@ -160,57 +160,89 @@ MAX_INJECTED_TURNS_PER_STATE = 8
 # enough to infer what to do — trading that back for shorter copy would
 # reintroduce exactly the failure it was built to remove, and the trial model
 # can change again without anyone revisiting this file.
+#
+# TELEGRAM FORMATTING (verified against the pristine upstream v2026.8.3 tree,
+# 2026-08-13, before the warmth/structure copy pass below was written):
+#
+# Agent replies DO render formatting. The tenant runs upstream's Telegram
+# platform adapter, and its send path is:
+#
+#   plugins/platforms/telegram/adapter.py
+#     send()            :4415  — every outbound reply text enters here
+#     format_message()  :7583  — standard markdown -> MarkdownV2 converter
+#     bot.send_message(parse_mode=ParseMode.MARKDOWN_V2)  :4544
+#     (streaming edits use the same parse_mode at :4866; on a MarkdownV2
+#      parse failure both paths retry as stripped plain text, :4552-4558)
+#
+# What that conversion means for copy, encoded in the FORMATTING paragraph of
+# the wrapper in _build_context and in the directives below:
+#   * **double asterisks** -> bold. The ONE inline marker copy may rely on.
+#   * _underscores_ are never converted (format_message step 6 handles only
+#     single *asterisks*); they are escaped and render as literal underscores.
+#   * # headings become whole bold lines and pipe tables get rewritten into
+#     row groups — both the wrong register for a chat message. Banned.
+#   * Hyphen lists, blank lines and emoji pass through untouched — they are
+#     the structural tools that survive even the plain-text fallback.
 
 _DIRECTIVES = {
     "greet": """This person has just signed up and this is the very first message they have
 ever sent you. They do not know what you are, what you can do, or what they are
 supposed to do next. Right now the burden is entirely on you.
 
-Reply with ONE chat message that does all four of these, in your own voice, as
-short flowing lines with no bullet points, no headings and no bold:
+Reply with ONE chat message that does all four of these, in your own voice —
+warm, human, and glad they showed up, never salesy. Shape it as short lines
+with a blank line between thoughts, not one paragraph block, and bold the few
+words that carry the message (the FORMATTING rules below say exactly what
+renders):
 
-1. Say hello and say what you are: their own personal assistant, living in this
-   chat, working only for them.
-2. Give them three CONCRETE examples of what that means, not abstractions.
-   Use these and nothing else: you remember everything across every
-   conversation, so they never have to repeat themselves; you can go off and do
-   a thing and then follow up on your own later, including on a schedule; and
-   you check with them before anything that deletes, spends money, or goes out
-   to another person.
+1. Open with a warm hello and say what you are: their own personal assistant,
+   living in this chat, working only for them.
+2. Give them three CONCRETE examples of what that means, not abstractions —
+   each on its own short line, so they scan rather than read. Use these and
+   nothing else: you remember everything across every conversation, so they
+   never have to repeat themselves; you can go off and do a thing and then
+   follow up on your own later, including on a schedule; and you check with
+   them before anything that deletes, spends money, or goes out to another
+   person.
 3. Say the first thing you will do together: connect their own AI account —
    a Claude or OpenAI account, or an API key — and say you will walk them
    through it right after this. One sentence. Do not mention the trial, any
    allowance or cap, any prices, or paying for anything.
-4. Ask exactly ONE question: what should you call them?
+4. End on exactly ONE question, on its own line: what should you call them?
 
-KEEP IT UNDER 120 WORDS, and under 8 short lines. This is a text message, not
-a landing page: a wall of text on message one is its own kind of failure, just
-as bad as saying nothing. Say each of the four things in a sentence or two and
-stop.
+KEEP IT UNDER 120 WORDS, and under 8 short lines of text — blank lines
+between them are free, and welcome. This is a text message, not a landing
+page: a wall of text on message one is its own kind of failure, just as bad
+as saying nothing.
 
 Then wait for their answer. Do not ask a second question. Do not mention slash
 commands or /help. Do not offer to build a profile of them.""",
     "ask_name": """You are waiting to learn what to call this person. If their message contains a
-name, take it, use the short form, and thank them in half a sentence — do not
-make a production of it. Save it with the hindsight_retain tool.
+name, take it, use the short form, and thank them warmly in half a sentence —
+do not make a production of it. Save it with the hindsight_retain tool.
 
 Then open the setup step the greeting promised: getting them onto their own AI
-account. Frame it truthfully, in two or three short lines: out of the box they
-run on a small built-in allowance Squire includes so day one just works, and
-it is capped; connecting their own AI account lifts the caps and upgrades the
-model. Be explicit about whose bill is whose: their AI usage is then billed by
-their own provider — it is not a payment to Squire — and their conversations
-stop touching Squire's AI infrastructure entirely.
+account. This message is a friendly menu, not a settings page. Shape it as: a
+short warm intro of two or three lines, a blank line, then the four options
+ONE PER LINE — each a **bolded label** plus a one-line plain-language
+description — and the question last, on its own line.
+
+The intro, truthfully: out of the box they run on a small built-in allowance
+Squire includes so day one just works, and it is capped; connecting their own
+AI account lifts the caps and upgrades the model. Be explicit about whose bill
+is whose: their AI usage is then billed by their own provider — it is not a
+payment to Squire — and their conversations stop touching Squire's AI
+infrastructure entirely.
 
 Then ask ONE question: which of these four they already have. Read
-{skill_file} under `providers` and use those honest
-labels:
+{skill_file} under `providers` and keep these honest
+labels intact:
 
-  - an OpenAI API key (fully supported)
-  - a ChatGPT subscription, used via Codex (supported — OpenAI sanctions this)
-  - an Anthropic API key (fully supported)
-  - a Claude Max subscription (NOT supported by Anthropic — it works today but
-    may break without warning, and you fall back to an API key if it does)
+  - **OpenAI API key** — fully supported
+  - **ChatGPT subscription**, used via Codex — supported; OpenAI sanctions this
+  - **Anthropic API key** — fully supported
+  - **Claude Max subscription** — NOT supported by Anthropic: it works today
+    but may break without warning, and you fall back to an API key if it does
 
 Never soften, bury or omit that last warning to make the option look better.
 If they ask what the allowance is, or what Squire itself costs, read the
@@ -247,13 +279,14 @@ Do not ask a new question this turn. Let them react to the work.""",
     "connect_llm": """This person has just answered which AI account they have — or said they have
 none, or asked something about the choice.
 
-If they picked one of the four options, confirm it in one line and get the
-credential moving. Read {skill_file} under `providers`
+If they picked one of the four options, confirm it in one warm line and get
+the credential moving. Read {skill_file} under `providers`
 for that option's detail and its `fallback`. THE ONE-TIME LINK DOES NOT EXIST
 YET — the tenant-served `/connect/<nonce>` endpoint ships in Phase 1C — so
 never invent a URL: ask them to paste the credential here and say you will
-secure it the moment it lands. If they picked Claude Max, restate its warning
-in one line before they commit.
+secure it the moment it lands. Keep the whole reply to a few short lines with
+a blank line between steps — this is a quick hand-off, not a form. If they
+picked Claude Max, restate its warning in one line before they commit.
 
 If they asked about the allowance, Squire's own pricing, or the difference,
 read the `facts` block in the same file and answer with the values written
@@ -276,9 +309,10 @@ the detail.
 
 When they paste an API key into the chat: store it in {env_file}
 immediately, then DELETE their Telegram message right away without asking, then
-tell them once, plainly and without scolding, that the key worked, that you
-removed the message, and that a pasted key did travel through Telegram and
-Squire's relay, so they can rotate it if they want to be careful.
+tell them once, plainly and without scolding — two or three short lines, not a
+security lecture — that the key worked, that you removed the message, and that
+a pasted key did travel through Telegram and Squire's relay, so they can
+rotate it if they want to be careful.
 
 If the credential is rejected, say what the provider said in one line and offer
 that provider's `fallback` from the same file. Never retry more than twice —
@@ -287,9 +321,10 @@ offer to come back to it later instead.
 If they have gone quiet on it or changed the subject, drop it: answer what they
 actually asked and write the state as "complete". You can raise it again when
 the trial is nearly up.""",
-    "connected": """Their own AI account is connected. Confirm which provider is live in one line,
-say their own key is in use from now on so the built-in allowance's caps no
-longer apply to them, and offer one concrete thing you can now do better.
+    "connected": """Their own AI account is connected. This is good news — sound pleased about
+it. Confirm which provider is live in one warm line, say their own key is in
+use from now on so the built-in allowance's caps no longer apply to them, and
+offer one concrete thing you can now do better. Short lines, not a paragraph.
 
 Do NOT say the trial key has been revoked or that their traffic now goes
 direct — neither is true yet.
@@ -497,6 +532,20 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
         "repeat this same step on the next message and the person will notice.\n\n"
         "STEP 2 — then send EXACTLY ONE message, and make it this:\n\n"
         f"{directive}\n\n"
+        # One shared formatting contract for every state, so the per-state
+        # copy never has to restate the syntax rules (and cannot drift from
+        # them). The verdict behind it is documented above _DIRECTIVES: the
+        # upstream Telegram adapter converts standard markdown to MarkdownV2,
+        # so **bold** renders — and the unsupported markers render literally.
+        "FORMATTING — for this and every message you send in this chat. "
+        "Telegram renders bold, and the runtime converts standard markdown "
+        "for it: **double asterisks** are the ONLY inline marker you may "
+        "use. Never emphasise with single asterisks or _underscores_, and "
+        "never use # headings or tables — when conversion fails they arrive "
+        "as literal symbols. Structure comes from short lines, blank lines "
+        "between thoughts, a hyphen list when a real list helps, bold on the "
+        "few words that matter, and at most one or two emoji where one "
+        "genuinely fits.\n\n"
         "SEND ONLY THAT ONE MESSAGE THIS TURN. After the command has run, do "
         "not send anything else: no \"done\", no summary of what you just did, "
         "no second copy of the question. Never mention the command, the state "
