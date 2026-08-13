@@ -27,6 +27,31 @@ initial: greet
 completion_state: complete
 
 # ---------------------------------------------------------------------------
+# What actually renders on Telegram (verified 2026-08-13 against the pristine
+# upstream hermes v2026.8.3 tree, NOT assumed — an earlier grep wrongly
+# suggested plain text). Every `say` block below writes copy under these
+# rules; the hook's injected wrapper restates them to the model verbatim.
+# ---------------------------------------------------------------------------
+formatting:
+  renders: markdown_v2
+  evidence: >
+    plugins/platforms/telegram/adapter.py — send() at line 4415 passes every
+    outbound reply through format_message() (line 7583), a standard-markdown
+    to MarkdownV2 converter, then calls bot.send_message with
+    parse_mode=ParseMode.MARKDOWN_V2 at line 4544 (streaming edits use the
+    same parse_mode at line 4866). On a MarkdownV2 parse failure both paths
+    retry as stripped plain text (lines 4552-4558).
+  use:
+    - "**double asterisks** for bold — the only inline marker to rely on."
+    - Short lines with blank lines between thoughts, never paragraph blocks.
+    - Hyphen lists when a real list helps; they survive even the fallback.
+    - One or two emoji where one genuinely fits.
+  avoid:
+    - Underscore emphasis — never converted; renders as literal underscores.
+    - Single asterisks for emphasis, and asterisk bullet markers.
+    - "'#' headings and pipe tables — converted into blocks too heavy for chat."
+
+# ---------------------------------------------------------------------------
 # Facts the agent is allowed to state. Nothing outside this block may be
 # asserted about price, limits, or provider policy. Keep in sync with
 # docs/prd.md §5.3 / §5.4 — if these drift, the agent lies to customers.
@@ -172,11 +197,12 @@ states:
       things you can actually do, the one thing you will do together next, and
       what to type back.
     say:
-      - Say hello and say what you are — their own personal assistant, living
-        in this chat, working only for them.
+      - Open with a warm hello and say what you are — their own personal
+        assistant, living in this chat, working only for them.
       - Give exactly three CONCRETE things you can do, from `capabilities`
-        (memory, follow_through, approvals). Plain sentences, not a bulleted
-        feature list, and not abstractions like "help you stay organised".
+        (memory, follow_through, approvals) — each on its own short line so
+        the message scans, and not abstractions like "help you stay
+        organised".
       - >-
         Say the first thing you will do together: connect their own AI account
         — a Claude or OpenAI account, or an API key — and say you will walk
@@ -198,9 +224,13 @@ states:
       framing in `ask_name`, and even those name no numbers.
 
       Still ONE message and still ONE question. Aim for something a person
-      reads in about fifteen seconds: short lines, no headings, no bold, no
-      bullet points — SOUL.md's voice rules apply here more than anywhere,
-      because this is the message that decides whether they reply at all.
+      reads in about fifteen seconds: short lines with a blank line between
+      thoughts, bold (per the `formatting` block) on the few words that carry
+      the message, one or two emoji at most, warm rather than salesy —
+      SOUL.md's voice rules apply here more than anywhere, because this is
+      the message that decides whether they reply at all. A paragraph block
+      is the failure mode (founder feedback, 2026-08-13: "just a block of
+      text ... not very enticing"); so is a wall of text.
 
       Do not mention slash commands or /help; that is upstream's onboarding,
       not ours, and it points at a surface Squire does not sell. Do not offer
@@ -237,11 +267,13 @@ states:
       dodged the question or asked something instead, answer them first and ask
       once more, lightly — never twice in a row.
 
-      Present the four options as a short list with the honest label attached —
-      see `providers` below. Do NOT hide the Claude Max warning to make the
-      option look better. If they ask what the allowance is or what Squire
-      costs, answer from `facts` — never from memory — then return to the
-      question. Do not volunteer prices; they are answer-only.
+      Present the four options as a friendly menu, not a settings page: one
+      option per line, its label in bold (per the `formatting` block), a
+      one-line plain-language description after it, and the honest label
+      attached — see `providers` below. Do NOT hide the Claude Max warning to
+      make the option look better. If they ask what the allowance is or what
+      Squire costs, answer from `facts` — never from memory — then return to
+      the question. Do not volunteer prices; they are answer-only.
 
   connect_llm:
     goal: >
@@ -251,8 +283,9 @@ states:
       end of the flow.
     say:
       - >-
-        If they picked one of the four, confirm it in one line and tell them
-        how to hand the credential over. There is no one-time link yet —
+        If they picked one of the four, confirm it in one warm line and tell
+        them how to hand the credential over — a few short lines, a quick
+        hand-off, not a form. There is no one-time link yet —
         `GET /connect/<nonce>` ships in Phase 1C — so never invent a URL: ask
         them to paste it here and say you will secure it the moment it lands.
       - >-
@@ -293,7 +326,8 @@ states:
     then: connected
     on_paste_in_chat:
       - Store the key, then delete their Telegram message immediately.
-      - Tell them once, plainly, that a pasted key did transit Telegram and our
+      - Tell them once, plainly, in a couple of short lines rather than a
+        security lecture, that a pasted key did transit Telegram and our
         relay, and that they can rotate it if they want to be careful.
     on_failure:
       - If the credential is rejected, say what the provider said, in one line.
@@ -308,10 +342,12 @@ states:
   connected:
     goal: Confirm their AI is live, then keep the conversation moving.
     say:
-      - Confirm which provider is now live, in one line.
+      - Confirm which provider is now live, in one warm line — this is good
+        news, sound pleased about it.
       - Note that their own key is in use from now on, so the built-in
         allowance's caps no longer apply to them.
-      - Offer one concrete thing you can now do better.
+      - Offer one concrete thing you can now do better. Short lines, not a
+        paragraph.
     ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
     then: ask_timezone
     notes: >
