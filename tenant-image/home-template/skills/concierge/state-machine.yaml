@@ -271,26 +271,53 @@ states:
       option per line, its label in bold (per the `formatting` block), a
       one-line plain-language description after it, and the honest label
       attached — see `providers` below. Do NOT hide the Claude Max warning to
-      make the option look better. If they ask what the allowance is or what
-      Squire costs, answer from `facts` — never from memory — then return to
-      the question. Do not volunteer prices; they are answer-only.
+      make the option look better, and do NOT drop the "coming soon" flag from
+      the ChatGPT-subscription line — nobody should pick an option expecting
+      to finish connecting today when they cannot. If they ask what the
+      allowance is or what Squire costs, answer from `facts` — never from
+      memory — then return to the question. Do not volunteer prices; they are
+      answer-only.
 
   connect_llm:
     goal: >
       They have answered the provider question. Get the chosen credential
-      moving. This is the single highest-signal conversion step (PRD §5.3),
-      which is why it sits directly after the name exchange rather than at the
-      end of the flow.
+      moving — or, when they picked a path that is not live yet, say so
+      honestly and offer the one that is. This is the single highest-signal
+      conversion step (PRD §5.3), which is why it sits directly after the name
+      exchange rather than at the end of the flow.
+    capture:
+      - llm
+    on_capture:
+      - >-
+        Record the picked provider's id in the `llm` key of
+        concierge-state.json — the state-write command already carries the
+        key. The next step reads it to give the right hand-off, so the id
+        must be exact: openai_api_key, openai_codex_oauth, anthropic_api_key
+        or claude_max_oauth.
     say:
       - >-
-        If they picked one of the four, confirm it in one warm line and tell
-        them how to hand the credential over — a few short lines, a quick
-        hand-off, not a form. There is no one-time link yet —
-        `GET /connect/<nonce>` ships in Phase 1C — so never invent a URL: ask
-        them to paste it here and say you will secure it the moment it lands.
+        If they picked a path that is live today — OpenAI API key, Anthropic
+        API key, or Claude Max — confirm it in one warm line and tell them
+        how to hand the credential over: a few short lines, a quick hand-off,
+        not a form. There is no one-time link yet — `GET /connect/<nonce>`
+        ships in Phase 1C — so never invent a URL: ask them to paste it here
+        and say you will secure it the moment it lands. Explain the missing
+        link at most once in the whole conversation; the next step is told
+        not to repeat it.
       - >-
         If they picked Claude Max, restate its honest_label warning in one
-        line before they commit.
+        line before they commit, and say how the token is minted: run
+        `claude setup-token` on a computer, then paste the token it prints
+        here.
+      - >-
+        If they picked the ChatGPT subscription (via Codex): that sign-in
+        flow is coming soon and cannot be connected in this alpha yet. One
+        warm message that does exactly three things — confirm it is a good
+        choice and it is coming (their subscription will be usable the moment
+        the sign-in flow ships); offer the OpenAI API key path as what works
+        today; and promise nothing else. Never say a sign-in starts "in a
+        moment", never offer to kick off a flow that does not exist, and
+        never ask them to confirm they are ready for one.
       - >-
         If they have none of the four, or say "not now": accept it
         immediately, say the built-in allowance keeps working meanwhile, set
@@ -307,16 +334,34 @@ states:
       provider's bill; a Squire subscription pays for the assistant itself,
       later, and is no part of onboarding.
 
+      The per-provider branching above exists because of a live incident
+      (2026-08-14): with one undifferentiated "ask them to paste it here",
+      the agent pitched the coming-soon device-code sign-in for the ChatGPT
+      subscription, told the user to "confirm you're ready", then demanded an
+      API key instead — a bait-and-switch. The branch the model takes must
+      match what the chosen provider can actually do today.
+
   awaiting_credential:
-    goal: Get the credential in without it travelling through chat.
+    goal: Get the chosen credential in — honestly, per provider.
     say:
-      # NOT YET: the one-time link does not exist until Phase 1C. Leading with
-      # it (as this state used to) invites the agent to invent a URL, which is
-      # both a dead end for the user and a phishing-shaped thing for us to
-      # teach. The paste path below is the ONLY live path today.
+      # The missing-link fact was explained in connect_llm, the first place
+      # credential capture comes up, and it is said AT MOST ONCE per
+      # conversation (live incident 2026-08-14: the user heard "no one-click
+      # link yet" in two consecutive messages). This state only forbids
+      # repeating it — and still never invents a URL.
       - >-
-        There is no one-time link yet. Ask them to paste the key here and
-        handle it exactly as `on_paste_in_chat` says. Never invent a URL.
+        The hand-off depends on the provider recorded in the `llm` key of
+        concierge-state.json. For a live path (an API key, or the Claude Max
+        token), ask them to paste the credential here and handle it exactly
+        as `on_paste_in_chat` says. Never invent a URL, and do not repeat the
+        missing-link explanation — connect_llm already gave it.
+      - >-
+        If the recorded provider is the coming-soon ChatGPT subscription,
+        there is nothing to paste yet: never demand a credential and never
+        promise or start a sign-in flow. Offer the OpenAI API key path if
+        they want to connect today; if they paste one, treat it as
+        openai_api_key. If they would rather wait, accept warmly and continue
+        onboarding.
       - >-
         WHEN 1C SHIPS, this becomes: send the one-time link, served by their
         own container, so the credential goes browser -> their agent and never
@@ -329,6 +374,13 @@ states:
       - Tell them once, plainly, in a couple of short lines rather than a
         security lecture, that a pasted key did transit Telegram and our
         relay, and that they can rotate it if they want to be careful.
+      # The disclosure is stated straight or not at all. The live incident
+      # rendered it as "totally fine, but rotate the key" — a minimiser that
+      # un-says the fact in the same breath.
+      - >-
+        Never minimise that disclosure: qualifiers like "totally fine",
+        "don't worry" and "perfectly safe" are banned. The deletion and the
+        rotation offer are the reassurance; the words must not editorialise.
     on_failure:
       - If the credential is rejected, say what the provider said, in one line.
       - Offer the next-best path for that provider (see providers[].fallback).
@@ -338,6 +390,8 @@ states:
       URL. Phase 1 workstream 1C (docs/implementation-plan.md §4) builds the
       `GET /connect/<nonce>` endpoint; until it ships, this state falls back to
       the paste-in-chat path above, with the deletion and the honesty note.
+      The hook branches its directive on the `llm` key connect_llm recorded,
+      so the coming-soon ChatGPT subscription never gets a paste demand here.
 
   connected:
     goal: Confirm their AI is live, then keep the conversation moving.
@@ -429,18 +483,32 @@ providers:
     fallback: null
 
   - id: openai_codex_oauth
-    label: OpenAI ChatGPT subscription (via Codex)
+    label: OpenAI ChatGPT subscription (via Codex) — coming soon
     blurb: >
-      Sign in with your existing ChatGPT account. Uses your subscription instead
-      of metered API billing.
+      Use your existing ChatGPT subscription instead of metered API billing.
+      The sign-in flow is not live in this alpha yet, so this option cannot be
+      connected today.
     honest_label: >
-      Supported — OpenAI explicitly sanctions using a ChatGPT subscription this
-      way for agents.
+      Coming soon — not connectable in this alpha yet. OpenAI explicitly
+      sanctions using a ChatGPT subscription this way for agents, and the
+      moment the sign-in flow ships your subscription will be usable here.
     credential: oauth_device_code
+    # NOTHING implements this credential yet: no codex CLI in the image, no
+    # device-code flow anywhere in the runtime — it is Phase 1C roadmap. The
+    # status flag below is what the hook branches on (its _COMING_SOON_PROVIDERS
+    # set must equal the ids carrying it; the test suite enforces that), and the
+    # menu label above must say so out loud so nobody picks it expecting to
+    # finish connecting today.
+    status: coming_soon
     fallback: openai_api_key
     notes: >
-      This is the recommended path for anyone who already pays for ChatGPT: no
-      extra bill, and it is the one subscription route the provider blesses.
+      This will be the recommended path for anyone who already pays for
+      ChatGPT: no extra bill, and it is the one subscription route the provider
+      blesses. But until the sign-in flow ships, offering to start it is a
+      promise the runtime cannot keep — never "kick off" a sign-in, never say
+      it starts "in a moment". Choosing it is still welcome: confirm the
+      choice warmly, say it is coming, and offer the API-key path as what
+      works today.
 
   - id: anthropic_api_key
     label: Anthropic API key
@@ -452,7 +520,14 @@ providers:
 
   - id: claude_max_oauth
     label: Claude Max subscription
-    blurb: Sign in with your existing Claude account and use your Max subscription.
+    # LIVE, not coming-soon: the capture is a pasted token, which the paste
+    # path already handles today. But the blurb must not pitch a "sign in"
+    # flow — none exists. The honest mechanism is: run `claude setup-token`
+    # on a computer, paste the token it prints here.
+    blurb: >
+      Use your existing Max subscription. Getting connected today means
+      running `claude setup-token` on a computer and pasting the token it
+      prints here.
     honest_label: >
       ⚠ Not supported by Anthropic. It works today, but it is not a sanctioned
       integration and it may break without warning. If it breaks we fall back to

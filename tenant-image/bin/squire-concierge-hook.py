@@ -239,12 +239,16 @@ Then ask ONE question: which of these four they already have. Read
 labels intact:
 
   - **OpenAI API key** — fully supported
-  - **ChatGPT subscription**, used via Codex — supported; OpenAI sanctions this
+  - **ChatGPT subscription**, used via Codex — coming soon; OpenAI sanctions
+    this path, but the sign-in flow is not live in this alpha yet
   - **Anthropic API key** — fully supported
   - **Claude Max subscription** — NOT supported by Anthropic: it works today
     but may break without warning, and you fall back to an API key if it does
 
-Never soften, bury or omit that last warning to make the option look better.
+Never soften, bury or omit that last warning to make the option look better,
+and never drop the "coming soon" flag from the ChatGPT-subscription line —
+picking it is welcome, but nobody should pick it expecting to finish
+connecting today.
 If they ask what the allowance is, or what Squire itself costs, read the
 `facts` block in {skill_file} and answer with the values
 written there — never from memory, and never rounded or softened — then come
@@ -279,14 +283,33 @@ Do not ask a new question this turn. Let them react to the work.""",
     "connect_llm": """This person has just answered which AI account they have — or said they have
 none, or asked something about the choice.
 
-If they picked one of the four options, confirm it in one warm line and get
-the credential moving. Read {skill_file} under `providers`
+Whatever they picked, record it: in the STEP 1 command, set the "llm" value
+to the picked option's exact id — "openai_api_key", "openai_codex_oauth",
+"anthropic_api_key" or "claude_max_oauth". The next step reads that key to
+give them the right hand-off. If they picked nothing, leave the value as it
+is.
+
+If they picked the OpenAI API key, the Anthropic API key, or Claude Max —
+the paths that are live today — confirm it in one warm line and get the
+credential moving. Read {skill_file} under `providers`
 for that option's detail and its `fallback`. THE ONE-TIME LINK DOES NOT EXIST
 YET — the tenant-served `/connect/<nonce>` endpoint ships in Phase 1C — so
 never invent a URL: ask them to paste the credential here and say you will
-secure it the moment it lands. Keep the whole reply to a few short lines with
-a blank line between steps — this is a quick hand-off, not a form. If they
-picked Claude Max, restate its warning in one line before they commit.
+secure it the moment it lands. Explain the missing link at most once in the
+whole conversation — after this message, never repeat that explanation. Keep
+the whole reply to a few short lines with a blank line between steps — this
+is a quick hand-off, not a form. If they picked Claude Max, restate its
+warning in one line before they commit, and say how the token is minted: run
+`claude setup-token` on a computer, then paste the token it prints here.
+
+If they picked the ChatGPT subscription (via Codex): that path is COMING
+SOON and cannot be connected in this alpha yet. Send one warm message that
+does exactly three things: confirm it is a good choice and it is coming —
+their subscription will be usable the moment the sign-in flow ships; offer
+the OpenAI API key path (a key from platform.openai.com) as what works
+today; and promise nothing else. Never say a sign-in starts "in a moment",
+never offer to kick off a flow that does not exist, and never ask them to
+confirm they are ready for one.
 
 If they asked about the allowance, Squire's own pricing, or the difference,
 read the `facts` block in the same file and answer with the values written
@@ -301,18 +324,21 @@ they, or what timezone, so that when you say "tomorrow morning" you mean
 it.""",
     "awaiting_credential": """This person is sending, or about to send, an AI account credential.
 
-THE ONE-TIME LINK DOES NOT EXIST YET. The tenant-served `/connect/<nonce>`
-endpoint ships in Phase 1C; until then there is no link to send, and you must
-never invent a URL. So ask them to paste the key here, and handle it exactly as
-below. Read {skill_file} under `awaiting_credential` for
+Ask them to paste the key here, and handle it exactly as below. Never invent
+a URL, and never re-explain why there is no one-time link — that explanation
+was already given when they chose, and it is said at most once per
+conversation. Read {skill_file} under `awaiting_credential` for
 the detail.
 
-When they paste an API key into the chat: store it in {env_file}
+When they paste an API key or token into the chat: store it in {env_file}
 immediately, then DELETE their Telegram message right away without asking, then
 tell them once, plainly and without scolding — two or three short lines, not a
 security lecture — that the key worked, that you removed the message, and that
 a pasted key did travel through Telegram and Squire's relay, so they can
-rotate it if they want to be careful.
+rotate it if they want to be careful. State that disclosure straight and never
+minimise it: qualifiers like "totally fine", "don't worry" and "perfectly
+safe" are banned. The deletion and the rotation offer are the reassurance —
+the words must not editorialise.
 
 If the credential is rejected, say what the provider said in one line and offer
 that provider's `fallback` from the same file. Never retry more than twice —
@@ -332,6 +358,53 @@ direct — neither is true yet.
 Then ask ONE question: where are they, or what timezone, so that when you say
 "tomorrow morning" you mean it.""",
 }
+
+# ---------------------------------------------------------------------------
+# Coming-soon providers: on the menu, honestly flagged, but NOT connectable
+# today — nothing in this image implements their credential flow (device-code
+# sign-in is Phase 1C roadmap). Mirrors `status: coming_soon` in
+# state-machine.yaml's providers block; the test suite asserts the two sets
+# are identical.
+#
+# How the choice reaches this hook: concierge-state.json carries an `llm` key
+# (seeded "trial" by squire-entrypoint.sh), the STEP 1 write command carries
+# every key of that file, and the connect_llm directive tells the model to set
+# `llm` to the picked provider's id. On the next turn this hook reads the file
+# and, for `awaiting_credential`, swaps in the variant below — so a user who
+# picked a coming-soon option is never hit with "paste your API key" as if
+# that were what they chose (live incident, 2026-08-14).
+# ---------------------------------------------------------------------------
+_COMING_SOON_PROVIDERS = {"openai_codex_oauth"}
+
+# The `awaiting_credential` directive used when the recorded choice is a
+# coming-soon provider. One honest, warm hand-off: no paste demand, no
+# sign-in promise, the API-key path offered as what works today.
+_AWAITING_COMING_SOON = """This person picked the ChatGPT subscription (via Codex). That path is COMING
+SOON and cannot be connected in this alpha yet — there is no sign-in flow to
+start, so never announce or "kick off" a sign-in, and never demand a
+credential as if the subscription itself could land that way.
+
+If they are asking to go ahead: say once, warmly, that their subscription
+will be usable the moment the sign-in flow ships, and that the OpenAI API
+key path (a key from platform.openai.com) works today if they would rather
+not wait. Never say "in a moment", and never re-explain why there is no
+one-time link — that was already said, at most once per conversation.
+
+If they paste an OpenAI API key: that is the live path — store it in
+{env_file} immediately, then DELETE their Telegram message right away
+without asking, and in the STEP 1 command set "llm" to "openai_api_key".
+Then tell them once, plainly and without scolding — two or three short
+lines — that the key worked, that you removed the message, and that a pasted
+key did travel through Telegram and Squire's relay, so they can rotate it if
+they want to be careful. Never minimise that disclosure: qualifiers like
+"totally fine", "don't worry" and "perfectly safe" are banned.
+
+If they would rather wait for the sign-in flow: accept warmly, say the
+built-in allowance keeps working meanwhile — in the STEP 1 command set "llm"
+to "trial" and the state to "ask_timezone" — and ask ONE question: where are
+they, or what timezone, so that when you say "tomorrow morning" you mean it.
+Only let the state advance to "connected" when a credential has actually
+landed."""
 
 # Where each state goes once its work is done. Mirrors the `then:` edges in
 # state-machine.yaml; the test suite asserts the two agree.
@@ -488,6 +561,14 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
     # str.format so a stray brace anywhere in the copy can never raise — this
     # runs in front of every message and must not be able to fail.
     directive = _DIRECTIVES[state]
+
+    # Per-provider branch: when the recorded choice (the `llm` key the
+    # connect_llm turn wrote) is a coming-soon provider, the credential step
+    # must not demand a paste or promise a sign-in — it gets the honest
+    # variant instead. Any other value — a live provider id, "trial", or a
+    # missing key on an older state file — keeps the live paste path.
+    if state == "awaiting_credential" and str(raw.get("llm") or "").strip() in _COMING_SOON_PROVIDERS:
+        directive = _AWAITING_COMING_SOON
     for token, value in (
         ("{skill_file}", _skill_file()),
         ("{config_file}", str(_home() / "config.yaml")),
@@ -527,7 +608,8 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
         "tool. Send no message first:\n"
         f"    {write_cmd}\n"
         "That command already carries every key the file has. If you learned "
-        "something this turn (their name, their timezone), edit that value "
+        "something this turn (their name, their timezone, which provider they "
+        "picked — the \"llm\" key), edit that value "
         "inside the command before you run it. If you do not run it, you will "
         "repeat this same step on the next message and the person will notice.\n\n"
         "STEP 2 — then send EXACTLY ONE message, and make it this:\n\n"
