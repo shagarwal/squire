@@ -89,6 +89,11 @@ EXPECTED_COLUMNS = {
         # first owner binding on an EMPTY tenant, and delete_tenant nulls it so
         # a recycled bot cannot carry it to its next tenant.
         "bind_nonce",
+        # 1C: which provider the owner connected. The NAME only -- "openai",
+        # "anthropic" or "chatgpt" -- pinned to a closed Literal in
+        # schemas.LlmConnectedRequest, so this column is structurally unable
+        # to hold key material.
+        "connected_provider",
         "trial_key_alias",
         "trial_key_active",
         "webhook_set",

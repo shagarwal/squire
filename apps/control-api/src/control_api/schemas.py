@@ -8,6 +8,7 @@ without coordinating.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -140,6 +141,28 @@ class RevokeTrialKeyResponse(BaseModel):
     tenant_id: str
     trial_key_active: bool
     revoked: bool
+
+
+class LlmConnectedRequest(BaseModel):
+    """POST /internal/llm-connected -- a tenant reports its owner connected an LLM.
+
+    `provider` is a CLOSED vocabulary on purpose: three literals fit through
+    this field and nothing else, so it is structurally unable to smuggle key
+    material into the control plane. `extra="forbid"` for the same reason as
+    every other tenant-writable schema here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    provider: Literal["openai", "anthropic", "chatgpt"]
+
+
+class LlmConnectedResponse(BaseModel):
+    tenant_id: str
+    provider: str
+    connected_provider_recorded: bool
+    trial_key_revoked: bool
 
 
 # ---------------------------------------------------------------------------

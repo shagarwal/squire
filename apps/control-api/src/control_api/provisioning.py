@@ -1194,3 +1194,18 @@ def revoke_trial_key(
     tenant.trial_key_active = False
     _touch(session, tenant)
     return revoked
+
+
+def record_llm_connected(
+    session: Session, tenant_id: str, provider: str,
+    clients: ProvisionClients | None = None,
+) -> bool:
+    """The conversion moment, control-plane side: record the provider NAME and
+    revoke the trial key immediately (PRD §2: their traffic never touches our
+    infrastructure again). Returns whether a key was actually revoked --
+    idempotent, because the tenant retries and the heartbeat backstop can race.
+    """
+    tenant = get_tenant(session, tenant_id)
+    tenant.connected_provider = provider
+    _touch(session, tenant)
+    return revoke_trial_key(session, tenant_id, clients=clients)

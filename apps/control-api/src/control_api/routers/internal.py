@@ -37,6 +37,8 @@ from control_api.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
     JobResponse,
+    LlmConnectedRequest,
+    LlmConnectedResponse,
     RedeployRequest,
     RedeployResponse,
     RegisterBotsRequest,
@@ -276,6 +278,27 @@ def revoke_trial_key(
         raise HTTPException(status_code=404, detail="tenant not found") from exc
     return RevokeTrialKeyResponse(
         tenant_id=tenant_id, trial_key_active=False, revoked=revoked
+    )
+
+
+@router.post("/llm-connected", response_model=LlmConnectedResponse)
+def llm_connected(
+    payload: LlmConnectedRequest, session: Session = Depends(get_session)
+) -> LlmConnectedResponse:
+    """Called by the tenant's connected pipeline (squire_connect.py) the moment
+    its owner's credential lands. Records the provider name (values are pinned
+    to a closed Literal -- never key material) and revokes the trial key."""
+    try:
+        revoked = provisioning.record_llm_connected(
+            session, payload.tenant_id, payload.provider
+        )
+    except provisioning.TenantNotFound as exc:
+        raise HTTPException(status_code=404, detail="tenant not found") from exc
+    return LlmConnectedResponse(
+        tenant_id=payload.tenant_id,
+        provider=payload.provider,
+        connected_provider_recorded=True,
+        trial_key_revoked=revoked,
     )
 
 

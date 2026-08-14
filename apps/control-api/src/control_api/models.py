@@ -159,6 +159,11 @@ class Tenant(SQLModel, table=True):
     # never carries the previous tenant's nonce forward.
     bind_nonce: str | None = None
 
+    # 1C: which provider the owner connected ("openai" / "anthropic" /
+    # "chatgpt"). The NAME only, never credential material — the ingest schema
+    # pins it to a closed Literal, and test_privacy_schema whitelists it.
+    connected_provider: str | None = None
+
     # We revoke trial keys *by alias* so the key material never enters this DB.
     trial_key_alias: str | None = None
     trial_key_active: bool = False

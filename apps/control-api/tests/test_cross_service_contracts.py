@@ -165,3 +165,41 @@ def test_tenant_image_is_pinned_to_an_explicit_tag():
         f"TENANT_IMAGE default ({reference!r}) carries no tag or digest -- Docker "
         "would resolve it as :latest"
     )
+
+
+# ---------------------------------------------------------------------------
+# tenant -> control-api: the llm-connected conversion call (1C). Same pattern
+# as the wake-typing pins: route + payload keys agreed between
+# tenant-image/bin/squire_connect.py and control_api with only this test
+# connecting them, and the tenant caller swallows failures by design.
+# ---------------------------------------------------------------------------
+
+TENANT_CONNECT = (
+    Path(__file__).resolve().parents[3] / "tenant-image" / "bin" / "squire_connect.py"
+)
+
+
+@pytest.fixture(scope="module")
+def tenant_connect_source() -> str:
+    if not TENANT_CONNECT.is_file():  # pragma: no cover - not in this checkout
+        pytest.skip(f"tenant image not present at {TENANT_CONNECT}")
+    return TENANT_CONNECT.read_text(encoding="utf-8")
+
+
+def test_tenant_calls_the_route_control_api_serves(client, tenant_connect_source):
+    assert "/internal/llm-connected" in tenant_connect_source, (
+        "squire_connect no longer targets /internal/llm-connected; if the path "
+        "moved, move control-api's route with it (and vice versa)."
+    )
+    # Unauthenticated probe: 401 proves the route exists AND is behind auth.
+    assert client.post("/internal/llm-connected", json={}).status_code == 401
+
+
+def test_tenant_payload_keys_match_the_request_schema(tenant_connect_source):
+    from control_api.schemas import LlmConnectedRequest
+
+    assert 'json.dumps({"tenant_id": tenant_id, "provider": provider})' in tenant_connect_source, (
+        "squire_connect's notify payload literal changed; update this pin and "
+        "confirm the keys still match LlmConnectedRequest."
+    )
+    assert set(LlmConnectedRequest.model_fields) == {"tenant_id", "provider"}
