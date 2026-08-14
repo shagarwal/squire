@@ -9,10 +9,21 @@ revoked the moment a connection lands.
 
 ## Decisions (made with founder — do not re-litigate)
 
-1. **All 4 connect paths ship**: OpenAI API key, ChatGPT subscription (any paid plan, via
-   Codex device-code OAuth), Anthropic API key, Claude subscription (**Pro or Max** — the
-   integration-level unsanctioned warning stays regardless of plan; correct the current
-   "Claude Max" naming everywhere as part of this work).
+1. **3 connect paths ship**: OpenAI API key, ChatGPT subscription (any paid plan, via Codex
+   device-code flow), Anthropic API key.
+   **The Claude-subscription path is DROPPED** (decided 2026-08-14 after the OAuth spike):
+   Anthropic's Consumer ToS now explicitly prohibits subscription-OAuth use in third-party
+   products and enforces it server-side + with account bans (see
+   `2026-08-14-spike-claude-oauth.md`). Anthropic = **API key only**. This work must also
+   REMOVE the live "Claude Max subscription" option from the shipped concierge (handled by a
+   separate v0.1.9 hotfix, then kept out here). The sanctioned Anthropic credential
+   (`sk-ant-api03-…`) is the only Anthropic path.
+   ChatGPT-subscription mechanism = **Codex device-code flow (RFC-8628-style, proprietary
+   endpoints)**, GO-WITH-CAVEATS per `2026-08-14-spike-codex-device-flow.md`: device login is
+   beta + off-by-default (onboarding must handle the 404-enable-retry path), and the
+   "OpenAI sanctions this" claim is softened to "OpenAI's Codex team openly supports it, no
+   formal written guarantee." Recommended: run real Codex in-tenant seeded by the flow rather
+   than re-implementing backend calls.
 2. **OAuth happens in chat; the page exists for API keys only.** Device-code sign-ins run
    on the provider's own site (user approves there; token is delivered provider → tenant
    via polling). The one-time link page's sole job is the secure hand-off of pasted API
