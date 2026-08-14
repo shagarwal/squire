@@ -995,14 +995,24 @@ check("Starter is described as the full agent", "full agent" in facts["price_sta
 # "send the one-time link" invites the agent to invent a URL — a dead end for
 # the user and a phishing-shaped habit to teach. The YAML notes said so, but
 # notes are the third field down; the hook copy is what gets read.
+#
+# Since the 2026-08-14 live incident the EXPLANATION lives in `connect_llm`
+# only (the first place credential capture comes up) — the founder heard "no
+# one-click link yet" twice in consecutive messages because both directives
+# carried it. Section 6b pins single-occurrence; here we pin that the fact
+# itself did not get lost in the move, and that the URL ban stayed put.
 _await = all_ctx["awaiting_credential"]
 check(
-    "the credential step says the one-time link does not exist yet",
-    "does not exist yet" in _await.lower(),
+    "the choice step says the one-time link does not exist yet",
+    "does not exist yet" in flat(all_ctx["connect_llm"]),
+)
+check(
+    "the credential step no longer restates the missing-link fact",
+    "does not exist yet" not in flat(_await),
 )
 check(
     "the credential step forbids inventing a URL",
-    "never invent a url" in _await.lower(),
+    "never invent a url" in flat(_await),
 )
 check(
     "the credential state's say[] no longer leads with sending the link",
@@ -1031,6 +1041,255 @@ check(
 check(
     "complete states the end-of-trial mechanics when it does re-raise",
     "trial_end_behaviour" in json.dumps(states["complete"]),
+)
+
+
+print()
+print("== 6b. the connect flow is honest per provider (live incident 2026-08-14) ==")
+
+# The incident this section exists to prevent, screenshot-verified in the
+# founder's live test: the user picked "ChatGPT subscription" from the menu,
+# the agent promised a device-code sign-in ("just confirm you're ready and
+# I'll kick off the sign-in flow"), then next turn demanded an API key
+# instead, repeated the "no one-click link yet" explanation in consecutive
+# messages, and called the key's transit through Telegram "totally fine".
+# Nothing in this image implements device-code or OAuth sign-in — 1C is the
+# roadmap item — so the only honest menu is one that says which options are
+# connectable TODAY, and choosing a coming-soon one must get one warm honest
+# message, not a bait-and-switch.
+
+# -- the coming-soon truth lives in the providers block, machine-readably ----
+check(
+    "the Codex option is marked coming_soon in the providers block",
+    providers["openai_codex_oauth"].get("status") == "coming_soon",
+)
+check(
+    "the Codex option's menu label itself says coming soon",
+    "coming soon" in providers["openai_codex_oauth"]["label"].lower(),
+)
+check(
+    "the Codex honest_label says it is not connectable yet",
+    "not connectable" in flat(providers["openai_codex_oauth"]["honest_label"]),
+)
+check(
+    "no other provider is marked coming_soon",
+    [p["id"] for p in MACHINE["providers"] if p.get("status") == "coming_soon"]
+    == ["openai_codex_oauth"],
+)
+check(
+    "the hook's coming-soon set matches the providers block exactly",
+    getattr(hook, "_COMING_SOON_PROVIDERS", None)
+    == {p["id"] for p in MACHINE["providers"] if p.get("status") == "coming_soon"},
+)
+# Claude Max stays LIVE, not coming-soon: its capture today is a pasted token
+# (CLAUDE_CODE_OAUTH_TOKEN), which the paste path already handles. The honesty
+# it owes is the un-softened warning (pinned in section 6) plus saying how the
+# token is actually minted — `claude setup-token` on a computer — rather than
+# implying a sign-in flow that does not exist.
+check(
+    "Claude Max stays offered as live (paste-capturable), not coming soon",
+    providers["claude_max_oauth"].get("status") != "coming_soon",
+)
+check(
+    "Claude Max says how its token is actually minted (claude setup-token)",
+    "claude setup-token" in flat(providers["claude_max_oauth"]["blurb"]),
+)
+check(
+    "the choice step passes the setup-token mechanism on to the user",
+    "claude setup-token" in flat(all_ctx["connect_llm"]),
+)
+check(
+    "Claude Max no longer pitches a sign-in that does not exist",
+    "sign in with" not in flat(providers["claude_max_oauth"]["blurb"]),
+)
+# The menu the user actually sees (the ask_name directive) must carry the flag
+# on the option's own line — nobody should pick it expecting to finish today.
+check(
+    "the menu line itself flags the ChatGPT subscription as coming soon",
+    "**chatgpt subscription**, used via codex — coming soon" in flat(all_ctx["ask_name"]),
+)
+
+# -- choosing the coming-soon option must not dead-end or bait-and-switch ----
+_choice = flat(all_ctx["connect_llm"])
+check(
+    "connect_llm has an explicit ChatGPT-subscription branch",
+    "if they picked the chatgpt subscription" in _choice,
+)
+check(
+    "the branch says it is coming soon and not connectable in this alpha",
+    "coming soon" in _choice and "cannot be connected in this alpha yet" in _choice,
+)
+check(
+    "the branch promises the subscription becomes usable when the flow ships",
+    "usable the moment the sign-in flow ships" in _choice,
+)
+check(
+    "the branch offers the API-key path as what works today",
+    "openai api key path" in _choice and "works today" in _choice,
+)
+check(
+    "the branch bans the 'in a moment' promise by name",
+    '"in a moment"' in _choice,
+)
+check(
+    "the branch bans kicking off a flow that does not exist",
+    "kick off a flow that does not exist" in _choice,
+)
+check(
+    "the branch bans asking the user to confirm they are ready for it",
+    "never ask them to confirm they are ready" in _choice,
+)
+# The live paths must stay explicitly enumerated so "ask them to paste" can
+# never again read as the instruction for ALL four options.
+check(
+    "the live paths are named as such in the choice step",
+    "live today" in _choice,
+)
+
+# -- the choice is recorded where the next turn can read it ------------------
+# Mechanism (existing, not invented here): concierge-state.json is seeded by
+# squire-entrypoint.sh with an `llm` key ("trial"), the STEP 1 write command
+# carries every key of that file, and the directive tells the model to set
+# `llm` to the picked provider id. The hook reads the file on the next turn
+# and picks the credential-step directive from it.
+check(
+    "connect_llm tells the model to record the pick in the llm key",
+    '"llm"' in all_ctx["connect_llm"]
+    and all(f'"{pid}"' in all_ctx["connect_llm"] for pid in providers),
+    [pid for pid in providers if f'"{pid}"' not in all_ctx["connect_llm"]],
+)
+
+
+def ctx_with_llm(state: str, llm: str | None) -> str:
+    """Injected context for `state` with a recorded provider choice."""
+    blob: dict = {"state": state}
+    if llm is not None:
+        blob["llm"] = llm
+    rc_, out_ = run_hook(json.dumps(blob))
+    return json.loads(out_)["context"] if out_.strip() else ""
+
+
+_cs = ctx_with_llm("awaiting_credential", "openai_codex_oauth")
+_cs_flat = flat(_cs)
+check(
+    "a coming-soon choice gets its own credential-step directive",
+    bool(_cs) and _cs != all_ctx["awaiting_credential"],
+)
+check(
+    "the coming-soon directive names the situation honestly",
+    "coming soon" in _cs_flat and "cannot be connected in this alpha yet" in _cs_flat,
+)
+check(
+    "it never demands a paste as the primary instruction",
+    "ask them to paste" not in _cs_flat,
+)
+check(
+    "it offers the API-key path that works today",
+    "openai api key path" in _cs_flat and "works today" in _cs_flat,
+)
+check(
+    "it forbids kicking off or announcing a sign-in",
+    '"kick off" a sign-in' in _cs_flat,
+)
+check("it bans the 'in a moment' promise by name", '"in a moment"' in _cs_flat)
+check(
+    "a key pasted on this branch is re-labelled openai_api_key",
+    '"openai_api_key"' in _cs,
+)
+check(
+    "declining keeps onboarding moving (timezone next, llm back to trial)",
+    '"ask_timezone"' in _cs and '"trial"' in _cs,
+)
+check(
+    "the variant only advances to connected on a landed credential",
+    "connected" in _cs_flat and "actually landed" in _cs_flat,
+)
+# The variant is still a normal injection: silent state write first, exactly
+# one message, no unexpanded templating.
+check(
+    "the coming-soon variant keeps the one-message wrapper",
+    "step 1" in _cs_flat and "send only that one message this turn" in _cs_flat,
+)
+check(
+    "the coming-soon variant has no unexpanded template variable",
+    "${" not in _cs and "{env_file}" not in _cs and "{skill_file}" not in _cs,
+)
+# Every live choice — and no recorded choice at all — keeps the paste path.
+for _pid in ("openai_api_key", "anthropic_api_key", "claude_max_oauth", "trial", None):
+    check(
+        f"llm={_pid!r} still gets the live paste directive",
+        "ask them to paste the key here" in flat(ctx_with_llm("awaiting_credential", _pid)),
+    )
+
+# -- the missing-link explanation is said AT MOST ONCE -----------------------
+# Both directives used to carry "THE ONE-TIME LINK DOES NOT EXIST YET", so the
+# user heard it twice in a row. Exactly one directive — the first place
+# credential capture comes up — may explain it; the others must forbid
+# repeating it instead.
+_dirs = dict(hook._DIRECTIVES)
+_dirs["awaiting_credential (coming-soon variant)"] = hook._AWAITING_COMING_SOON
+_saying = sorted(k for k, d in _dirs.items() if "link does not exist" in flat(d))
+check(
+    "exactly one directive carries the missing-link explanation",
+    _saying == ["connect_llm"],
+    str(_saying),
+)
+check(
+    "connect_llm caps the explanation at once per conversation",
+    "at most once" in flat(hook._DIRECTIVES["connect_llm"]),
+)
+check(
+    "the live credential step forbids re-explaining it",
+    "never re-explain" in flat(hook._DIRECTIVES["awaiting_credential"]),
+)
+check(
+    "the coming-soon variant forbids re-explaining it too",
+    "never re-explain" in _cs_flat,
+)
+# The YAML mirror must agree, or the next copy pass reintroduces the repeat.
+_yaml_await_say = flat(" ".join(str(s) for s in states["awaiting_credential"]["say"]))
+check(
+    "the YAML credential state no longer restates the missing-link fact",
+    "there is no one-time link yet" not in _yaml_await_say,
+)
+check(
+    "the YAML credential state forbids repeating the explanation instead",
+    "do not repeat the missing-link explanation" in _yaml_await_say,
+)
+check(
+    "the YAML choice state keeps the single-say cap",
+    "at most once" in flat(" ".join(str(s) for s in states["connect_llm"]["say"])),
+)
+
+# -- the security disclosure is plain, and minimising it is banned -----------
+# The incident rendering was "briefly passes through Telegram and our relay —
+# totally fine". The fact must be stated straight: the key DID transit
+# Telegram and the relay, the message is deleted, rotation is offered — and
+# the qualifiers that soften it are banned by name, because that is the form
+# the drift actually took.
+_yaml_paste = flat(" ".join(str(s) for s in states["awaiting_credential"]["on_paste_in_chat"]))
+for _label, _blob in [
+    ("YAML on_paste_in_chat", _yaml_paste),
+    ("hook credential directive", flat(hook._DIRECTIVES["awaiting_credential"])),
+    ("hook coming-soon variant", _cs_flat),
+]:
+    check(
+        f"{_label} states the transit fact plainly",
+        "telegram" in _blob and "relay" in _blob,
+    )
+    check(
+        f"{_label} bans minimising qualifiers by name",
+        '"totally fine"' in _blob
+        and '"don\'t worry"' in _blob
+        and '"perfectly safe"' in _blob,
+    )
+check(
+    "the deletion is still promised in the credential directive",
+    "delete their telegram message" in flat(hook._DIRECTIVES["awaiting_credential"]),
+)
+check(
+    "rotation advice survives in both mirrors",
+    "rotate" in flat(hook._DIRECTIVES["awaiting_credential"]) and "rotate" in _yaml_paste,
 )
 
 
