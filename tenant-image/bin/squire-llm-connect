@@ -93,7 +93,19 @@ def store_chatgpt_tokens(tokens: dict) -> None:
     Both writes resolve symlinks (see squire_connect.env_upsert's rationale)."""
     home = os.environ.get("HERMES_HOME") or "/opt/data"
     auth = dev.build_auth_json(tokens)
-    auth_path = os.path.realpath(os.path.join(home, "auth.json"))
+    # auth.json is normally a SYMLINK the entrypoint points into tmpfs, so the
+    # write follows the link off the persistent volume. Apply the SAME
+    # fail-closed guard the .env write already uses (env_upsert ->
+    # _assert_tmpfs_target): if the symlink is missing, auth.json would resolve
+    # to a plain file INSIDE $HERMES_HOME and the OAuth access_token would land
+    # as plaintext on the volume — the one outcome this architecture forbids.
+    # Guard on the UNRESOLVED link path (the check inspects os.path.islink),
+    # then resolve for the atomic write. Raises RuntimeError on a non-tmpfs
+    # target; callers turn that into a clean error state (no crash, nothing
+    # stored — the .env write below never runs because this raises first).
+    auth_link = os.path.join(home, "auth.json")
+    squire_connect._assert_tmpfs_target(auth_link)  # fail closed
+    auth_path = os.path.realpath(auth_link)
     squire_connect._atomic_write_0600(
         auth_path, json.dumps(auth, indent=2).encode("utf-8")
     )
@@ -169,7 +181,16 @@ def cmd_poll(device_auth_id: str, user_code: str, interval: str) -> int:
                             "plan is required. The OpenAI API-key path works today.")
         return 1
 
-    store_chatgpt_tokens(tokens)
+    # Fail closed: if store_chatgpt_tokens refuses (auth.json/.env would land on
+    # the persistent volume instead of tmpfs), report a clean error state rather
+    # than crashing the detached poller. Nothing was stored — no partial write —
+    # and the detail names no token material (only the guard's fixed message).
+    try:
+        store_chatgpt_tokens(tokens)
+    except RuntimeError:
+        write_status("error", provider="chatgpt",
+                     detail="could not store credential securely; try again")
+        return 1
     squire_connect.run_connected_pipeline("chatgpt")
     write_status("connected", provider="chatgpt")
     return 0
@@ -196,7 +217,15 @@ def cmd_refresh_openai_device() -> int:
         return 1
     # Rotating refresh tokens: PERSIST the new pair before anything uses it —
     # crash after use-before-persist would strand us with a burned token.
-    store_chatgpt_tokens(tokens)
+    # Same fail-closed guard as the connect path: a non-tmpfs target is refused
+    # cleanly rather than writing the rotated token to the volume or crashing.
+    try:
+        store_chatgpt_tokens(tokens)
+    except RuntimeError:
+        write_status("error", provider="chatgpt",
+                     detail="could not store refreshed credential securely")
+        print(json.dumps({"state": "error", "detail": "credential store refused"}))
+        return 1
     print(json.dumps({"state": "refreshed"}))
     return 0
 

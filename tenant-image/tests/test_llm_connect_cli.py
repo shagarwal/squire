@@ -218,6 +218,12 @@ os.makedirs(os.path.join(home, ".squire"), exist_ok=True)
 env_tmpfs = tempfile.mkdtemp()
 open(os.path.join(env_tmpfs, ".env"), "w").close()
 os.symlink(os.path.join(env_tmpfs, ".env"), os.path.join(home, ".env"))
+# auth.json (the ChatGPT OAuth tokens) is ALSO a tmpfs symlink in the real
+# container -- store_chatgpt_tokens now applies the same fail-closed
+# _assert_tmpfs_target guard to it, so the success path must present the
+# tmpfs-symlink shape or the write is (correctly) refused. The negative test
+# below proves the refusal when auth.json is a plain file on the volume.
+os.symlink(os.path.join(env_tmpfs, "auth.json"), os.path.join(home, "auth.json"))
 CLI_ENV = dict(os.environ)
 CLI_ENV.update({
     "HERMES_HOME": home,
@@ -295,6 +301,50 @@ env_text = open(os.path.join(env_tmpfs, ".env")).read()  # follow the symlink to
 check("gateway env got the access token + codex base url",
       "OPENAI_API_KEY=at-cli-secret" in env_text
       and "OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex" in env_text, env_text)
+
+# --- fail-closed: auth.json write is refused on a non-tmpfs target -------
+# If the entrypoint's auth.json symlink were ever missing, auth.json would
+# resolve to a PLAIN file inside $HERMES_HOME (the persistent volume) and the
+# OAuth access_token would land there as plaintext. store_chatgpt_tokens now
+# guards the auth.json write with the same _assert_tmpfs_target check the .env
+# write already uses, so the whole device flow must fail cleanly (error state,
+# nothing stored) instead of writing the token to disk or crashing.
+print("== auth.json write fails closed on a non-tmpfs (volume) target ==")
+home2 = tempfile.mkdtemp()
+os.makedirs(os.path.join(home2, ".squire"), exist_ok=True)
+# auth.json is a PLAIN file resolving inside HERMES_HOME -- the forbidden shape.
+plain_auth = os.path.join(home2, "auth.json")
+open(plain_auth, "w").close()
+# .env is a proper tmpfs symlink so ONLY the auth.json guard is exercised: any
+# failure must come from auth.json, not from the (already-guarded) .env write.
+env_tmpfs2 = tempfile.mkdtemp()
+open(os.path.join(env_tmpfs2, ".env"), "w").close()
+os.symlink(os.path.join(env_tmpfs2, ".env"), os.path.join(home2, ".env"))
+CLI_ENV2 = dict(CLI_ENV)
+CLI_ENV2.update({
+    "HERMES_HOME": home2,
+    "SQUIRE_STATE_DIR": os.path.join(home2, ".squire"),
+})
+
+rc, out, _ = cli("start", "openai-device", env=CLI_ENV2)
+check("start exits 0 (device flow begins)", rc == 0, (rc, out))
+deadline = time.time() + 30
+final2 = {}
+while time.time() < deadline:
+    _, sout, _ = cli("status", env=CLI_ENV2)
+    final2 = json.loads(sout)
+    if final2.get("state") in ("connected", "denied", "error", "timed_out"):
+        break
+    time.sleep(0.5)
+check("flow reports failure, NOT connected, when auth.json is non-tmpfs",
+      final2.get("state") == "error", final2)
+# The plaintext credential must NOT have landed on the volume.
+plain_contents = open(plain_auth).read()
+check("access token was NOT written as plaintext to the volume auth.json",
+      "at-cli-secret" not in plain_contents, repr(plain_contents))
+# And the guard's own error message (which names a path) must not leak the key.
+check("failure detail carries no token material",
+      "at-cli-secret" not in json.dumps(final2), final2)
 
 print()
 if failures:

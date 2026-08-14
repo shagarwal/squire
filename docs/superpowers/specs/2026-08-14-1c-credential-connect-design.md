@@ -127,6 +127,12 @@ gains `connected_provider` — requires the manual ALTER TABLE, per [[deploy-ord
 → image published + `TENANT_IMAGE` bumped → control-api deployed → existing test tenants
 reprovisioned (template-migration gap means in-place tenants don't get the new concierge).
 
+**Fleet-wide critical:** BOTH ALTER TABLEs (the `tenant.connected_provider` column AND
+the `heartbeat.llm_connected` column) MUST run BEFORE the control-api deploy — `build_payload`
+always emits `llm_connected`, so a missing `heartbeat.llm_connected` column breaks EVERY
+tenant's heartbeat write (loud errors, not just connected tenants), not only the ones that
+have connected a credential.
+
 ## Out of scope
 
 Custom domains; central web-app involvement in credentials (violates privacy promise);
