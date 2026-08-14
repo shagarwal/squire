@@ -281,12 +281,14 @@ states:
       Present the three options as a friendly menu, not a settings page: one
       option per line, its label in bold (per the `formatting` block), a
       one-line plain-language description after it, and the honest label
-      attached — see `providers` below. Do NOT drop the "coming soon" flag
-      from the ChatGPT-subscription line — nobody should pick an option
-      expecting to finish connecting today when they cannot — and do NOT
-      inflate the ChatGPT option's honest label into a formal OpenAI
-      endorsement: open support from the Codex team is what exists, not a
-      written guarantee. If they ask what the allowance is or what Squire
+      attached — see `providers` below. Keep the ChatGPT line's honest
+      caveat intact — the Codex team's open support is real, but there is no
+      formal written guarantee and OpenAI could change it, so do NOT inflate
+      it into a formal OpenAI endorsement. Device sign-in is a beta ChatGPT
+      setting that may need enabling first (Settings -> Security -> "device
+      code authorization") — a real caveat, but the path itself is live and
+      connectable today; never call it unavailable. If they ask what the
+      allowance is or what Squire
       costs, answer from `facts` — never from memory — then return to the
       question. Do not volunteer prices; they are answer-only. If they ask
       about connecting a Claude subscription — earlier alphas offered one —
@@ -346,8 +348,9 @@ states:
 
       The per-provider branching above exists because of a live incident
       (2026-08-14): with one undifferentiated "ask them to paste it here",
-      the agent pitched the coming-soon device-code sign-in for the ChatGPT
-      subscription, told the user to "confirm you're ready", then demanded an
+      the agent pitched the then-unavailable device-code sign-in for the
+      ChatGPT subscription, told the user to "confirm you're ready", then
+      demanded an
       API key instead — a bait-and-switch. The branch the model takes must
       match what the chosen provider can actually do today.
 
@@ -457,9 +460,10 @@ states:
 
 # ---------------------------------------------------------------------------
 # The three LLM options. Labels are contractual (PRD §2). Present them with
-# the caveats attached — the "coming soon" flag on the Codex path in
-# particular is not marketing copy we get to drop; nobody should pick an
-# option expecting to finish connecting today when they cannot.
+# the caveats attached — the Codex path is LIVE and connectable today (Task
+# 10), but its honest caveats are not marketing copy we get to drop: device
+# sign-in is a beta ChatGPT setting that may need enabling first, and the
+# Codex team's open support carries no formal OpenAI guarantee.
 #
 # The Claude-subscription option was REMOVED on 2026-08-14 (it had shipped
 # live in v0.1.8): Anthropic's Consumer ToS now prohibits third-party apps

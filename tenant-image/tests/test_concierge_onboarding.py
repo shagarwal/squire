@@ -1279,6 +1279,51 @@ for _st in ("ask_name",):
 
 
 print()
+print("== 6d. ask_name menu: the ChatGPT path is LIVE, not 'coming soon' (Task 10 gap) ==")
+
+# Task 10 made all three connect paths live and rewrote connect_llm /
+# awaiting_credential / connected accordingly, but left the ask_name provider
+# MENU still advertising the ChatGPT path as "coming soon" / "not live in this
+# alpha yet". That is an internal contradiction — the menu calls a path
+# unavailable one turn before the flow connects it live — and it is the exact
+# honesty defect (advertising a state that isn't true) this whole feature
+# exists to remove.
+_ask = flat(all_ctx["ask_name"])
+check(
+    "the ask_name ChatGPT option is NOT advertised as coming soon",
+    "coming soon" not in _ask,
+)
+check(
+    "the ask_name ChatGPT option is NOT labelled unavailable / not-live",
+    "not live" not in _ask,
+)
+check(
+    "the ask_name ChatGPT option keeps the softened honesty, never 'sanctions'",
+    "openly supports" in _ask
+    and "no formal written guarantee" in _ask
+    and "sanction" not in _ask,
+    _ask[:200],
+)
+
+# Routing negative-assertion, re-added after Task 10's reconciliation dropped
+# it: ONLY the recorded codex provider gets the in-chat device-flow directive
+# in awaiting_credential. Every other recorded pick (both API keys, the seeded
+# "trial" placeholder) and an unset llm key must get the API-key/link directive,
+# never the device-flow one — otherwise the model would demand a device code
+# from someone who chose to paste a key.
+for _llm in ("openai_api_key", "anthropic_api_key", "trial", None):
+    _ac = ctx_with_llm("awaiting_credential", _llm)
+    check(
+        f"awaiting_credential with llm={_llm!r} does NOT get the device-flow directive",
+        "device flow" not in flat(_ac) and hook._AWAITING_DEVICE_FLOW not in _ac,
+    )
+check(
+    "awaiting_credential WITH the codex provider DOES get the device-flow directive",
+    "device flow" in flat(ctx_with_llm("awaiting_credential", "openai_codex_oauth")),
+)
+
+
+print()
 print("== 7. SOUL.md carries the mandate, and carries it FIRST ==")
 
 check("SOUL.md still mentions the concierge skill", "concierge" in SOUL_TEXT)

@@ -239,16 +239,20 @@ Then ask ONE question: which of these three they already have. Read
 labels intact:
 
   - **OpenAI API key** — fully supported
-  - **ChatGPT subscription**, used via Codex — coming soon; OpenAI's Codex
-    team openly supports third-party agents using ChatGPT sign-in (unlike
-    Anthropic), though there's no formal written guarantee and OpenAI could
-    change this — and the sign-in flow is not live in this alpha yet
+  - **ChatGPT subscription**, used via Codex — uses your existing paid
+    ChatGPT plan via a device sign-in you approve on OpenAI's own site (no
+    key to paste); OpenAI's Codex team openly supports third-party agents
+    using ChatGPT sign-in (unlike Anthropic), though there's no formal
+    written guarantee and OpenAI could change this
   - **Anthropic API key** — fully supported
 
-Never drop the "coming soon" flag from the ChatGPT-subscription line —
-picking it is welcome, but nobody should pick it expecting to finish
-connecting today — and never inflate the Codex team's open support into a
-formal OpenAI endorsement: there is no written guarantee to promise.
+Keep the ChatGPT line's honest caveat intact — the Codex team's open support
+is real, but there's no formal written guarantee and OpenAI could change it,
+so never inflate it into a formal OpenAI endorsement. Device sign-in is a
+beta ChatGPT setting they may first need to enable (chatgpt.com -> Settings
+-> Security -> "device code authorization"); mention that real caveat if it
+comes up — but the path itself is live and connectable today, so never call
+it unavailable.
 
 If they ask about connecting a Claude subscription (earlier alphas offered
 one, so they may have seen it): read the `claude_subscription` entry in the
