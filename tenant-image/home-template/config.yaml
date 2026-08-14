@@ -35,9 +35,10 @@ model: "anthropic:claude-sonnet-5"
 
 # Fallback ladder. Empty by default: during the trial there is only one key, and
 # a silent fallback to a different provider would quietly bypass the metering
-# proxy. The connect-your-LLM flow populates this when a tenant chooses the
-# Claude Max OAuth path (PRD §6 risk 2 — "unsupported, may break, auto-fallback
-# to API key"), which is precisely the case where a ladder earns its keep.
+# proxy. It stays empty since the Claude-subscription connect path was removed
+# on 2026-08-14 (prohibited by Anthropic's Consumer ToS): every live provider
+# is now a plain API key, so there is nothing to ladder down from. A future
+# connect path that can break out from under a tenant would repopulate this.
 fallback_providers: []
 
 # --- Long-term memory ------------------------------------------------------
