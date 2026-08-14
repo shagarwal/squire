@@ -1,0 +1,220 @@
+#!/opt/squire/venv/bin/python
+"""squire-llm-connect — the agent's ONLY interface to credential connection.
+
+Prints machine-readable JSON lines carrying only URLs, short codes, and
+states. NO code path here prints, logs, or returns credential material — the
+agent relays this output into a Telegram chat.
+
+Commands
+--------
+  mint-link                one-time https://<domain>/connect/<nonce> URL
+  status                   {"state": none|pending|connected|denied|timed_out|error|not_enabled, ...}
+  start openai-device      begin the Codex device flow; prints code + URL,
+                           polls in the background, stores tokens on grant
+  refresh openai-device    rotate the ChatGPT tokens if the spike policy says so
+  _poll <id> <code> <interval>   internal: the detached poll daemon
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import squire_codex_device as dev  # noqa: E402
+import squire_connect  # noqa: E402
+
+
+def _state_dir() -> str:
+    state_dir = os.environ.get("SQUIRE_STATE_DIR")
+    if not state_dir:
+        home = os.environ.get("HERMES_HOME") or "/opt/data"
+        state_dir = os.path.join(home, ".squire")
+    return state_dir
+
+
+def _status_path() -> str:
+    return os.path.join(_state_dir(), "llm-connect-status.json")
+
+
+def write_status(state: str, **extra) -> None:
+    payload = {"state": state, "updated": dev.iso_utc(time.time()), **extra}
+    squire_connect._atomic_write_0600(
+        _status_path(), json.dumps(payload).encode("utf-8")
+    )
+
+
+def read_status() -> dict:
+    try:
+        return json.loads(open(_status_path(), "rb").read())
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+def public_domain() -> str:
+    return (
+        os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        or os.environ.get("SQUIRE_PUBLIC_DOMAIN")
+        or ""
+    ).strip()
+
+
+NOT_ENABLED_INSTRUCTIONS = (
+    "Device sign-in is switched off on this ChatGPT account (it is a beta "
+    "feature, off by default). To enable it: open chatgpt.com, go to Settings "
+    "-> Security, and turn ON 'device code authorization'. On a Team or "
+    "Enterprise workspace an admin has to enable it. Then ask me to try again."
+)
+
+
+def cmd_mint_link() -> int:
+    domain = public_domain()
+    if not domain:
+        print(json.dumps({"state": "no_public_domain",
+                          "detail": "no RAILWAY_PUBLIC_DOMAIN/SQUIRE_PUBLIC_DOMAIN set"}))
+        return 1
+    nonce = squire_connect.mint_nonce(None)
+    print(json.dumps({"url": f"https://{domain}/connect/{nonce}",
+                      "expires_in_minutes": squire_connect.NONCE_TTL_SECONDS // 60}))
+    return 0
+
+
+def cmd_status() -> int:
+    print(json.dumps(read_status()))
+    return 0
+
+
+def store_chatgpt_tokens(tokens: dict) -> None:
+    """auth.json (sealed name — secrets-sync encrypts it) + gateway env.
+    Both writes resolve symlinks (see squire_connect.env_upsert's rationale)."""
+    home = os.environ.get("HERMES_HOME") or "/opt/data"
+    auth = dev.build_auth_json(tokens)
+    auth_path = os.path.realpath(os.path.join(home, "auth.json"))
+    squire_connect._atomic_write_0600(
+        auth_path, json.dumps(auth, indent=2).encode("utf-8")
+    )
+    squire_connect.env_upsert(os.path.join(home, ".env"), {
+        "OPENAI_API_KEY": auth["tokens"]["access_token"],
+        "OPENAI_BASE_URL": squire_connect.CHATGPT_CODEX_BASE_URL,
+    })
+
+
+def cmd_start_openai_device() -> int:
+    cfg = dev.DeviceFlowConfig()
+    try:
+        started = dev.request_user_code(cfg)
+    except dev.DeviceLoginNotEnabled:
+        # The beta/off-by-default caveat: a REAL onboarding branch, not an
+        # error. The agent relays these instructions and retries afterwards.
+        write_status("not_enabled", provider="chatgpt")
+        print(json.dumps({"state": "not_enabled",
+                          "instructions": NOT_ENABLED_INSTRUCTIONS}))
+        return 3
+    except dev.DeviceFlowError as exc:
+        write_status("error", provider="chatgpt", detail=str(exc))
+        print(json.dumps({"state": "error", "detail": str(exc)}))
+        return 1
+
+    write_status("pending", provider="chatgpt")
+    interval = dev.poll_interval_seconds(started)
+    # Detach the poller so the agent's terminal command returns immediately;
+    # the agent then polls `status`. start_new_session survives our exit.
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_poll",
+         started["device_auth_id"], started["user_code"], str(interval)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print(json.dumps({
+        "state": "pending",
+        "verification_url": cfg.verification_url,
+        "user_code": started["user_code"],
+        "expires_in_minutes": cfg.code_lifetime_seconds // 60,
+    }))
+    return 0
+
+
+def cmd_poll(device_auth_id: str, user_code: str, interval: str) -> int:
+    cfg = dev.DeviceFlowConfig()
+    delay = max(cfg.min_poll_seconds, int(interval))
+    deadline = time.monotonic() + cfg.code_lifetime_seconds
+    grant = None
+    while time.monotonic() < deadline:
+        try:
+            grant = dev.poll_once(cfg, device_auth_id, user_code)
+        except dev.DeviceFlowError as exc:
+            write_status("denied", provider="chatgpt", detail=str(exc))
+            return 1
+        if grant is not None:
+            break
+        time.sleep(delay)
+    if grant is None:
+        write_status("timed_out", provider="chatgpt")
+        return 1
+
+    try:
+        tokens = dev.exchange_code(cfg, grant)
+    except dev.DeviceFlowError as exc:
+        write_status("error", provider="chatgpt", detail=str(exc))
+        return 1
+
+    if not dev.plan_allowed(dev.jwt_claims(tokens.get("id_token", ""))):
+        # Free plan cannot serve Codex traffic — honest denial + the key path.
+        write_status("denied", provider="chatgpt",
+                     detail="This ChatGPT account is on the free plan; a paid "
+                            "plan is required. The OpenAI API-key path works today.")
+        return 1
+
+    store_chatgpt_tokens(tokens)
+    # Task 6 wires squire_connect.run_connected_pipeline("chatgpt") here.
+    write_status("connected", provider="chatgpt")
+    return 0
+
+
+def cmd_refresh_openai_device() -> int:
+    home = os.environ.get("HERMES_HOME") or "/opt/data"
+    auth_path = os.path.realpath(os.path.join(home, "auth.json"))
+    try:
+        auth = json.loads(open(auth_path, "rb").read())
+    except (OSError, ValueError):
+        print(json.dumps({"state": "error", "detail": "no auth.json to refresh"}))
+        return 1
+    if not dev.needs_refresh(auth, now=time.time()):
+        print(json.dumps({"state": "fresh"}))
+        return 0
+    cfg = dev.DeviceFlowConfig()
+    try:
+        tokens = dev.refresh_tokens(cfg, auth["tokens"]["refresh_token"])
+    except dev.DeviceFlowError:
+        # Terminal (reused/expired/revoked): the agent must offer a re-link.
+        write_status("error", provider="chatgpt", detail="refresh rejected; re-link needed")
+        print(json.dumps({"state": "relink_required"}))
+        return 1
+    # Rotating refresh tokens: PERSIST the new pair before anything uses it —
+    # crash after use-before-persist would strand us with a burned token.
+    store_chatgpt_tokens(tokens)
+    print(json.dumps({"state": "refreshed"}))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "mint-link":
+        return cmd_mint_link()
+    if len(argv) >= 2 and argv[1] == "status":
+        return cmd_status()
+    if len(argv) >= 3 and argv[1] == "start" and argv[2] == "openai-device":
+        return cmd_start_openai_device()
+    if len(argv) >= 3 and argv[1] == "refresh" and argv[2] == "openai-device":
+        return cmd_refresh_openai_device()
+    if len(argv) >= 5 and argv[1] == "_poll":
+        return cmd_poll(argv[2], argv[3], argv[4])
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
