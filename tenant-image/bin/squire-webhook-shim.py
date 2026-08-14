@@ -119,6 +119,46 @@ REQUIRE_AUTH = os.environ.get("SQUIRE_WEBHOOK_REQUIRE_AUTH", "false").lower() in
     "on",
 )
 
+# --- Public-domain Host gating (1C) -----------------------------------------
+# Attaching a Railway public domain (for the /connect page) exposes this port
+# to the internet. Everything except /connect/* must then answer ONLY for
+# requests that addressed the shim by a private name. Railway injects
+# RAILWAY_PUBLIC_DOMAIN once a domain exists; provisioning also writes
+# SQUIRE_PUBLIC_DOMAIN explicitly so this gate cannot depend on platform
+# injection timing. Unset (dev, plain docker run) => no gating at all.
+PUBLIC_DOMAIN = (
+    os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("SQUIRE_PUBLIC_DOMAIN") or ""
+).strip().lower()
+
+
+def _request_host(headers) -> str:
+    """The Host header, lowercased, port stripped. '[::1]:80' handled too."""
+    host = (headers.get("Host") or "").strip().lower()
+    if host.startswith("["):  # bracketed IPv6
+        return host.split("]", 1)[0].lstrip("[")
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def _host_is_private(headers) -> bool:
+    """True when the request addressed us by a name only the private network,
+    the container itself, or Railway's own health prober would use.
+
+    Fail-closed: with a public domain configured, an unrecognised Host is
+    treated as public. An attacker reaching the public edge cannot make the
+    edge route an arbitrary Host to this container, but this code must not
+    rely on that — 'not provably private' is the safe reading.
+    """
+    host = _request_host(headers)
+    if host in ("", "localhost", "healthcheck.railway.app"):
+        return True
+    if host.endswith(".railway.internal"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True  # IP literal: private-network or loopback addressing
+    except ValueError:
+        return False
+
 
 def log(msg: str) -> None:
     # Never log request bodies. The ingress is body-non-logging by design
@@ -266,6 +306,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802 - stdlib naming
+        # Public-domain gate: with a domain attached, only /connect/* is public.
+        if PUBLIC_DOMAIN and not _host_is_private(self.headers):
+            if not self.path.split("?", 1)[0].startswith("/connect/"):
+                log("rejected public-Host GET outside /connect")
+                self._respond(403, {"error": "forbidden"})
+                return
         if self.path.split("?", 1)[0] in ("/health", "/healthz"):
             self._respond(
                 200,
@@ -302,6 +348,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 - stdlib naming
         path = self.path.split("?", 1)[0]
+
+        # Public-domain gate (see do_GET). A forged Telegram update arriving
+        # via the public domain — even with a stolen delivery secret — is the
+        # injection path this exists to close. Counted so probing is visible.
+        if PUBLIC_DOMAIN and not _host_is_private(self.headers):
+            if not path.startswith("/connect/"):
+                log("rejected public-Host POST outside /connect")
+                count("updates_rejected")
+                self._respond(403, {"error": "forbidden"})
+                return
+
         if path != WEBHOOK_PATH:
             self._respond(404, {"error": "not found"})
             return
