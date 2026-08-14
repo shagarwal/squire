@@ -3,7 +3,7 @@ name: concierge
 description: >
   Squire onboarding concierge. Run this at the very start of a tenant's life —
   the first message they ever send — and whenever they ask how to connect
-  their own AI (OpenAI, ChatGPT/Codex, Anthropic, Claude Max), about their
+  their own AI (OpenAI, ChatGPT/Codex, Anthropic), about their
   plan, or what happens when the trial ends. Owns the greeting, walking them
   through connecting their own LLM account first, learning their name and
   timezone, and answering trial and pricing questions honestly when asked.

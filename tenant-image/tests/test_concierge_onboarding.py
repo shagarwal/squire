@@ -756,8 +756,15 @@ for label, blob in [
         "first" in blob and "own ai account" in blob,
     )
     check(
-        f"greet ({label}) names the accounts concretely (Claude/OpenAI)",
-        "claude" in blob and "openai" in blob,
+        f"greet ({label}) names the accounts concretely (OpenAI/Anthropic)",
+        "openai" in blob and "anthropic" in blob,
+    )
+    # Anthropic is API-key only since 2026-08-14 (Consumer ToS change,
+    # server-side enforced): the greeting must not promise connecting a
+    # "Claude account" the flow can no longer accept.
+    check(
+        f"greet ({label}) no longer promises a Claude account",
+        "claude" not in blob,
     )
     check(f"greet ({label}) asks their name", "call" in blob)
     # /help is upstream's onboarding surface, not Squire's. It is not enough for
@@ -865,9 +872,14 @@ for lbl in (
     "**openai api key**",
     "**chatgpt subscription**",
     "**anthropic api key**",
-    "**claude max subscription**",
 ):
     check(f"the connect pitch bolds the {lbl} label", lbl in _pitch_flat)
+# The Claude-subscription option was removed 2026-08-14 (prohibited by
+# Anthropic's Consumer ToS). The menu must not offer it in any form.
+check(
+    "the connect pitch offers no Claude-subscription option",
+    "**claude max" not in _pitch_flat and "**claude subscription" not in _pitch_flat,
+)
 
 # The YAML mirror carries the same verdict WITH its evidence, so the next
 # copy pass starts from the finding instead of re-deriving or guessing it.
@@ -889,18 +901,29 @@ print("== 6. honesty rules survive the rewrite ==")
 facts = MACHINE["facts"]
 providers = {p["id"]: p for p in MACHINE["providers"]}
 
-check("all four provider options are present", len(providers) == 4)
+# Founder decision 2026-08-14 (spike-backed): Anthropic's Consumer ToS now
+# prohibits third-party apps using Claude subscriptions (Feb 2026 change,
+# server-side enforced — account bans), so the claude_max_oauth option was
+# REMOVED entirely. Anthropic is API-key only. Three options remain.
 check(
-    "the Claude Max option keeps its unsupported warning",
-    "not supported by anthropic" in providers["claude_max_oauth"]["honest_label"].lower(),
+    "exactly the three surviving provider options are present",
+    set(providers) == {"openai_api_key", "openai_codex_oauth", "anthropic_api_key"},
+    str(sorted(providers)),
+)
+# The OpenAI honesty label used to say OpenAI "explicitly sanctions" the
+# ChatGPT-subscription path — an overstatement of OpenAI's actual stance.
+# The accurate claim: the Codex team openly supports it, with no formal
+# written guarantee.
+_codex_hl = flat(providers["openai_codex_oauth"]["honest_label"])
+check(
+    "the Codex label claims open Codex-team support, not formal endorsement",
+    "openai's codex team openly supports third-party agents using chatgpt sign-in"
+    in _codex_hl,
+    _codex_hl,
 )
 check(
-    "the Claude Max option keeps its API-key fallback",
-    providers["claude_max_oauth"]["fallback"] == "anthropic_api_key",
-)
-check(
-    "the Codex option is still labelled sanctioned",
-    "sanction" in providers["openai_codex_oauth"]["honest_label"].lower(),
+    "the Codex label admits the support could change",
+    "no formal written guarantee" in _codex_hl and "openai could change this" in _codex_hl,
 )
 
 # The trial numbers the injected directives repeat must match the facts block —
@@ -945,10 +968,10 @@ check(
     and "not a payment to squire" in flat(_pitch),
 )
 check(
-    "the four honest labels are presented where the options are",
+    "the three honest labels are presented where the options are",
     "fully supported" in flat(_pitch)
-    and "not supported by anthropic" in flat(_pitch)
-    and "openai sanctions this" in flat(_pitch),
+    and "openly supports third-party agents" in flat(_pitch)
+    and "no formal written guarantee" in flat(_pitch),
 )
 check(
     "declining the connect step continues onboarding instead of ending it",
@@ -1081,27 +1104,6 @@ check(
     getattr(hook, "_COMING_SOON_PROVIDERS", None)
     == {p["id"] for p in MACHINE["providers"] if p.get("status") == "coming_soon"},
 )
-# Claude Max stays LIVE, not coming-soon: its capture today is a pasted token
-# (CLAUDE_CODE_OAUTH_TOKEN), which the paste path already handles. The honesty
-# it owes is the un-softened warning (pinned in section 6) plus saying how the
-# token is actually minted — `claude setup-token` on a computer — rather than
-# implying a sign-in flow that does not exist.
-check(
-    "Claude Max stays offered as live (paste-capturable), not coming soon",
-    providers["claude_max_oauth"].get("status") != "coming_soon",
-)
-check(
-    "Claude Max says how its token is actually minted (claude setup-token)",
-    "claude setup-token" in flat(providers["claude_max_oauth"]["blurb"]),
-)
-check(
-    "the choice step passes the setup-token mechanism on to the user",
-    "claude setup-token" in flat(all_ctx["connect_llm"]),
-)
-check(
-    "Claude Max no longer pitches a sign-in that does not exist",
-    "sign in with" not in flat(providers["claude_max_oauth"]["blurb"]),
-)
 # The menu the user actually sees (the ask_name directive) must carry the flag
 # on the option's own line — nobody should pick it expecting to finish today.
 check(
@@ -1215,7 +1217,7 @@ check(
     "${" not in _cs and "{env_file}" not in _cs and "{skill_file}" not in _cs,
 )
 # Every live choice — and no recorded choice at all — keeps the paste path.
-for _pid in ("openai_api_key", "anthropic_api_key", "claude_max_oauth", "trial", None):
+for _pid in ("openai_api_key", "anthropic_api_key", "trial", None):
     check(
         f"llm={_pid!r} still gets the live paste directive",
         "ask them to paste the key here" in flat(ctx_with_llm("awaiting_credential", _pid)),
@@ -1291,6 +1293,81 @@ check(
     "rotation advice survives in both mirrors",
     "rotate" in flat(hook._DIRECTIVES["awaiting_credential"]) and "rotate" in _yaml_paste,
 )
+
+
+print()
+print("== 6c. the Claude-subscription option is GONE (Anthropic ToS, 2026-08-14) ==")
+
+# Founder decision 2026-08-14, backed by the research spikes in
+# docs/superpowers/specs/2026-08-14-spike-*.md: Anthropic's Consumer ToS now
+# prohibits third-party apps from using Claude subscriptions (Feb 2026 change,
+# server-side enforced — accounts get banned). The claude_max_oauth option that
+# shipped live in v0.1.8 — menu line, providers entry, setup-token hand-off,
+# CLAUDE_CODE_OAUTH_TOKEN path — must be gone from every surface the agent
+# reads. Anthropic is API-key only.
+
+_yaml_raw = flat(STATE_MACHINE.read_text(encoding="utf-8"))
+_all_directives = list(hook._DIRECTIVES.values()) + [hook._AWAITING_COMING_SOON]
+_rendered = flat(" ".join(all_ctx.values()))
+
+check(
+    "no claude_max provider survives anywhere in the state machine",
+    "claude_max" not in _yaml_raw and "claude max" not in _yaml_raw,
+)
+check(
+    "no CLAUDE_CODE_OAUTH_TOKEN path survives in the state machine",
+    "claude_code_oauth" not in _yaml_raw,
+)
+check(
+    "no setup-token hand-off survives in the state machine",
+    "setup-token" not in _yaml_raw,
+)
+check(
+    "no provider option mentions Claude at all",
+    all("claude" not in flat(json.dumps(p)) for p in MACHINE["providers"]),
+)
+check(
+    "the removed provider id is never offered for the llm key",
+    all("claude_max_oauth" not in d for d in _all_directives)
+    and "claude_max_oauth" not in _rendered,
+)
+check(
+    "no directive hands out the setup-token mechanism",
+    all("setup-token" not in flat(d) for d in _all_directives),
+)
+check(
+    "the overstated 'sanctions' wording is gone from every surface",
+    "sanction" not in _yaml_raw
+    and all("sanction" not in flat(d) for d in _all_directives),
+)
+check(
+    "SKILL.md no longer advertises the Claude-subscription path",
+    "claude max" not in flat((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")),
+)
+
+# A user who saw the option in an earlier alpha may ask where it went. The
+# honest answer lives in the facts block — answer-only, like every fact — and
+# the connect-adjacent states point at it by name rather than paraphrasing.
+_claude_fact = flat(facts.get("claude_subscription", ""))
+check(
+    "facts carries the Claude-subscription answer",
+    "isn't available" in _claude_fact
+    and "don't permit it for third-party apps" in _claude_fact,
+    _claude_fact,
+)
+check(
+    "the answer redirects to an Anthropic API key, concretely",
+    "**api key**" in _claude_fact and "console.anthropic.com" in _claude_fact,
+)
+for _st in ("ask_name", "connect_llm"):
+    check(
+        f"`{_st}` points at facts.claude_subscription for the if-asked answer",
+        "claude_subscription" in flat(all_ctx[_st]),
+    )
+    check(
+        f"`{_st}` keeps that answer answer-only (never volunteered)",
+        "never volunteer" in flat(all_ctx[_st]),
+    )
 
 
 print()

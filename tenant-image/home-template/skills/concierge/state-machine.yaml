@@ -108,6 +108,17 @@ facts:
     provider (OpenAI or Anthropic) — it is not a payment to Squire. A Squire
     subscription pays for the assistant itself, comes later, and is not part
     of setup.
+  # Answer-only, like everything in this block. Earlier alphas (through
+  # v0.1.8) offered a Claude-subscription connect option; it was removed on
+  # 2026-08-14 because Anthropic's Consumer ToS prohibits third-party apps
+  # from using consumer subscriptions (Feb 2026 change, enforced server-side).
+  # A user who saw the old menu may ask where it went — this is the answer.
+  # Never volunteer it unprompted. Double asterisks, not underscores, per the
+  # `formatting` block.
+  claude_subscription: >
+    Connecting a Claude **subscription** isn't available — Anthropic's terms
+    don't permit it for third-party apps. You can connect an Anthropic
+    **API key** from console.anthropic.com instead.
   privacy_claim: >
     Squire is designed so we cannot casually or silently read your
     conversations or credentials: you get your own isolated runtime and your own
@@ -205,9 +216,9 @@ states:
         organised".
       - >-
         Say the first thing you will do together: connect their own AI account
-        — a Claude or OpenAI account, or an API key — and say you will walk
-        them through it right after this. One sentence. Do not mention the
-        trial, any allowance or cap, any prices, or paying for anything.
+        — OpenAI or Anthropic — and say you will walk them through it right
+        after this. One sentence. Do not mention the trial, any allowance or
+        cap, any prices, or paying for anything.
     ask: What should I call you?
     then: ask_name
     notes: >
@@ -267,16 +278,19 @@ states:
       dodged the question or asked something instead, answer them first and ask
       once more, lightly — never twice in a row.
 
-      Present the four options as a friendly menu, not a settings page: one
+      Present the three options as a friendly menu, not a settings page: one
       option per line, its label in bold (per the `formatting` block), a
       one-line plain-language description after it, and the honest label
-      attached — see `providers` below. Do NOT hide the Claude Max warning to
-      make the option look better, and do NOT drop the "coming soon" flag from
-      the ChatGPT-subscription line — nobody should pick an option expecting
-      to finish connecting today when they cannot. If they ask what the
-      allowance is or what Squire costs, answer from `facts` — never from
-      memory — then return to the question. Do not volunteer prices; they are
-      answer-only.
+      attached — see `providers` below. Do NOT drop the "coming soon" flag
+      from the ChatGPT-subscription line — nobody should pick an option
+      expecting to finish connecting today when they cannot — and do NOT
+      inflate the ChatGPT option's honest label into a formal OpenAI
+      endorsement: open support from the Codex team is what exists, not a
+      written guarantee. If they ask what the allowance is or what Squire
+      costs, answer from `facts` — never from memory — then return to the
+      question. Do not volunteer prices; they are answer-only. If they ask
+      about connecting a Claude subscription — earlier alphas offered one —
+      answer from facts.claude_subscription; never volunteer it unprompted.
 
   connect_llm:
     goal: >
@@ -292,23 +306,18 @@ states:
         Record the picked provider's id in the `llm` key of
         concierge-state.json — the state-write command already carries the
         key. The next step reads it to give the right hand-off, so the id
-        must be exact: openai_api_key, openai_codex_oauth, anthropic_api_key
-        or claude_max_oauth.
+        must be exact: openai_api_key, openai_codex_oauth or
+        anthropic_api_key.
     say:
       - >-
-        If they picked a path that is live today — OpenAI API key, Anthropic
-        API key, or Claude Max — confirm it in one warm line and tell them
+        If they picked a path that is live today — the OpenAI API key or the
+        Anthropic API key — confirm it in one warm line and tell them
         how to hand the credential over: a few short lines, a quick hand-off,
         not a form. There is no one-time link yet — `GET /connect/<nonce>`
         ships in Phase 1C — so never invent a URL: ask them to paste it here
         and say you will secure it the moment it lands. Explain the missing
         link at most once in the whole conversation; the next step is told
         not to repeat it.
-      - >-
-        If they picked Claude Max, restate its honest_label warning in one
-        line before they commit, and say how the token is minted: run
-        `claude setup-token` on a computer, then paste the token it prints
-        here.
       - >-
         If they picked the ChatGPT subscription (via Codex): that sign-in
         flow is coming soon and cannot be connected in this alpha yet. One
@@ -319,7 +328,7 @@ states:
         moment", never offer to kick off a flow that does not exist, and
         never ask them to confirm they are ready for one.
       - >-
-        If they have none of the four, or say "not now": accept it
+        If they have none of these, or say "not now": accept it
         immediately, say the built-in allowance keeps working meanwhile, set
         the state to ask_timezone, and move on to the timezone question.
         Never nag.
@@ -332,7 +341,9 @@ states:
       difference between the two are answered from `facts` only — see
       billing_separation: their AI usage on their own account is their
       provider's bill; a Squire subscription pays for the assistant itself,
-      later, and is no part of onboarding.
+      later, and is no part of onboarding. If they ask about connecting a
+      Claude subscription — earlier alphas offered one — answer from
+      facts.claude_subscription; never volunteer it unprompted.
 
       The per-provider branching above exists because of a live incident
       (2026-08-14): with one undifferentiated "ask them to paste it here",
@@ -351,9 +362,9 @@ states:
       # repeating it — and still never invents a URL.
       - >-
         The hand-off depends on the provider recorded in the `llm` key of
-        concierge-state.json. For a live path (an API key, or the Claude Max
-        token), ask them to paste the credential here and handle it exactly
-        as `on_paste_in_chat` says. Never invent a URL, and do not repeat the
+        concierge-state.json. For a live path (an API key), ask them to
+        paste the credential here and handle it exactly as
+        `on_paste_in_chat` says. Never invent a URL, and do not repeat the
         missing-link explanation — connect_llm already gave it.
       - >-
         If the recorded provider is the coming-soon ChatGPT subscription,
@@ -467,10 +478,19 @@ states:
       everywhere else they are answer-only, from `facts`.
 
 # ---------------------------------------------------------------------------
-# The four LLM options. Labels are contractual (PRD §2). Present them with the
-# caveats attached — the Claude Max warning in particular is not marketing copy
-# we get to soften; it is the reason we are allowed to offer that path at all.
-# See docs/reference/hermes-400-extra-usage-fix.md for the underlying breakage.
+# The three LLM options. Labels are contractual (PRD §2). Present them with
+# the caveats attached — the "coming soon" flag on the Codex path in
+# particular is not marketing copy we get to drop; nobody should pick an
+# option expecting to finish connecting today when they cannot.
+#
+# The Claude-subscription option was REMOVED on 2026-08-14 (it had shipped
+# live in v0.1.8): Anthropic's Consumer ToS now prohibits third-party apps
+# from using consumer subscriptions (Feb 2026 change, enforced server-side —
+# accounts get banned), so offering it would put users' accounts at risk.
+# Anthropic is API-key only. If a user who saw the old menu asks where the
+# option went, the answer lives in facts.claude_subscription — answer-only,
+# never volunteered. Backed by the research spikes in
+# docs/superpowers/specs/2026-08-14-spike-*.md.
 # ---------------------------------------------------------------------------
 providers:
 
@@ -488,10 +508,17 @@ providers:
       Use your existing ChatGPT subscription instead of metered API billing.
       The sign-in flow is not live in this alpha yet, so this option cannot be
       connected today.
+    # The support claim below is calibrated on purpose (2026-08-14): an
+    # earlier label claimed formal, explicit OpenAI approval of this path,
+    # which overstates OpenAI's actual stance. What is true: the Codex team
+    # openly supports third-party agents using ChatGPT sign-in. What is not:
+    # any formal written guarantee. The label says exactly that much, no more.
     honest_label: >
-      Coming soon — not connectable in this alpha yet. OpenAI explicitly
-      sanctions using a ChatGPT subscription this way for agents, and the
-      moment the sign-in flow ships your subscription will be usable here.
+      Coming soon — not connectable in this alpha yet. OpenAI's Codex team
+      openly supports third-party agents using ChatGPT sign-in (unlike
+      Anthropic) — there's no formal written guarantee, and OpenAI could
+      change this. The moment the sign-in flow ships your subscription will
+      be usable here.
     credential: oauth_device_code
     # NOTHING implements this credential yet: no codex CLI in the image, no
     # device-code flow anywhere in the runtime — it is Phase 1C roadmap. The
@@ -503,12 +530,13 @@ providers:
     fallback: openai_api_key
     notes: >
       This will be the recommended path for anyone who already pays for
-      ChatGPT: no extra bill, and it is the one subscription route the provider
-      blesses. But until the sign-in flow ships, offering to start it is a
-      promise the runtime cannot keep — never "kick off" a sign-in, never say
-      it starts "in a moment". Choosing it is still welcome: confirm the
-      choice warmly, say it is coming, and offer the API-key path as what
-      works today.
+      ChatGPT: no extra bill, and the Codex team's support for third-party
+      agents is public and real — but it is not a written guarantee, so never
+      inflate it into a formal endorsement. Until the sign-in flow ships,
+      offering to start it is a promise the runtime cannot keep — never "kick
+      off" a sign-in, never say it starts "in a moment". Choosing it is still
+      welcome: confirm the choice warmly, say it is coming, and offer the
+      API-key path as what works today.
 
   - id: anthropic_api_key
     label: Anthropic API key
@@ -517,27 +545,3 @@ providers:
     credential: api_key
     env: ANTHROPIC_API_KEY
     fallback: null
-
-  - id: claude_max_oauth
-    label: Claude Max subscription
-    # LIVE, not coming-soon: the capture is a pasted token, which the paste
-    # path already handles today. But the blurb must not pitch a "sign in"
-    # flow — none exists. The honest mechanism is: run `claude setup-token`
-    # on a computer, paste the token it prints here.
-    blurb: >
-      Use your existing Max subscription. Getting connected today means
-      running `claude setup-token` on a computer and pasting the token it
-      prints here.
-    honest_label: >
-      ⚠ Not supported by Anthropic. It works today, but it is not a sanctioned
-      integration and it may break without warning. If it breaks we fall back to
-      an API key automatically — we will ask you for one then.
-    credential: oauth_token
-    env: CLAUDE_CODE_OAUTH_TOKEN
-    fallback: anthropic_api_key
-    notes: >
-      Say the warning out loud when you offer it. Do not bury it, do not put it
-      last in a long sentence, and do not answer "is this allowed?" with
-      anything softer than the honest_label above. If it starts failing, tell
-      them what happened rather than silently degrading — a mysterious quality
-      drop is worse than a clear "this broke, paste a key".
