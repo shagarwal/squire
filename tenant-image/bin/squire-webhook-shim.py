@@ -350,6 +350,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _client_ip(self) -> str:
+        """The throttle key: the real external client's IP.
+
+        Behind Railway's HTTP edge, self.client_address is the proxy hop —
+        identical for every external user — so keying the per-IP backoff on it
+        would (a) fail to isolate clients and (b) let anyone lock the real owner
+        out. The real client is the RIGHTMOST X-Forwarded-For entry: that is the
+        hop closest to us, the value Railway's OWN edge appended, and it is the
+        edge's trusted view of who connected. Taking the leftmost instead would
+        trust a client-supplied XFF and let one user spoof another's IP to lock
+        them out — so rightmost, deliberately, is the only safe choice.
+
+        http.server joins repeated X-Forwarded-For headers with ", " into one
+        value, so split on "," and take the last non-empty entry. An
+        empty/whitespace header falls back to client_address. Railway sends a
+        bare IP (no port) in XFF, but tolerate a stray :port just in case.
+        """
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            # Rightmost non-empty entry = the trusted edge's view of the client.
+            for part in reversed(xff.split(",")):
+                candidate = part.strip()
+                if candidate:
+                    # Bare IP is expected; strip a trailing :port defensively
+                    # (only for IPv4 "a.b.c.d:p" — never for bracketless IPv6,
+                    # which Railway does not send here).
+                    if candidate.count(":") == 1:
+                        candidate = candidate.rsplit(":", 1)[0]
+                    return candidate
+        # No usable XFF: fall back to the direct peer (dev, private-network,
+        # or a request that never traversed the edge).
+        return (self.client_address or ("",))[0]
+
     def _handle_connect_post(self, path: str) -> None:
         """POST /connect/<nonce>: validate the pasted key with the provider,
         store it, consume the nonce, kick the connected pipeline. An invalid
@@ -358,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
             return
 
-        ip = (self.client_address or ("",))[0]
+        ip = self._client_ip()
         if _connect_throttled(ip):
             log("throttled /connect attempt")
             self._respond(429, {"error": "too many attempts"},
@@ -402,7 +435,21 @@ class Handler(BaseHTTPRequestHandler):
         # Store FIRST, then consume: a consume that lost a race after a store
         # is harmless (same credential), while the reverse order could burn
         # the nonce with nothing saved.
-        squire_connect.store_api_key(provider, api_key)
+        #
+        # store_api_key fails CLOSED: it refuses to write if the target would
+        # land on the persistent volume instead of tmpfs (the one forbidden
+        # outcome — a plaintext credential on disk). If it raises, the store
+        # runs BEFORE consume, so the nonce is untouched and stays live for a
+        # retry. Render our own fixed copy — never the exception text — and do
+        # not log the key or the exception detail.
+        try:
+            squire_connect.store_api_key(provider, api_key)
+        except Exception:
+            log("connect: credential store refused (non-tmpfs target); nonce left live")
+            self._respond_html(200, squire_connect.render_connect_page(
+                candidate,
+                error="Something went wrong saving that — ask your agent for a fresh link."))
+            return
         squire_connect.consume_nonce(None, candidate)
         _connect_clear(ip)
         # Never log the provider *response* or the key; the provider NAME is fine.

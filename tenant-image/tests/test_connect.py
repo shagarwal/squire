@@ -178,6 +178,19 @@ class FakeProvider(BaseHTTPRequestHandler):
             "x_api_key": self.headers.get("x-api-key"),
             "version": self.headers.get("anthropic-version"),
         })
+        # Finding 3: /redirect-src issues a cross-path 302 to /redirect-dst.
+        # A validation that follows it would re-send the Authorization /
+        # x-api-key header to the target — the leak we are guarding against.
+        # /redirect-dst records any call so the test can assert it is NEVER hit.
+        if self.path.startswith("/redirect-src"):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{FAKE_PROVIDER_PORT}/redirect-dst",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # /openai/ok and /anthropic/ok accept; /openai/bad rejects with 401.
         status = 401 if "/bad" in self.path else 200
         body = b'{"data": []}'
@@ -193,14 +206,20 @@ fake_provider.daemon_threads = True
 threading.Thread(target=fake_provider.serve_forever, daemon=True).start()
 
 
-def shim_post(nonce, provider, key, host=PUB, port=SHIM_PORT):
+def shim_post(nonce, provider, key, host=PUB, port=SHIM_PORT, xff=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     form = urllib.parse.urlencode({"provider": provider, "api_key": key}).encode()
-    conn.request("POST", f"/connect/{nonce}", body=form, headers={
+    headers = {
         "Host": host,
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": str(len(form)),
-    })
+    }
+    # Finding 1: let a test set X-Forwarded-For so it can stand in for Railway's
+    # edge, which appends the real client IP as the RIGHTMOST entry. `xff` is the
+    # raw header value (may be a comma-joined list to exercise rightmost logic).
+    if xff is not None:
+        headers["X-Forwarded-For"] = xff
+    conn.request("POST", f"/connect/{nonce}", body=form, headers=headers)
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", "replace")
     conn.close()
@@ -303,14 +322,87 @@ try:
           any(c["path"] == "/anthropic/ok" and c["x_api_key"] == ANTHROPIC_KEY
               and c["version"] for c in provider_calls), provider_calls)
 
+    # --- Finding 1: throttle isolates clients by their REAL IP (XFF) -------
+    # Behind Railway's edge, self.client_address is the proxy hop — identical
+    # for every external user. The shim must key the per-IP failure backoff on
+    # the RIGHTMOST X-Forwarded-For entry (the value Railway's own edge
+    # appended), so that (a) one abuser cannot lock out the real owner and (b) a
+    # client cannot prepend a victim's IP to forge another user's key.
+    CONNECT_MAX_FAILS = 5  # mirrors the shim constant of the same name
+    XFF_A = "203.0.113.10"
+    XFF_B = "203.0.113.20"
+    # Exhaust client A's failure budget with nonce misses (each miss records a
+    # failure). After CONNECT_MAX_FAILS misses the next request from A is 429.
+    for i in range(CONNECT_MAX_FAILS):
+        shim_post("miss-a", "openai", f"sk-test-a-{i:030d}", xff=XFF_A)
+    status_a, _ = shim_post("miss-a", "openai", "sk-test-a-final-00000000000000", xff=XFF_A)
+    check("client A is throttled once its own budget is exhausted",
+          status_a == 429, status_a)
+    # A DIFFERENT client (different rightmost XFF) is unaffected — per-client
+    # isolation. It gets the friendly invalid-nonce page, not a 429.
+    status_b, body_b = shim_post("miss-b", "openai", "sk-test-b-000000000000000000", xff=XFF_B)
+    check("a different client is NOT throttled by A's failures (per-client isolation)",
+          status_b != 429, (status_b, body_b[:120]))
+    # Rightmost wins: a request whose XFF *ends* in A's IP is still A, no matter
+    # what precedes it — so a client cannot prepend to escape or forge.
+    status_a2, _ = shim_post("miss-a", "openai", "sk-test-a-spoof-00000000000000",
+                             xff=f"9.9.9.9, {XFF_A}")
+    check("rightmost XFF entry is the throttle key (prepended IPs ignored)",
+          status_a2 == 429, status_a2)
+
     # --- abuse limit: repeated misses back off ----------------------------
+    # No XFF at all: the throttle must still work, falling back to
+    # client_address (127.0.0.1 here). This is the original coverage, retained.
     got_429 = False
     for i in range(8):
         status, _ = shim_post("not-a-nonce", "openai", f"sk-test-guess-{i:030d}")
         if status == 429:
             got_429 = True
             break
-    check("repeated nonce misses from one IP hit a 429 backoff", got_429, status)
+    check("repeated nonce misses from one IP (no XFF) hit a 429 backoff", got_429, status)
+
+    # --- Finding 3: validation must NOT follow redirects -------------------
+    # urlopen's default opener follows 3xx and re-sends Authorization / x-api-key
+    # to the redirect target (possibly a different host). The fake provider
+    # 302-redirects /redirect-src -> /redirect-dst; a correct validator refuses
+    # the redirect, so /redirect-dst is NEVER hit and the key never leaves for it.
+    REDIRECT_KEY = "sk-test-redirect-key-00000000000000000"
+    provider_calls.clear()
+    n_redir = squire_connect.mint_nonce(state2)
+    proc.terminate(); proc.wait(timeout=10)
+    proc = start_shim2(SQUIRE_CONNECT_OPENAI_VALIDATE_URL=
+                       f"http://127.0.0.1:{FAKE_PROVIDER_PORT}/redirect-src")
+    status, body = shim_post(n_redir, "openai", REDIRECT_KEY)
+    check("provider redirect -> reachable-failure message on the form page",
+          status == 200 and "couldn't be reached" in body, (status, body[:300]))
+    check("the key was NOT re-sent to the redirect target",
+          not any(c["path"] == "/redirect-dst" for c in provider_calls), provider_calls)
+    check("a redirected validation stored nothing",
+          REDIRECT_KEY not in open(os.path.join(tmpfs, ".env")).read(), "stored on redirect")
+    check("nonce still live after a redirect failure",
+          squire_connect.find_nonce(state2, n_redir) is not None)
+
+    # --- Finding 2: fail closed if the write would NOT land on tmpfs ------
+    # The entrypoint makes $HERMES_HOME/.env a symlink into tmpfs. If it is
+    # instead a PLAIN FILE on the volume, writing the key there is the one
+    # forbidden outcome (plaintext credential on the persistent volume). The
+    # code must refuse — the user sees a friendly save error, nothing is
+    # written, and the nonce stays live for a retry.
+    home3 = tempfile.mkdtemp()
+    state3 = os.path.join(home3, ".squire")
+    plain_env = os.path.join(home3, ".env")
+    open(plain_env, "w").close()  # a real file on the "volume", NOT a symlink
+    proc.terminate(); proc.wait(timeout=10)
+    proc = start_shim2(HERMES_HOME=home3, SQUIRE_STATE_DIR=state3)
+    n_vol = squire_connect.mint_nonce(state3)
+    status, body = shim_post(n_vol, "openai", OPENAI_KEY)
+    check("plain-file .env -> friendly save error (not a 500, not the done page)",
+          status == 200 and "went wrong saving" in body.lower()
+          and "back to telegram" not in body.lower(), (status, body[:300]))
+    check("no credential written to the plain .env on the volume",
+          OPENAI_KEY not in open(plain_env).read(), "credential leaked to volume")
+    check("nonce still live after a refused (non-tmpfs) write",
+          squire_connect.find_nonce(state3, n_vol) is not None)
 finally:
     proc.terminate()
     proc.wait(timeout=10)

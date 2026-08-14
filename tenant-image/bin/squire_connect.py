@@ -245,6 +245,25 @@ import urllib.request
 VALIDATE_TIMEOUT = 20.0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every 3xx during validation.
+
+    urllib's default opener transparently FOLLOWS redirects and re-sends the
+    Authorization / x-api-key header to the target — potentially a different
+    host. For a request whose whole purpose is to carry the user's secret key,
+    that is a credential leak. Returning None from redirect_request makes urllib
+    stop and raise the 3xx as an HTTPError instead of chasing it, so the key is
+    never re-sent. A redirect is then treated as a reachable-failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+# One opener, reused: default handlers minus redirect-following.
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _validate_urls() -> dict:
     return {
         "openai": os.environ.get(
@@ -268,13 +287,16 @@ def validate_key(provider: str, key: str) -> tuple[bool, str]:
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
     request = urllib.request.Request(urls[provider], headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=VALIDATE_TIMEOUT) as response:
+        # No-redirect opener: a 3xx must NEVER cause the key to be re-sent to a
+        # redirect target (see _NoRedirect). It raises the 3xx as an HTTPError.
+        with _NO_REDIRECT_OPENER.open(request, timeout=VALIDATE_TIMEOUT) as response:
             if 200 <= response.status < 300:
                 return True, ""
             return False, "The provider didn't accept that key."
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return False, "The provider didn't accept that key — check it and try again."
+        # 3xx (redirect we refused) or any other unexpected status: reachable-failure.
         return False, "The provider couldn't be reached just now — try again in a minute."
     except (urllib.error.URLError, OSError):
         return False, "The provider couldn't be reached just now — try again in a minute."
@@ -289,9 +311,39 @@ def validate_key(provider: str, key: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _assert_tmpfs_target(env_path: str) -> None:
+    """Fail closed unless the write will land on tmpfs, never the volume.
+
+    $HERMES_HOME/.env is normally a SYMLINK the entrypoint points into tmpfs, so
+    a credential write follows the link off the persistent volume. But if .env
+    is a real file (or absent, so realpath returns the volume path), writing the
+    key there would put PLAINTEXT ON THE VOLUME — the one outcome this
+    architecture forbids. The entrypoint always makes the symlink first, so this
+    is latent; this guard makes the code refuse to rely on that silently.
+
+    Safe iff: env_path is itself a symlink (the tmpfs shape), OR its resolved
+    target is OUTSIDE $HERMES_HOME (i.e. already on the tmpfs mount, not the
+    volume). Anything else — a plain file resolving inside the volume — is
+    refused with a clear error the caller turns into a friendly message.
+    """
+    if os.path.islink(env_path):
+        return  # the expected tmpfs symlink shape
+    hermes_home = os.environ.get("HERMES_HOME") or "/opt/data"
+    target = os.path.realpath(env_path)
+    home_real = os.path.realpath(hermes_home)
+    try:
+        inside_volume = os.path.commonpath([target, home_real]) == home_real
+    except ValueError:
+        # Different roots/drives => not under the volume => on some other mount.
+        inside_volume = False
+    if inside_volume:
+        raise RuntimeError("refusing to write credential to non-tmpfs path")
+
+
 def env_upsert(env_path: str, updates: dict) -> None:
     """Idempotent last-assignment-wins upsert, same semantics as the
     entrypoint's env_put, written to the RESOLVED target atomically (0600)."""
+    _assert_tmpfs_target(env_path)  # fail closed before touching the target
     target = os.path.realpath(env_path)
     try:
         with open(target, "r", encoding="utf-8") as fh:
