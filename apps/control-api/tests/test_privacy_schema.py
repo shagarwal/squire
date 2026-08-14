@@ -127,6 +127,9 @@ EXPECTED_COLUMNS = {
         "hindsight_ops_processing",
         "hindsight_ops_failed",
         "backup_last_success_age_seconds",
+        # 1C backstop: ONE tenant-reported boolean ("my owner connected an
+        # LLM"). Not derived from anything a user said; carries no credential.
+        "llm_connected",
     },
     # `token` and `webhook_secret` are OUR pool-bot credentials (BotFather +
     # self-generated), not the user's -- control-api cannot call setWebhook without

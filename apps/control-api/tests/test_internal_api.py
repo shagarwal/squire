@@ -417,3 +417,50 @@ class TestLlmConnected:
             headers=auth,
         )
         assert response.status_code == 422
+
+
+class TestHeartbeatReconciliation:
+    @respx.mock
+    def test_connected_beat_with_live_trial_key_revokes_it(self, client, auth, session):
+        session.add(Tenant(id="t-beat-1", email="beat@example.com",
+                           status=TenantStatus.RUNNING,
+                           trial_key_alias="squire-trial-t-beat-1",
+                           trial_key_active=True))
+        session.commit()
+
+        delete = respx.post("https://trial-proxy.squire.test/key/delete").mock(
+            return_value=httpx.Response(200, json={"deleted_keys": 1})
+        )
+        response = client.post(
+            "/internal/heartbeat",
+            json={"tenant_id": "t-beat-1", "uptime_seconds": 10,
+                  "gateway_up": True, "hindsight_up": True,
+                  "llm_connected": True},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert delete.called, "backstop must revoke the orphaned trial key"
+
+        with db.session_scope() as s:
+            assert s.get(Tenant, "t-beat-1").trial_key_active is False
+
+    @respx.mock
+    def test_unconnected_beat_leaves_the_trial_key_alone(self, client, auth, session):
+        session.add(Tenant(id="t-beat-2", email="beat2@example.com",
+                           status=TenantStatus.RUNNING,
+                           trial_key_alias="squire-trial-t-beat-2",
+                           trial_key_active=True))
+        session.commit()
+
+        delete = respx.post("https://trial-proxy.squire.test/key/delete").mock(
+            return_value=httpx.Response(200, json={"deleted_keys": 1})
+        )
+        response = client.post(
+            "/internal/heartbeat",
+            json={"tenant_id": "t-beat-2", "uptime_seconds": 10,
+                  "gateway_up": True, "hindsight_up": True,
+                  "llm_connected": False},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert not delete.called

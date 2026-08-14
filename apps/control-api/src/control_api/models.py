@@ -210,6 +210,9 @@ class Heartbeat(SQLModel, table=True):
     gateway_up: bool = False
     hindsight_up: bool = False
 
+    # 1C: tenant-reported connected flag (see schemas.HeartbeatRequest).
+    llm_connected: bool | None = None
+
     # Gauges for the G1 economics gate: RSS is container-wide (cgroup), the volume
     # figures come from statvfs on the mount.
     memory_rss_mb: int | None = None

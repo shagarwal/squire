@@ -204,6 +204,7 @@ PAYLOAD_FIELDS = {
     "hindsight_ops_processing",
     "hindsight_ops_failed",
     "backup_last_success_age_seconds",
+    "llm_connected",
 }
 
 #: control-api's HeartbeatRequest caps image_ref at 512 characters. One
@@ -321,6 +322,39 @@ def backup_age_seconds() -> int | None:
     return max(0, int(time.time()) - written)
 
 
+def llm_connected() -> bool:
+    """True once the tenant holds its owner's own LLM credential (1C).
+
+    The RECONCILIATION BACKSTOP for the connect flow: if the pipeline's
+    /internal/llm-connected call was lost, control-api sees this flag against
+    a still-active trial key on the next beat and revokes it then.
+
+    Privacy discipline: this reads credential FILES, which nothing else in
+    this program does — so what it may extract is pinned hard. It checks key
+    NAMES against the same marker set squire-hindsight-env.sh uses, plus the
+    auth.json token artifact the .env-only markers famously miss, and emits
+    ONE BOOLEAN. No value, length, or prefix ever leaves this function.
+    """
+    markers = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+    try:
+        with open(os.path.join(HERMES_HOME, ".env"), encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, value = line.partition("=")
+                if sep and key.strip() in markers and value.strip():
+                    return True
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(HERMES_HOME, "auth.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        tokens = data.get("tokens") if isinstance(data, dict) else None
+        if isinstance(tokens, dict) and tokens.get("access_token"):
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def hindsight_ops() -> dict:
     """Queue depth in Hindsight's `async_operations`, by status.
 
@@ -379,6 +413,7 @@ def build_payload() -> dict:
         "uptime_seconds": int(time.monotonic() - START_MONOTONIC),
         "gateway_up": gateway_up(),
         "hindsight_up": hindsight_up(),
+        "llm_connected": llm_connected(),
     }
     if IMAGE_REF:
         payload["image_ref"] = IMAGE_REF[:MAX_IMAGE_REF_LEN]

@@ -219,6 +219,11 @@ class HeartbeatRequest(BaseModel):
         default=None, ge=0, le=_MAX_COUNTER
     )
 
+    #: 1C reconciliation backstop: the tenant's own "owner has connected an
+    #: LLM" flag, derived from credential artifacts on the tenant side. A
+    #: True against a still-active trial key triggers revocation.
+    llm_connected: bool | None = None
+
 
 class HeartbeatResponse(BaseModel):
     """Deliberately tiny: the tenant has no use for a fleet view."""

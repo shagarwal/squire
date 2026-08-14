@@ -1148,7 +1148,7 @@ def record_heartbeat(session: Session, fields: dict) -> Heartbeat:
     function never sees free-form input.
     """
     tenant_id = fields["tenant_id"]
-    get_tenant(session, tenant_id)  # raises TenantNotFound -> 404
+    tenant = get_tenant(session, tenant_id)  # raises TenantNotFound -> 404
 
     row = session.get(Heartbeat, tenant_id)
     if row is None:
@@ -1160,6 +1160,14 @@ def record_heartbeat(session: Session, fields: dict) -> Heartbeat:
     session.add(row)
     session.commit()
     session.refresh(row)
+    # 1C reconciliation backstop: a converted tenant whose
+    # /internal/llm-connected call was lost still gets its trial key revoked
+    # on the next beat. Idempotent (revoke_trial_key no-ops once inactive);
+    # worst case on a missed beat, the trial cap still bounds spend.
+    if fields.get("llm_connected") and tenant.trial_key_active:
+        log.info("heartbeat reconciliation: tenant %s connected an LLM but the "
+                 "trial key is still active — revoking", tenant_id)
+        revoke_trial_key(session, tenant_id)
     return row
 
 
