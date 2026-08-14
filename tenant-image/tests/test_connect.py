@@ -155,6 +155,171 @@ finally:
     out = proc.stdout.read() if proc.stdout else ""
     check("nonce never appears in shim logs", live not in out, out[-300:])
 
+print("== POST /connect/<nonce>: validate -> store -> consume ==")
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+import threading            # noqa: E402
+import urllib.parse         # noqa: E402
+
+FAKE_PROVIDER_PORT = 18082
+provider_calls = []
+
+
+class FakeProvider(BaseHTTPRequestHandler):
+    """Answers both providers' models-list validation endpoints."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        return
+
+    def do_GET(self):
+        provider_calls.append({
+            "path": self.path,
+            "bearer": self.headers.get("Authorization"),
+            "x_api_key": self.headers.get("x-api-key"),
+            "version": self.headers.get("anthropic-version"),
+        })
+        # /openai/ok and /anthropic/ok accept; /openai/bad rejects with 401.
+        status = 401 if "/bad" in self.path else 200
+        body = b'{"data": []}'
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+fake_provider = ThreadingHTTPServer(("127.0.0.1", FAKE_PROVIDER_PORT), FakeProvider)
+fake_provider.daemon_threads = True
+threading.Thread(target=fake_provider.serve_forever, daemon=True).start()
+
+
+def shim_post(nonce, provider, key, host=PUB, port=SHIM_PORT):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    form = urllib.parse.urlencode({"provider": provider, "api_key": key}).encode()
+    conn.request("POST", f"/connect/{nonce}", body=form, headers={
+        "Host": host,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": str(len(form)),
+    })
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", "replace")
+    conn.close()
+    return resp.status, body
+
+
+home2 = tempfile.mkdtemp()
+state2 = os.path.join(home2, ".squire")
+# The real container's .env is a SYMLINK into tmpfs. Reproduce that shape so
+# the test proves credential writes follow the link instead of replacing it
+# with a plaintext file on the "volume".
+tmpfs = tempfile.mkdtemp()
+open(os.path.join(tmpfs, ".env"), "w").close()
+os.symlink(os.path.join(tmpfs, ".env"), os.path.join(home2, ".env"))
+
+
+def start_shim2(**overrides):
+    env = dict(os.environ)
+    env.update({
+        "PORT": str(SHIM_PORT),
+        "HERMES_HOME": home2,
+        "SQUIRE_STATE_DIR": state2,
+        "SQUIRE_PUBLIC_DOMAIN": PUB,
+        "TELEGRAM_WEBHOOK_SECRET": "s3cr3t",
+        "TENANT_ID": "t-connect-test",
+        "SQUIRE_CONNECT_OPENAI_VALIDATE_URL":
+            f"http://127.0.0.1:{FAKE_PROVIDER_PORT}/openai/ok",
+        "SQUIRE_CONNECT_ANTHROPIC_VALIDATE_URL":
+            f"http://127.0.0.1:{FAKE_PROVIDER_PORT}/anthropic/ok",
+        # Task 6 wires the full pipeline; these keep restart/notify inert here.
+        "SQUIRE_SUPERVISORCTL": "/bin/true",
+        "CONTROL_API_URL": "",
+    })
+    env.update(overrides)
+    proc = subprocess.Popen([sys.executable, SHIM], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{SHIM_PORT}/health", timeout=2)
+            return proc
+        except Exception:
+            time.sleep(0.25)
+    raise AssertionError("shim never became ready")
+
+
+OPENAI_KEY = "sk-test-openai-key-0123456789abcdef0123"
+ANTHROPIC_KEY = "sk-ant-api03-test-key-0123456789abcdef"
+
+proc = start_shim2()
+try:
+    # --- happy path: OpenAI key -------------------------------------------
+    n1 = squire_connect.mint_nonce(state2)
+    status, body = shim_post(n1, "openai", OPENAI_KEY)
+    check("valid OpenAI key -> done page", status == 200 and "back to Telegram" in body,
+          (status, body[:300]))
+    check("provider was actually called to validate",
+          any(c["path"] == "/openai/ok" and c["bearer"] == f"Bearer {OPENAI_KEY}"
+              for c in provider_calls), provider_calls)
+    env_text = open(os.path.join(tmpfs, ".env")).read()
+    check("key stored in .env", f"OPENAI_API_KEY={OPENAI_KEY}" in env_text, env_text)
+    check(".env is still a symlink (write followed it to tmpfs)",
+          os.path.islink(os.path.join(home2, ".env")), "symlink was replaced")
+    check("nonce consumed by success", squire_connect.find_nonce(state2, n1) is None)
+
+    # A reused nonce gets the friendly invalid page and stores nothing.
+    before = env_text
+    status, body = shim_post(n1, "openai", "sk-test-second-key-000000000000000000")
+    check("reused nonce -> invalid page", status == 200 and "ask your" in body.lower(),
+          (status, body[:200]))
+    check("reused nonce stored nothing",
+          open(os.path.join(tmpfs, ".env")).read() == before, "env changed")
+
+    # --- invalid key: stated plainly, nothing stored, nonce STILL valid ---
+    # The fake provider 401s on the /bad path, so restart the shim pointing
+    # the OpenAI validation URL at it.
+    provider_calls.clear()
+    n2 = squire_connect.mint_nonce(state2)
+    proc.terminate(); proc.wait(timeout=10)
+    proc = start_shim2(SQUIRE_CONNECT_OPENAI_VALIDATE_URL=
+                       f"http://127.0.0.1:{FAKE_PROVIDER_PORT}/openai/bad")
+    status, body = shim_post(n2, "openai", "sk-test-a-key-the-provider-rejects-000")
+    check("rejected key -> plain statement on the form page",
+          status == 200 and "didn't accept" in body, (status, body[:300]))
+    check("rejected key stored nothing",
+          "rejects" not in open(os.path.join(tmpfs, ".env")).read(), "stored a bad key")
+    check("nonce still valid after a rejected key",
+          squire_connect.find_nonce(state2, n2) is not None)
+
+    # --- happy path: Anthropic key (fresh shim, back on the OK endpoint) --
+    proc.terminate(); proc.wait(timeout=10)
+    proc = start_shim2()
+    status, body = shim_post(n2, "anthropic", ANTHROPIC_KEY)
+    check("valid Anthropic key -> done page", status == 200 and "Anthropic" in body,
+          (status, body[:300]))
+    env_text = open(os.path.join(tmpfs, ".env")).read()
+    check("Anthropic key stored", f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}" in env_text, env_text)
+    check("direct base URL stored with it (overrides the trial proxy)",
+          "ANTHROPIC_BASE_URL=https://api.anthropic.com" in env_text, env_text)
+    check("anthropic validation sent x-api-key + version header",
+          any(c["path"] == "/anthropic/ok" and c["x_api_key"] == ANTHROPIC_KEY
+              and c["version"] for c in provider_calls), provider_calls)
+
+    # --- abuse limit: repeated misses back off ----------------------------
+    got_429 = False
+    for i in range(8):
+        status, _ = shim_post("not-a-nonce", "openai", f"sk-test-guess-{i:030d}")
+        if status == 429:
+            got_429 = True
+            break
+    check("repeated nonce misses from one IP hit a 429 backoff", got_429, status)
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    out = proc.stdout.read() if proc.stdout else ""
+    check("no credential material in shim logs",
+          OPENAI_KEY not in out and ANTHROPIC_KEY not in out, out[-300:])
+    fake_provider.shutdown()
+    fake_provider.server_close()
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

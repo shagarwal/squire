@@ -54,6 +54,7 @@ import os
 import socket
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -199,6 +200,35 @@ def counters_snapshot() -> dict:
         return dict(_COUNTERS)
 
 
+# --- /connect abuse limiting -------------------------------------------------
+# Per-IP failure backoff for the connect page. In-memory (resets on restart),
+# which matches the threat: online guessing of a live nonce. Nonce lookups are
+# already constant-time; this bounds the request RATE.
+_CONNECT_FAILS: dict = {}
+_CONNECT_FAILS_LOCK = threading.Lock()
+CONNECT_MAX_FAILS = 5
+CONNECT_LOCKOUT_SECONDS = 60.0
+
+
+def _connect_throttled(ip: str) -> bool:
+    import time as _time
+    with _CONNECT_FAILS_LOCK:
+        count_, until = _CONNECT_FAILS.get(ip, (0, 0.0))
+        return count_ >= CONNECT_MAX_FAILS and _time.monotonic() < until
+
+
+def _connect_record_failure(ip: str) -> None:
+    import time as _time
+    with _CONNECT_FAILS_LOCK:
+        count_, _until = _CONNECT_FAILS.get(ip, (0, 0.0))
+        _CONNECT_FAILS[ip] = (count_ + 1, _time.monotonic() + CONNECT_LOCKOUT_SECONDS)
+
+
+def _connect_clear(ip: str) -> None:
+    with _CONNECT_FAILS_LOCK:
+        _CONNECT_FAILS.pop(ip, None)
+
+
 def _authorised(headers) -> bool:
     """True if the request carries a DELIVERY credential we recognise.
 
@@ -320,6 +350,68 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_connect_post(self, path: str) -> None:
+        """POST /connect/<nonce>: validate the pasted key with the provider,
+        store it, consume the nonce, kick the connected pipeline. An invalid
+        key is stated plainly, stores nothing, and leaves the nonce live."""
+        if squire_connect is None:
+            self._respond(404, {"error": "not found"})
+            return
+
+        ip = (self.client_address or ("",))[0]
+        if _connect_throttled(ip):
+            log("throttled /connect attempt")
+            self._respond(429, {"error": "too many attempts"},
+                          extra_headers=(("Retry-After", "60"),))
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._respond(400, {"error": "bad Content-Length"})
+            return
+        if length <= 0 or length > 64 * 1024:
+            self._respond(413, {"error": "body missing or too large"})
+            return
+        try:
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._respond(400, {"error": "bad form body"})
+            return
+        provider = (form.get("provider") or [""])[0]
+        api_key = (form.get("api_key") or [""])[0].strip()
+
+        candidate = path[len("/connect/"):]
+        if squire_connect.find_nonce(None, candidate) is None:
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_invalid_page())
+            return
+        if provider not in ("openai", "anthropic") or len(api_key) < 20:
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_connect_page(
+                candidate, error="That didn't look like a key — pick a provider and paste the whole key."))
+            return
+
+        ok, message = squire_connect.validate_key(provider, api_key)
+        if not ok:
+            # Stated plainly, nothing stored, nonce still valid (spec).
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_connect_page(candidate, error=message))
+            return
+
+        # Store FIRST, then consume: a consume that lost a race after a store
+        # is harmless (same credential), while the reverse order could burn
+        # the nonce with nothing saved.
+        squire_connect.store_api_key(provider, api_key)
+        squire_connect.consume_nonce(None, candidate)
+        _connect_clear(ip)
+        # Never log the provider *response* or the key; the provider NAME is fine.
+        log(f"connect: stored {provider} credential; nonce consumed")
+
+        # Task 6 wires squire_connect.run_connected_pipeline here (background
+        # thread: a gateway restart takes ~45s and must not hold the browser).
+        self._respond_html(200, squire_connect.render_done_page(provider))
+
     def do_GET(self):  # noqa: N802 - stdlib naming
         path = self.path.split("?", 1)[0]
         # Public-domain gate: with a domain attached, only /connect/* is public.
@@ -388,6 +480,10 @@ class Handler(BaseHTTPRequestHandler):
                 count("updates_rejected")
                 self._respond(403, {"error": "forbidden"})
                 return
+
+        if path.startswith("/connect/"):
+            self._handle_connect_post(path)
+            return
 
         if path != WEBHOOK_PATH:
             self._respond(404, {"error": "not found"})

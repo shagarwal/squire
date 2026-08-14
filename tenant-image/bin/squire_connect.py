@@ -232,3 +232,102 @@ def render_done_page(provider: str) -> str:
 <p><strong>Head back to Telegram</strong> — your agent will confirm there in a
 moment.</p>
 </body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Provider key validation — one cheap authenticated GET per provider.
+# URLs are env-overridable ONLY so the Docker-free tests can fake the
+# provider; production never sets these variables.
+# ---------------------------------------------------------------------------
+import urllib.error
+import urllib.request
+
+VALIDATE_TIMEOUT = 20.0
+
+
+def _validate_urls() -> dict:
+    return {
+        "openai": os.environ.get(
+            "SQUIRE_CONNECT_OPENAI_VALIDATE_URL", "https://api.openai.com/v1/models"
+        ),
+        "anthropic": os.environ.get(
+            "SQUIRE_CONNECT_ANTHROPIC_VALIDATE_URL", "https://api.anthropic.com/v1/models"
+        ),
+    }
+
+
+def validate_key(provider: str, key: str) -> tuple[bool, str]:
+    """(ok, user_facing_message). The message is OUR fixed copy — provider
+    response bodies are never reflected to the page (no injection surface)."""
+    urls = _validate_urls()
+    if provider not in urls:
+        return False, "Unknown provider."
+    if provider == "openai":
+        headers = {"Authorization": f"Bearer {key}"}
+    else:
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    request = urllib.request.Request(urls[provider], headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=VALIDATE_TIMEOUT) as response:
+            if 200 <= response.status < 300:
+                return True, ""
+            return False, "The provider didn't accept that key."
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, "The provider didn't accept that key — check it and try again."
+        return False, "The provider couldn't be reached just now — try again in a minute."
+    except (urllib.error.URLError, OSError):
+        return False, "The provider couldn't be reached just now — try again in a minute."
+
+
+# ---------------------------------------------------------------------------
+# Credential storage. $HERMES_HOME/.env and auth.json are SYMLINKS into tmpfs
+# (squire-entrypoint.sh §4): every write resolves the link first, because an
+# atomic replace of the symlink path would swap the link for a plaintext file
+# ON THE VOLUME — the one thing this architecture forbids. secrets-sync then
+# seals the tmpfs change and re-wires Hindsight; nothing here duplicates that.
+# ---------------------------------------------------------------------------
+
+
+def env_upsert(env_path: str, updates: dict) -> None:
+    """Idempotent last-assignment-wins upsert, same semantics as the
+    entrypoint's env_put, written to the RESOLVED target atomically (0600)."""
+    target = os.path.realpath(env_path)
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        lines = []
+    kept = [
+        line for line in lines
+        if line.split("=", 1)[0] not in updates
+    ]
+    for key, value in updates.items():
+        kept.append(f"{key}={value}")
+    _atomic_write_0600(target, ("\n".join(kept) + "\n").encode("utf-8"))
+
+
+ANTHROPIC_DIRECT_BASE_URL = "https://api.anthropic.com"
+CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+
+def store_api_key(provider: str, key: str, hermes_home: str | None = None) -> None:
+    """Write the user's own key into the tenant's .env.
+
+    Anthropic also gets an explicit direct base URL: the tenant's process env
+    still carries the trial proxy's ANTHROPIC_BASE_URL, and .env must override
+    it as a whole configuration (the exact per-source rule
+    squire-hindsight-env.sh documents) so the user's key is never paired with
+    our proxy.
+    """
+    home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+    env_path = os.path.join(home, ".env")
+    if provider == "anthropic":
+        env_upsert(env_path, {
+            "ANTHROPIC_API_KEY": key,
+            "ANTHROPIC_BASE_URL": ANTHROPIC_DIRECT_BASE_URL,
+        })
+    elif provider == "openai":
+        env_upsert(env_path, {"OPENAI_API_KEY": key})
+    else:
+        raise ValueError(f"store_api_key: unknown provider {provider!r}")
