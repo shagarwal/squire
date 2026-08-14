@@ -455,8 +455,12 @@ class Handler(BaseHTTPRequestHandler):
         # Never log the provider *response* or the key; the provider NAME is fine.
         log(f"connect: stored {provider} credential; nonce consumed")
 
-        # Task 6 wires squire_connect.run_connected_pipeline here (background
-        # thread: a gateway restart takes ~45s and must not hold the browser).
+        # Background thread: a supervisord gateway restart can take ~45s and
+        # must not hold the browser's response open that long.
+        threading.Thread(
+            target=squire_connect.run_connected_pipeline, args=(provider,),
+            daemon=True,
+        ).start()
         self._respond_html(200, squire_connect.render_done_page(provider))
 
     def do_GET(self):  # noqa: N802 - stdlib naming

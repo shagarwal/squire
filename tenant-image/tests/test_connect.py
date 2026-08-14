@@ -412,6 +412,113 @@ finally:
     fake_provider.shutdown()
     fake_provider.server_close()
 
+print("== connected pipeline: switch model -> restart gateway -> notify ==")
+home3 = tempfile.mkdtemp()
+# A config.yaml with the trial model line plus other keys that MUST survive.
+config_path = os.path.join(home3, "config.yaml")
+open(config_path, "w").write(
+    'model: "anthropic:claude-sonnet-5"\n'
+    "hooks:\n  pre_llm_call: something-load-bearing\n"
+    "timezone: UTC\n"
+)
+open(os.path.join(home3, ".env"), "w").close()
+
+# Fake supervisorctl: records its argv so ordering and arguments are provable.
+bindir = tempfile.mkdtemp()
+ctl_log = os.path.join(bindir, "ctl.log")
+ctl = os.path.join(bindir, "supervisorctl")
+open(ctl, "w").write(f"#!/bin/sh\necho \"$@\" >> {ctl_log}\n")
+os.chmod(ctl, 0o755)
+
+# Fake control-api capturing /internal/llm-connected.
+notified = []
+
+
+class FakeControl(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        return
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        notified.append({"path": self.path,
+                         "auth": self.headers.get("Authorization"),
+                         "payload": json.loads(self.rfile.read(n) or b"{}")})
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
+CONTROL_PORT = 18084
+control = ThreadingHTTPServer(("127.0.0.1", CONTROL_PORT), FakeControl)
+control.daemon_threads = True
+threading.Thread(target=control.serve_forever, daemon=True).start()
+
+os.environ["SQUIRE_SUPERVISORCTL"] = ctl
+os.environ["SQUIRE_SUPERVISORD_CONF"] = "/tmp/fake-supervisord.conf"
+os.environ["CONTROL_API_URL"] = f"http://127.0.0.1:{CONTROL_PORT}"
+os.environ["INTERNAL_API_TOKEN"] = "internal-tok-test"
+os.environ["TENANT_ID"] = "t-pipeline-test"
+
+order = []
+real_switch = squire_connect.switch_gateway_model
+real_restart = squire_connect.restart_gateway
+real_notify = squire_connect.notify_control_api
+squire_connect.switch_gateway_model = lambda p, h=None: (order.append("switch"), real_switch(p, h))[1]
+squire_connect.restart_gateway = lambda: (order.append("restart"), real_restart())[1]
+squire_connect.notify_control_api = lambda p: (order.append("notify"), real_notify(p))[1]
+try:
+    squire_connect.run_connected_pipeline("openai", hermes_home=home3)
+finally:
+    squire_connect.switch_gateway_model = real_switch
+    squire_connect.restart_gateway = real_restart
+    squire_connect.notify_control_api = real_notify
+
+check("pipeline order is switch -> restart -> notify",
+      order == ["switch", "restart", "notify"], order)
+
+config_text = open(config_path).read()
+check("model line rewritten to the OpenAI default",
+      'model: "openai:gpt-4.1"' in config_text, config_text)
+check("the rest of config.yaml survived (targeted line edit, no YAML round-trip)",
+      "pre_llm_call: something-load-bearing" in config_text
+      and "timezone: UTC" in config_text, config_text)
+check("gateway restarted via supervisorctl",
+      os.path.exists(ctl_log) and "restart gateway" in open(ctl_log).read(),
+      open(ctl_log).read() if os.path.exists(ctl_log) else "no ctl call")
+check("control-api notified on the pinned route",
+      notified and notified[0]["path"] == "/internal/llm-connected", notified)
+check("notify payload is exactly {tenant_id, provider}",
+      notified and notified[0]["payload"] == {"tenant_id": "t-pipeline-test",
+                                              "provider": "openai"}, notified)
+check("notify carries the internal bearer",
+      notified and notified[0]["auth"] == "Bearer internal-tok-test", notified)
+
+# Model choice per provider (env-overridable, defaults locked here).
+open(config_path, "w").write('model: "anthropic:claude-sonnet-5"\n')
+squire_connect.switch_gateway_model("chatgpt", home3)
+check("chatgpt switches to the codex model",
+      'model: "openai:gpt-5-codex"' in open(config_path).read(), open(config_path).read())
+open(config_path, "w").write('model: "anthropic:claude-sonnet-5"\n')
+squire_connect.switch_gateway_model("anthropic", home3)
+check("anthropic keeps the sonnet model (direct, no proxy)",
+      'model: "anthropic:claude-sonnet-5"' in open(config_path).read())
+
+# A notify failure must not blow up the pipeline (heartbeat backstop covers it).
+control.shutdown()
+control.server_close()
+notified.clear()
+try:
+    squire_connect.run_connected_pipeline("openai", hermes_home=home3)
+    check("pipeline survives an unreachable control-api", True)
+except Exception as exc:  # noqa: BLE001
+    check("pipeline survives an unreachable control-api", False, repr(exc))
+for var in ("SQUIRE_SUPERVISORCTL", "SQUIRE_SUPERVISORD_CONF",
+            "CONTROL_API_URL", "INTERNAL_API_TOKEN", "TENANT_ID"):
+    os.environ.pop(var, None)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

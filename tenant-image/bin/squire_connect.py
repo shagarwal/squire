@@ -383,3 +383,99 @@ def store_api_key(provider: str, key: str, hermes_home: str | None = None) -> No
         env_upsert(env_path, {"OPENAI_API_KEY": key})
     else:
         raise ValueError(f"store_api_key: unknown provider {provider!r}")
+
+
+# ---------------------------------------------------------------------------
+# Connected pipeline (shared by the /connect page and the device-flow CLI):
+#   store credential (caller already did) -> switch the gateway model ->
+#   restart the gateway -> tell control-api so the trial key is revoked.
+# Every step is independently non-fatal: a stored credential with a failed
+# notify is reconciled by the heartbeat backstop; failing the whole pipeline
+# would leave the USER's success page lying.
+# ---------------------------------------------------------------------------
+import re
+import subprocess
+
+
+def _gateway_model_for(provider: str) -> str:
+    """Env-overridable so a model rename never needs an image rebuild.
+    anthropic keeps the trial's model id — same model, now direct + unmetered."""
+    defaults = {
+        "openai": "openai:gpt-4.1",
+        "chatgpt": "openai:gpt-5-codex",
+        "anthropic": "anthropic:claude-sonnet-5",
+    }
+    env_names = {
+        "openai": "SQUIRE_CONNECT_MODEL_OPENAI",
+        "chatgpt": "SQUIRE_CONNECT_MODEL_CHATGPT",
+        "anthropic": "SQUIRE_CONNECT_MODEL_ANTHROPIC",
+    }
+    return os.environ.get(env_names.get(provider, ""), "") or defaults[provider]
+
+
+def switch_gateway_model(provider: str, hermes_home: str | None = None) -> bool:
+    """Anchored per-line rewrite of the `model:` line ONLY — the same targeted
+    discipline as the concierge hook's timezone command, and for the same
+    reason: config.yaml also carries the hooks block that makes onboarding
+    work, and a YAML round-trip is how that gets silently dropped."""
+    home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+    config_path = os.path.join(home, "config.yaml")
+    model = _gateway_model_for(provider)
+    try:
+        text = open(config_path, "r", encoding="utf-8").read()
+        new_text = re.sub(r'(?m)^model:.*$', f'model: "{model}"', text, count=1)
+        if new_text != text:
+            _atomic_write_0600(os.path.realpath(config_path), new_text.encode("utf-8"))
+        return True
+    except OSError:
+        print("[squire-connect] could not rewrite config.yaml model line", flush=True)
+        return False
+
+
+def restart_gateway() -> bool:
+    """supervisorctl restart gateway. Shutdown notices are already silenced
+    (SQUIRE_SHUTDOWN_NOTICES image default 0), so this is invisible in chat;
+    the agent's celebration message doubles as the 'we're back' signal."""
+    ctl = os.environ.get("SQUIRE_SUPERVISORCTL", "/opt/squire/venv/bin/supervisorctl")
+    conf = os.environ.get("SQUIRE_SUPERVISORD_CONF", "/opt/squire/supervisord.conf")
+    try:
+        result = subprocess.run([ctl, "-c", conf, "restart", "gateway"],
+                                capture_output=True, timeout=180, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        print("[squire-connect] gateway restart failed (will pick up on next boot)", flush=True)
+        return False
+
+
+def notify_control_api(provider: str) -> bool:
+    """POST /internal/llm-connected {tenant_id, provider} with the internal
+    bearer. Provider NAME only — never credential material. Non-fatal: the
+    heartbeat's llm_connected marker is the reconciliation backstop."""
+    base = (os.environ.get("CONTROL_API_URL") or "").rstrip("/")
+    token = os.environ.get("INTERNAL_API_TOKEN") or ""
+    tenant_id = os.environ.get("TENANT_ID") or ""
+    if not (base and token and tenant_id):
+        return False
+    request = urllib.request.Request(
+        f"{base}/internal/llm-connected",
+        data=json.dumps({"tenant_id": tenant_id, "provider": provider}).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError):
+        print("[squire-connect] llm-connected call failed; heartbeat backstop will reconcile", flush=True)
+        return False
+
+
+def run_connected_pipeline(provider: str, hermes_home: str | None = None) -> None:
+    """The conversion moment. Order matters: the model must point at the new
+    provider BEFORE the gateway restarts (or it boots back onto the trial
+    model), and the trial key is revoked only AFTER the tenant can serve
+    without it."""
+    switch_gateway_model(provider, hermes_home)
+    restart_gateway()
+    notify_control_api(provider)

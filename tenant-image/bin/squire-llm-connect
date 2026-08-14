@@ -170,7 +170,7 @@ def cmd_poll(device_auth_id: str, user_code: str, interval: str) -> int:
         return 1
 
     store_chatgpt_tokens(tokens)
-    # Task 6 wires squire_connect.run_connected_pipeline("chatgpt") here.
+    squire_connect.run_connected_pipeline("chatgpt")
     write_status("connected", provider="chatgpt")
     return 0
 
