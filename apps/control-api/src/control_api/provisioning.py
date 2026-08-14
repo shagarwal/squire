@@ -440,6 +440,24 @@ def _step_attach_volume(session: Session, tenant: Tenant, clients: ProvisionClie
     _touch(session, tenant)
 
 
+def _step_create_domain(session: Session, tenant: Tenant, clients: ProvisionClients) -> None:
+    """Public Railway domain for the 1C /connect page (design decision 3:
+    Railway-generated domains for alpha; custom domains are Phase 1 polish).
+
+    Probe-first, like attach_volume: serviceDomainCreate's idempotency is
+    unverified, and a retry must adopt rather than duplicate. The domain is
+    deliberately NOT persisted on the tenant row -- _step_set_variables reads
+    it back from Railway by name, and no control-plane query path needs it.
+    Ordering before DEPLOY is load-bearing: Railway stamps
+    RAILWAY_PUBLIC_DOMAIN into the container at deploy time, so the domain
+    must exist before the first deploy runs.
+    """
+    if clients.railway.get_service_domain(tenant.railway_service_id):
+        return
+    clients.railway.create_service_domain(tenant.railway_service_id)
+    _touch(session, tenant)
+
+
 def _mint_trial_key(session: Session, tenant: Tenant, clients: ProvisionClients) -> str | None:
     """Mint (or re-mint) this tenant's trial key and stash the material in memory.
 
@@ -554,6 +572,14 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # with patch 006 (identity-refresh loop off). The image default stays 300
         # for dev/self-hosted, where nothing sleeps.
         "SQUIRE_HEARTBEAT_INTERVAL": str(settings.tenant_heartbeat_interval_seconds),
+        # 1C: the tenant's public domain, written explicitly so the connect
+        # CLI never depends on Railway's deploy-time RAILWAY_PUBLIC_DOMAIN
+        # injection actually happening. Read back by name from Railway (the
+        # domain is not stored in the control DB). Tenant code prefers
+        # RAILWAY_PUBLIC_DOMAIN and falls back to this.
+        "SQUIRE_PUBLIC_DOMAIN": clients.railway.get_service_domain(
+            tenant.railway_service_id
+        ) or "",
     }
     # 32 random bytes, base64. Generated only if we have not already set one: a
     # retry must not rotate the key out from under a volume already encrypted with
@@ -664,6 +690,7 @@ def _step_set_webhook(session: Session, tenant: Tenant, clients: ProvisionClient
 _STEP_HANDLERS = {
     ProvisionStep.CREATE_SERVICE: _step_create_service,
     ProvisionStep.ATTACH_VOLUME: _step_attach_volume,
+    ProvisionStep.CREATE_DOMAIN: _step_create_domain,
     ProvisionStep.CREATE_TRIAL_KEY: _step_create_trial_key,
     ProvisionStep.SET_VARIABLES: _step_set_variables,
     ProvisionStep.DEPLOY: _step_deploy,

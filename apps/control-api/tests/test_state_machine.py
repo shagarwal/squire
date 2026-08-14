@@ -101,6 +101,9 @@ def test_full_provision_happy_path(pool_bot, fake_railway):
         "serviceCreate",
         "project",  # idempotency probe: does a volume already exist?
         "volumeCreate",
+        "domains",  # CREATE_DOMAIN probe: does a public domain already exist?
+        "serviceDomainCreate",  # 1C: front door for the /connect page
+        "domains",  # SET_VARIABLES read-back: resolve SQUIRE_PUBLIC_DOMAIN by name
         "variableCollectionUpsert",
         "variables",  # read-back: confirm SQUIRE_DEK landed (names only)
         "serviceInstanceUpdate",  # sleepApplication (serverless sleep -- Gate G1)
@@ -143,6 +146,10 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         # which would keep every tenant awake past Railway's ~10-minute
         # outbound-quiet sleep window forever.
         "SQUIRE_HEARTBEAT_INTERVAL",
+        # 1C: the tenant's public domain (the /connect page's front door),
+        # written explicitly so the connect CLI never depends on Railway's
+        # deploy-time RAILWAY_PUBLIC_DOMAIN injection actually landing.
+        "SQUIRE_PUBLIC_DOMAIN",
     }
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN
@@ -1076,3 +1083,74 @@ def test_a_failed_job_can_be_retried_with_a_fresh_job(pool_bot, fake_railway):
         assert provisioning.get_tenant(s, tenant_id).status == TenantStatus.RUNNING
     # The retry created no duplicate Railway resources.
     assert fake_railway.operations().count("serviceCreate") == 1
+
+
+# ---------------------------------------------------------------------------
+# 1C: public domain per tenant (the /connect page's front door)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_domain_is_created_before_deploy_and_reaches_the_variables(pool_bot, fake_railway):
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.DONE, job.last_error
+
+    ops = fake_railway.operations()
+    assert "serviceDomainCreate" in ops
+    # Deploy-time injection of RAILWAY_PUBLIC_DOMAIN only works if the domain
+    # exists before the deploy -- the ordering IS the feature.
+    assert ops.index("serviceDomainCreate") < ops.index("serviceInstanceDeploy")
+
+    sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    domain = next(iter(fake_railway.service_domains.values()))
+    # Belt and braces: the domain is ALSO an explicit variable, so the tenant
+    # never depends on Railway's injection timing.
+    assert sent["SQUIRE_PUBLIC_DOMAIN"] == domain
+
+
+@respx.mock
+def test_domain_step_is_probe_first_idempotent(pool_bot, fake_railway):
+    """serviceDomainCreate's idempotency is UNVERIFIED against the live API, so
+    the step probes first -- the same discipline attach_volume earned the hard
+    way (volumeCreate silently duplicates)."""
+    mock_all(fake_railway)
+    with db.session_scope() as s:
+        tenant, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+        # Simulate a previous attempt that created service + domain, then died.
+        name = provisioning.service_name_for(tenant.id)
+    fake_railway.existing_services[name] = "svc-pre"
+    fake_railway.service_domains["svc-pre"] = "pre-existing.up.railway.app"
+
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.DONE, job.last_error
+
+    assert "serviceDomainCreate" not in fake_railway.operations(), (
+        "a pre-existing domain must be adopted, not duplicated"
+    )
+    sent = fake_railway.variables_for("variableCollectionUpsert")["input"]["variables"]
+    assert sent["SQUIRE_PUBLIC_DOMAIN"] == "pre-existing.up.railway.app"
+
+
+@respx.mock
+def test_domain_probe_failure_is_retryable(pool_bot, fake_railway):
+    mock_all(fake_railway)
+    fake_railway.fail_on.add("domains")
+    with db.session_scope() as s:
+        _, job = provisioning.create_tenant(s, email="alpha@squire.test")
+        job_id = job.id
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id)
+        assert job.status == JobStatus.PENDING
+        assert job.step == ProvisionStep.CREATE_DOMAIN
+
+    fake_railway.fail_on.discard("domains")
+    with db.session_scope() as s:
+        job = provisioning.advance_job(s, job_id, force=True)
+        assert job.status == JobStatus.DONE, job.last_error

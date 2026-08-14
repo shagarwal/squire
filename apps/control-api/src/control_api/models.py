@@ -53,6 +53,7 @@ class ProvisionStep(str, Enum):
 
     CREATE_SERVICE = "create_service"
     ATTACH_VOLUME = "attach_volume"
+    CREATE_DOMAIN = "create_domain"
     CREATE_TRIAL_KEY = "create_trial_key"
     SET_VARIABLES = "set_variables"
     DEPLOY = "deploy"
@@ -64,6 +65,7 @@ class ProvisionStep(str, Enum):
 PROVISION_STEP_ORDER: list[ProvisionStep] = [
     ProvisionStep.CREATE_SERVICE,
     ProvisionStep.ATTACH_VOLUME,
+    ProvisionStep.CREATE_DOMAIN,
     ProvisionStep.CREATE_TRIAL_KEY,
     ProvisionStep.SET_VARIABLES,
     ProvisionStep.DEPLOY,
