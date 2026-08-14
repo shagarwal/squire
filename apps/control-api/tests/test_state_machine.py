@@ -150,6 +150,11 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         # written explicitly so the connect CLI never depends on Railway's
         # deploy-time RAILWAY_PUBLIC_DOMAIN injection actually landing.
         "SQUIRE_PUBLIC_DOMAIN",
+        # 1C hardening: once a PUBLIC domain is attached to the shim port (for
+        # the /connect page), the Host-gate is the only lock on the webhook.
+        # Turning REQUIRE_AUTH on adds defense-in-depth -- the shim also demands
+        # the per-bot secret header, which ingress re-stamps on every forward.
+        "SQUIRE_WEBHOOK_REQUIRE_AUTH",
     }
     assert sent["TENANT_ID"] == tenant_id
     assert sent["TELEGRAM_BOT_TOKEN"] == BOT_TOKEN

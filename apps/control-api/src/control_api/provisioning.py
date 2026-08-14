@@ -545,6 +545,16 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # control-api remains the authoritative registrar (see _step_set_webhook).
         "TELEGRAM_WEBHOOK_URL": telegram_webhook_url(bot.id, settings),
         "TELEGRAM_WEBHOOK_SECRET": bot.webhook_secret,
+        # Defense-in-depth for the 1C public domain. Task 8 attaches a PUBLIC
+        # Railway domain to the shim port so the /connect page is reachable;
+        # that same domain exposes the webhook endpoint to the internet, where
+        # the Host-gate (which trusts the client-controllable Host header) would
+        # otherwise be the ONLY lock on forged Telegram updates. With this on,
+        # the shim ALSO requires the per-bot secret header on every delivery.
+        # This is safe because ingress re-stamps X-Telegram-Bot-Api-Secret-Token
+        # with this exact TELEGRAM_WEBHOOK_SECRET on every forward (verbatim and
+        # buffered-replay paths alike), so legitimate delivery still passes.
+        "SQUIRE_WEBHOOK_REQUIRE_AUTH": "true",
         "ANTHROPIC_BASE_URL": settings.effective_trial_base_url,
         "ANTHROPIC_API_KEY": trial_key or "",
         # The PRIVATE address when one is configured (see `control_api_internal_url`).
