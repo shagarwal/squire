@@ -98,6 +98,11 @@ except ImportError:  # pragma: no cover - defensive
     defang_start_command = None
     strip_start_payload = None
 
+try:
+    import squire_connect
+except ImportError:  # pragma: no cover - defensive; page 404s, webhook unaffected
+    squire_connect = None
+
 # Telegram updates are small; the largest realistic body is a long message with
 # a big entity list. 2 MiB is generous and stops an unbounded read.
 MAX_BODY = 2 * 1024 * 1024
@@ -305,14 +310,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _respond_html(self, status: int, html: str):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):  # noqa: N802 - stdlib naming
+        path = self.path.split("?", 1)[0]
         # Public-domain gate: with a domain attached, only /connect/* is public.
         if PUBLIC_DOMAIN and not _host_is_private(self.headers):
-            if not self.path.split("?", 1)[0].startswith("/connect/"):
+            if not path.startswith("/connect/"):
                 log("rejected public-Host GET outside /connect")
                 self._respond(403, {"error": "forbidden"})
                 return
-        if self.path.split("?", 1)[0] in ("/health", "/healthz"):
+        if path.startswith("/connect/"):
+            # One-time credential hand-off page (1C). GET never consumes the
+            # nonce — the user may reload before submitting.
+            if squire_connect is None:
+                self._respond(404, {"error": "not found"})
+                return
+            candidate = path[len("/connect/"):]
+            if squire_connect.find_nonce(None, candidate) is None:
+                # Same friendly page for invalid/expired/used — never an error
+                # dump, and never an oracle for which nonces exist.
+                self._respond_html(200, squire_connect.render_invalid_page())
+                return
+            self._respond_html(200, squire_connect.render_connect_page(candidate))
+            return
+        if path in ("/health", "/healthz"):
             self._respond(
                 200,
                 {
@@ -326,7 +356,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if self.path.split("?", 1)[0] == "/metrics":
+        if path == "/metrics":
             # LOOPBACK (or an authenticated caller) ONLY.
             #
             # This listener is bound to 0.0.0.0, and every tenant in the project

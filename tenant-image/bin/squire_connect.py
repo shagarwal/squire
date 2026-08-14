@@ -151,3 +151,84 @@ def consume_nonce(state_dir: str | None, candidate: str) -> bool:
     except OSError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Connect page (served by the webhook shim). Fully self-contained: inline CSS,
+# no JS, no external assets — the page must render with the strictest CSP and
+# without a single extra network fetch. Only the TWO API-key paths live here;
+# the ChatGPT-subscription path is a device-code flow that runs entirely in
+# chat + on the provider's own site (design decision 2), and there is NO
+# Claude-subscription path at all (OAuth spike: NO-GO, prohibited + enforced).
+# ---------------------------------------------------------------------------
+
+_PAGE_STYLE = """
+  body { font-family: system-ui, sans-serif; max-width: 26rem; margin: 8vh auto;
+         padding: 0 1rem; color: #1a1a1a; background: #fafafa; }
+  h1 { font-size: 1.3rem; } p { line-height: 1.5; }
+  label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+  input[type=password] { width: 100%; padding: 0.5rem; font-size: 1rem;
+         border: 1px solid #bbb; border-radius: 6px; }
+  .radio { margin: 0.35rem 0; font-weight: 400; }
+  button { margin-top: 1.25rem; padding: 0.6rem 1.4rem; font-size: 1rem;
+         border: 0; border-radius: 6px; background: #2456d6; color: #fff; }
+  .note { font-size: 0.85rem; color: #555; margin-top: 1.5rem; }
+  .error { color: #b00020; font-weight: 600; }
+"""
+
+
+def render_connect_page(nonce: str, error: str = "") -> str:
+    """The one-time key hand-off form. `error` is OUR OWN fixed copy only —
+    never provider response text and never user input (no reflection)."""
+    error_html = f'<p class="error">{error}</p>' if error else ""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Connect your AI account</title>
+<style>{_PAGE_STYLE}</style></head><body>
+<h1>Connect your AI account</h1>
+<p>This page is served by <strong>your own Squire runtime</strong> — the key you
+paste goes straight to your agent's container over TLS and nowhere else. The
+link is single-use and expires 15 minutes after it was minted.</p>
+{error_html}
+<form method="post" action="/connect/{nonce}" autocomplete="off">
+  <label>Which key are you pasting?</label>
+  <div class="radio"><label><input type="radio" name="provider" value="openai" checked>
+    OpenAI API key (starts with <code>sk-</code>, from platform.openai.com)</label></div>
+  <div class="radio"><label><input type="radio" name="provider" value="anthropic">
+    Anthropic API key (starts with <code>sk-ant-api</code>, from console.anthropic.com)</label></div>
+  <label for="api_key">Your API key</label>
+  <input type="password" id="api_key" name="api_key" required minlength="20">
+  <button type="submit">Connect</button>
+</form>
+<p class="note">We check the key with one cheap request to your provider before
+saving it, store it encrypted on your agent's own volume, and your AI traffic
+then goes directly to your provider.</p>
+</body></html>"""
+
+
+def render_invalid_page() -> str:
+    """Friendly invalid/expired/used state — deliberately identical for all
+    three causes so the page cannot be used to probe which nonces exist."""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Link expired</title>
+<style>{_PAGE_STYLE}</style></head><body>
+<h1>This link isn't live any more</h1>
+<p>Connect links are single-use and expire after 15 minutes — this one has
+either been used or timed out. Nothing is wrong with your account.</p>
+<p><strong>Just ask your agent for a fresh link</strong> in your Telegram chat
+and tap it straight away.</p>
+</body></html>"""
+
+
+def render_done_page(provider: str) -> str:
+    label = {"openai": "OpenAI", "anthropic": "Anthropic"}.get(provider, provider)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Connected</title>
+<style>{_PAGE_STYLE}</style></head><body>
+<h1>Done — {label} is connected 🎉</h1>
+<p>Your key was verified and stored, encrypted, on your agent's own volume.</p>
+<p><strong>Head back to Telegram</strong> — your agent will confirm there in a
+moment.</p>
+</body></html>"""

@@ -77,6 +77,84 @@ check("two outstanding nonces coexist",
 squire_connect.consume_nonce(state_dir, a)
 check("consuming one leaves the other valid", squire_connect.find_nonce(state_dir, b) is not None)
 
+print("== GET /connect/<nonce> through the real shim ==")
+import http.client      # noqa: E402
+import subprocess       # noqa: E402
+import urllib.request   # noqa: E402
+
+SHIM = str(IMAGE_ROOT / "bin" / "squire-webhook-shim.py")
+SHIM_PORT = 18081
+PUB = "tenant-test.up.railway.app"
+
+
+def shim_get(path, host=None):
+    conn = http.client.HTTPConnection("127.0.0.1", SHIM_PORT, timeout=10)
+    headers = {"Host": host} if host else {}
+    conn.request("GET", path, headers=headers)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", "replace")
+    ctype = resp.getheader("Content-Type") or ""
+    conn.close()
+    return resp.status, ctype, body
+
+
+def start_shim(home):
+    env = dict(os.environ)
+    env.update({
+        "PORT": str(SHIM_PORT),
+        "HERMES_HOME": home,
+        "SQUIRE_STATE_DIR": os.path.join(home, ".squire"),
+        "SQUIRE_PUBLIC_DOMAIN": PUB,
+        "TELEGRAM_WEBHOOK_SECRET": "s3cr3t",
+        "TENANT_ID": "t-connect-test",
+    })
+    proc = subprocess.Popen([sys.executable, SHIM], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{SHIM_PORT}/health", timeout=2)
+            return proc
+        except Exception:
+            time.sleep(0.25)
+    raise AssertionError("shim never became ready")
+
+
+home = tempfile.mkdtemp()
+page_state = os.path.join(home, ".squire")
+live = squire_connect.mint_nonce(page_state)
+proc = start_shim(home)
+try:
+    status, ctype, body = shim_get(f"/connect/{live}", host=PUB)
+    check("live nonce -> 200 HTML page", status == 200 and "text/html" in ctype, (status, ctype))
+    check("page offers the OpenAI key path", "OpenAI" in body, body[:400])
+    check("page offers the Anthropic key path", "Anthropic" in body, body[:400])
+    check("page never offers a Claude subscription path",
+          "subscription" not in body.lower() and "setup-token" not in body.lower(), body[:400])
+    check("page posts back to the same nonce", f"/connect/{live}" in body, body[:400])
+    check("page is self-contained (no external assets)",
+          "http://" not in body and "https://" not in body
+          and "<script src" not in body and "<link" not in body, body[:400])
+
+    status, _, body = shim_get("/connect/definitely-not-a-nonce", host=PUB)
+    check("invalid nonce -> 200 friendly page, not an error dump",
+          status == 200 and "ask your" in body.lower(), (status, body[:300]))
+    check("invalid page mentions a fresh link", "fresh link" in body.lower(), body[:300])
+
+    # GET must NOT consume — the user may reload before submitting.
+    status, _, _ = shim_get(f"/connect/{live}", host=PUB)
+    check("reloading the page keeps the nonce live", status == 200
+          and squire_connect.find_nonce(page_state, live) is not None, status)
+
+    # The page is reachable from the private side too (wake path goes via edge,
+    # but nothing about the page should REQUIRE the public Host).
+    status, _, _ = shim_get(f"/connect/{live}")
+    check("connect page also answers without a public Host", status == 200, status)
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    out = proc.stdout.read() if proc.stdout else ""
+    check("nonce never appears in shim logs", live not in out, out[-300:])
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
