@@ -133,6 +133,50 @@ always emits `llm_connected`, so a missing `heartbeat.llm_connected` column brea
 tenant's heartbeat write (loud errors, not just connected tenants), not only the ones that
 have connected a credential.
 
+### THREE migrations, not two (found the hard way on staging, 2026-08-15)
+
+`ProvisionStep` is a Postgres **ENUM type**, so the new `CREATE_DOMAIN` step needs an
+`ALTER TYPE` as well as the two `ALTER TABLE`s. The tests never caught this: they build the
+schema from scratch, where the enum is created already containing every member — only a
+pre-existing database has the old enum. Live symptom: provisioning 500s the moment the state
+machine tries to write the new step (`invalid input value for enum provisionstep:
+"CREATE_DOMAIN"`), leaving the job stuck mid-claim until the stale-reclaim window frees it.
+
+Run ALL THREE before the control-api deploy, in any order (all additive, all idempotent):
+
+```sql
+ALTER TABLE tenant    ADD COLUMN IF NOT EXISTS connected_provider VARCHAR;
+ALTER TABLE heartbeat ADD COLUMN IF NOT EXISTS llm_connected      BOOLEAN;
+ALTER TYPE  provisionstep ADD VALUE IF NOT EXISTS 'CREATE_DOMAIN';  -- needs AUTOCOMMIT
+```
+
+The `ALTER TYPE` must run outside a transaction block (use an AUTOCOMMIT connection).
+Appending to the end of the enum is fine — step ORDER lives in Python
+(`PROVISION_STEP_ORDER`), not in the enum's declaration order.
+
+**Generalises beyond 1C:** any future `ProvisionStep`/status-enum member needs the same
+`ALTER TYPE`, and no test will remind you.
+
+### Staging findings (2026-08-15) — the previously-unverified assumptions
+
+- **`serviceDomainCreate` GraphQL shape: CORRECT.** The mutation and the `domains` probe both
+  worked live on the first real provision; the "UNVERIFIED against the live API" banner in
+  `clients/railway.py` can now be downgraded to verified-on-staging.
+- **`RAILWAY_PUBLIC_DOMAIN` IS injected by Railway** once a domain exists, stamped at deploy
+  time as documented. Our explicit `SQUIRE_PUBLIC_DOMAIN` fallback was therefore belt-and-braces,
+  not load-bearing — both were present and identical. Keep the fallback: it costs nothing and
+  removes the dependency on injection timing.
+- **Railway's edge routes on the Host header, which closes the final review's MAJOR concern.**
+  A spoofed `Host: 127.0.0.1` with SNI set to the tenant domain never reaches the container:
+  Railway's edge answers it itself (404 with `x-railway-fallback: true`). So a client cannot
+  present a private-looking Host to the shim, and `_host_is_private` is not trusting
+  client-controlled input in practice. `SQUIRE_WEBHOOK_REQUIRE_AUTH=true` now sits behind it
+  as an independent second lock regardless.
+- **Cold-start transient:** the very first public-domain request to a waking tenant can return
+  a one-off `501` from the edge before the container is listening; it self-resolves within
+  seconds (subsequent requests are `200`). Harmless for the connect flow (the user re-taps or
+  reloads), but worth knowing before anyone reports it as a bug.
+
 ## Out of scope
 
 Custom domains; central web-app involvement in credentials (violates privacy promise);
