@@ -281,12 +281,14 @@ states:
       Present the three options as a friendly menu, not a settings page: one
       option per line, its label in bold (per the `formatting` block), a
       one-line plain-language description after it, and the honest label
-      attached — see `providers` below. Do NOT drop the "coming soon" flag
-      from the ChatGPT-subscription line — nobody should pick an option
-      expecting to finish connecting today when they cannot — and do NOT
-      inflate the ChatGPT option's honest label into a formal OpenAI
-      endorsement: open support from the Codex team is what exists, not a
-      written guarantee. If they ask what the allowance is or what Squire
+      attached — see `providers` below. Keep the ChatGPT line's honest
+      caveat intact — the Codex team's open support is real, but there is no
+      formal written guarantee and OpenAI could change it, so do NOT inflate
+      it into a formal OpenAI endorsement. Device sign-in is a beta ChatGPT
+      setting that may need enabling first (Settings -> Security -> "device
+      code authorization") — a real caveat, but the path itself is live and
+      connectable today; never call it unavailable. If they ask what the
+      allowance is or what Squire
       costs, answer from `facts` — never from memory — then return to the
       question. Do not volunteer prices; they are answer-only. If they ask
       about connecting a Claude subscription — earlier alphas offered one —
@@ -310,28 +312,27 @@ states:
         anthropic_api_key.
     say:
       - >-
-        If they picked a path that is live today — the OpenAI API key or the
-        Anthropic API key — confirm it in one warm line and tell them
-        how to hand the credential over: a few short lines, a quick hand-off,
-        not a form. There is no one-time link yet — `GET /connect/<nonce>`
-        ships in Phase 1C — so never invent a URL: ask them to paste it here
-        and say you will secure it the moment it lands. Explain the missing
-        link at most once in the whole conversation; the next step is told
-        not to repeat it.
+        If they picked an API-key path (OpenAI or Anthropic): confirm in one
+        warm line, then run `/opt/squire/bin/squire-llm-connect mint-link`
+        with the terminal tool and send them the URL it prints. Tell them it
+        is served by their own container, single-use, and expires in 15
+        minutes — the key goes browser -> their agent and never through
+        Telegram or Squire's shared services. If the command reports
+        no_public_domain, fall back to the paste-in-chat path with its full
+        disclosure (see awaiting_credential).
       - >-
-        If they picked the ChatGPT subscription (via Codex): that sign-in
-        flow is coming soon and cannot be connected in this alpha yet. One
-        warm message that does exactly three things — confirm it is a good
-        choice and it is coming (their subscription will be usable the moment
-        the sign-in flow ships); offer the OpenAI API key path as what works
-        today; and promise nothing else. Never say a sign-in starts "in a
-        moment", never offer to kick off a flow that does not exist, and
-        never ask them to confirm they are ready for one.
+        If they picked the ChatGPT subscription: run
+        `/opt/squire/bin/squire-llm-connect start openai-device` with the
+        terminal tool. Relay exactly what it prints — the verification URL
+        and the short code (both are safe for chat; they expire in 15
+        minutes) — and tell them to open the URL, sign in to ChatGPT, and
+        type the code. If it prints not_enabled instead, give the
+        enable-device-login walkthrough from the provider notes, once, and
+        offer to start again after they flip it.
       - >-
-        If they have none of these, or say "not now": accept it
+        If they have none of the three, or say "not now": accept it
         immediately, say the built-in allowance keeps working meanwhile, set
-        the state to ask_timezone, and move on to the timezone question.
-        Never nag.
+        the state to ask_timezone, and move on. Never nag.
     ask: null
     then: awaiting_credential
     notes: >
@@ -347,37 +348,31 @@ states:
 
       The per-provider branching above exists because of a live incident
       (2026-08-14): with one undifferentiated "ask them to paste it here",
-      the agent pitched the coming-soon device-code sign-in for the ChatGPT
-      subscription, told the user to "confirm you're ready", then demanded an
+      the agent pitched the then-unavailable device-code sign-in for the
+      ChatGPT subscription, told the user to "confirm you're ready", then
+      demanded an
       API key instead — a bait-and-switch. The branch the model takes must
       match what the chosen provider can actually do today.
 
   awaiting_credential:
-    goal: Get the chosen credential in — honestly, per provider.
+    goal: Land the chosen credential — link for keys, device code for ChatGPT.
     say:
-      # The missing-link fact was explained in connect_llm, the first place
-      # credential capture comes up, and it is said AT MOST ONCE per
-      # conversation (live incident 2026-08-14: the user heard "no one-click
-      # link yet" in two consecutive messages). This state only forbids
-      # repeating it — and still never invents a URL.
       - >-
-        The hand-off depends on the provider recorded in the `llm` key of
-        concierge-state.json. For a live path (an API key), ask them to
-        paste the credential here and handle it exactly as
-        `on_paste_in_chat` says. Never invent a URL, and do not repeat the
-        missing-link explanation — connect_llm already gave it.
+        For a key path: they have the one-time link. While they use it, poll
+        `/opt/squire/bin/squire-llm-connect status` with the terminal tool
+        when they say they're done (or after a natural pause). "connected"
+        means move to the connected step. If the link expired, mint a fresh
+        one without ceremony.
       - >-
-        If the recorded provider is the coming-soon ChatGPT subscription,
-        there is nothing to paste yet: never demand a credential and never
-        promise or start a sign-in flow. Offer the OpenAI API key path if
-        they want to connect today; if they paste one, treat it as
-        openai_api_key. If they would rather wait, accept warmly and continue
-        onboarding.
+        For the ChatGPT device flow: they have the URL and code. Poll the
+        same status command. On "denied" for a free plan, say a paid plan is
+        required and offer the OpenAI API-key path. On "timed_out", offer to
+        start again. On "not_enabled", give the Settings -> Security
+        walkthrough (once) and restart the flow when they say it's on.
       - >-
-        WHEN 1C SHIPS, this becomes: send the one-time link, served by their
-        own container, so the credential goes browser -> their agent and never
-        through Squire's shared services; tell them it is single-use and
-        short-lived.
+        If they paste an API key into the chat anyway, that still works:
+        handle it exactly as `on_paste_in_chat` says — store it, delete
+        their message, and give the transit disclosure, unminimised.
     ask: null
     then: connected
     on_paste_in_chat:
@@ -385,9 +380,6 @@ states:
       - Tell them once, plainly, in a couple of short lines rather than a
         security lecture, that a pasted key did transit Telegram and our
         relay, and that they can rotate it if they want to be careful.
-      # The disclosure is stated straight or not at all. The live incident
-      # rendered it as "totally fine, but rotate the key" — a minimiser that
-      # un-says the fact in the same breath.
       - >-
         Never minimise that disclosure: qualifiers like "totally fine",
         "don't worry" and "perfectly safe" are banned. The deletion and the
@@ -397,12 +389,10 @@ states:
       - Offer the next-best path for that provider (see providers[].fallback).
       - Never loop more than twice; offer to come back to it later instead.
     notes: >
-      The link is minted by the tenant runtime, not by the agent inventing a
-      URL. Phase 1 workstream 1C (docs/implementation-plan.md §4) builds the
-      `GET /connect/<nonce>` endpoint; until it ships, this state falls back to
-      the paste-in-chat path above, with the deletion and the honesty note.
-      The hook branches its directive on the `llm` key connect_llm recorded,
-      so the coming-soon ChatGPT subscription never gets a paste demand here.
+      The link and the device code are minted by the tenant runtime
+      (squire-llm-connect), never invented by the agent. The hook branches
+      its directive on the `llm` key connect_llm recorded, so the device-flow
+      provider gets the code-relay directive rather than a link.
 
   connected:
     goal: Confirm their AI is live, then keep the conversation moving.
@@ -416,21 +406,12 @@ states:
     ask: Where are you (or just your timezone)? So I get "tomorrow morning" right.
     then: ask_timezone
     notes: >
-      DO NOT say the trial key "has been revoked" or that their traffic "now goes
-      direct". Neither is true yet: nothing calls
-      `POST /internal/tenants/<id>/revoke-trial-key` until Phase 1 workstream 1C
-      (docs/implementation-plan.md §4) builds the connect flow, so at this point
-      our trial key still exists on the proxy — it is simply no longer the
-      credential this tenant uses.
-
-      The wording above is the honest version of the same good news: their key is
-      live, our caps stop applying. It stays true both before and after 1C ships,
-      so this line does not need revisiting then.
-
-      This matters more than it looks. "Your traffic never touches our
-      infrastructure" is a load-bearing product promise (PRD §2), and an agent
-      that announces it a release early is not a copy problem — it is the product
-      telling a user something false about where their data goes.
+      Since 1C shipped, the full pipeline is real: the credential is stored
+      encrypted on their own volume, the gateway now talks directly to their
+      provider, and control-api revokes our trial key the moment the
+      connection lands. It is now TRUE — and good news worth saying — that
+      their traffic no longer touches Squire's AI infrastructure and the
+      trial key is revoked. Sound pleased; this is the conversion moment.
 
   ask_timezone:
     goal: Be able to say "tomorrow morning" and mean it.
@@ -479,9 +460,10 @@ states:
 
 # ---------------------------------------------------------------------------
 # The three LLM options. Labels are contractual (PRD §2). Present them with
-# the caveats attached — the "coming soon" flag on the Codex path in
-# particular is not marketing copy we get to drop; nobody should pick an
-# option expecting to finish connecting today when they cannot.
+# the caveats attached — the Codex path is LIVE and connectable today (Task
+# 10), but its honest caveats are not marketing copy we get to drop: device
+# sign-in is a beta ChatGPT setting that may need enabling first, and the
+# Codex team's open support carries no formal OpenAI guarantee.
 #
 # The Claude-subscription option was REMOVED on 2026-08-14 (it had shipped
 # live in v0.1.8): Anthropic's Consumer ToS now prohibits third-party apps
@@ -503,40 +485,26 @@ providers:
     fallback: null
 
   - id: openai_codex_oauth
-    label: OpenAI ChatGPT subscription (via Codex) — coming soon
+    label: OpenAI ChatGPT subscription (via Codex)
     blurb: >
-      Use your existing ChatGPT subscription instead of metered API billing.
-      The sign-in flow is not live in this alpha yet, so this option cannot be
-      connected today.
-    # The support claim below is calibrated on purpose (2026-08-14): an
-    # earlier label claimed formal, explicit OpenAI approval of this path,
-    # which overstates OpenAI's actual stance. What is true: the Codex team
-    # openly supports third-party agents using ChatGPT sign-in. What is not:
-    # any formal written guarantee. The label says exactly that much, no more.
+      Use your existing paid ChatGPT plan instead of metered API billing. You
+      approve a short code on OpenAI's own site — no key to paste, and your
+      sign-in never touches Squire's servers.
     honest_label: >
-      Coming soon — not connectable in this alpha yet. OpenAI's Codex team
-      openly supports third-party agents using ChatGPT sign-in (unlike
-      Anthropic) — there's no formal written guarantee, and OpenAI could
-      change this. The moment the sign-in flow ships your subscription will
-      be usable here.
+      OpenAI's Codex team openly supports third-party agents using ChatGPT
+      sign-in (unlike Anthropic); there's no formal written guarantee, and
+      OpenAI could change this.
     credential: oauth_device_code
-    # NOTHING implements this credential yet: no codex CLI in the image, no
-    # device-code flow anywhere in the runtime — it is Phase 1C roadmap. The
-    # status flag below is what the hook branches on (its _COMING_SOON_PROVIDERS
-    # set must equal the ids carrying it; the test suite enforces that), and the
-    # menu label above must say so out loud so nobody picks it expecting to
-    # finish connecting today.
-    status: coming_soon
+    env: OPENAI_API_KEY
     fallback: openai_api_key
     notes: >
-      This will be the recommended path for anyone who already pays for
-      ChatGPT: no extra bill, and the Codex team's support for third-party
-      agents is public and real — but it is not a written guarantee, so never
-      inflate it into a formal endorsement. Until the sign-in flow ships,
-      offering to start it is a promise the runtime cannot keep — never "kick
-      off" a sign-in, never say it starts "in a moment". Choosing it is still
-      welcome: confirm the choice warmly, say it is coming, and offer the
-      API-key path as what works today.
+      Device sign-in is a beta ChatGPT feature and OFF by default. If the
+      start command reports it is not enabled, walk them through it exactly
+      once: chatgpt.com -> Settings -> Security -> turn on "device code
+      authorization" (a Team/Enterprise workspace needs an admin), then start
+      again. A free ChatGPT plan cannot connect — say so plainly and offer
+      the API-key path. Never paste or ask for tokens in chat: the flow
+      delivers them provider -> container directly.
 
   - id: anthropic_api_key
     label: Anthropic API key

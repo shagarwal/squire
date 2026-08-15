@@ -38,6 +38,10 @@ class FakeRailway:
     #: which is the healthy case; set it explicitly to simulate a lost variable.
     variable_names: set[str] | None = None
     _upserted_names: set[str] = field(default_factory=set)
+    #: service_id -> public domain. serviceDomainCreate populates it; the
+    #: `domains` query probe reads it. Pre-seed to simulate a pre-existing
+    #: domain (the probe-first idempotency case).
+    service_domains: dict[str, str] = field(default_factory=dict)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.read())
@@ -127,6 +131,16 @@ class FakeRailway:
             # keeps `existing_volume_service_ids` untouched on purpose, so a test
             # that deletes in the wrong order can still observe the orphan.
             return self._ok({"serviceDelete": True})
+
+        if op == "domains":
+            domain = self.service_domains.get(variables["serviceId"])
+            service_domains = [{"domain": domain}] if domain else []
+            return self._ok({"domains": {"serviceDomains": service_domains}})
+
+        if op == "serviceDomainCreate":
+            sid = variables["input"]["serviceId"]
+            domain = self.service_domains.setdefault(sid, f"{sid}-test.up.railway.app")
+            return self._ok({"serviceDomainCreate": {"id": f"dom-{sid}", "domain": domain}})
 
         raise AssertionError(f"unexpected Railway operation: {op}\n{query}")
 

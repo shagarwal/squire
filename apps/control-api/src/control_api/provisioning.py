@@ -440,6 +440,24 @@ def _step_attach_volume(session: Session, tenant: Tenant, clients: ProvisionClie
     _touch(session, tenant)
 
 
+def _step_create_domain(session: Session, tenant: Tenant, clients: ProvisionClients) -> None:
+    """Public Railway domain for the 1C /connect page (design decision 3:
+    Railway-generated domains for alpha; custom domains are Phase 1 polish).
+
+    Probe-first, like attach_volume: serviceDomainCreate's idempotency is
+    unverified, and a retry must adopt rather than duplicate. The domain is
+    deliberately NOT persisted on the tenant row -- _step_set_variables reads
+    it back from Railway by name, and no control-plane query path needs it.
+    Ordering before DEPLOY is load-bearing: Railway stamps
+    RAILWAY_PUBLIC_DOMAIN into the container at deploy time, so the domain
+    must exist before the first deploy runs.
+    """
+    if clients.railway.get_service_domain(tenant.railway_service_id):
+        return
+    clients.railway.create_service_domain(tenant.railway_service_id)
+    _touch(session, tenant)
+
+
 def _mint_trial_key(session: Session, tenant: Tenant, clients: ProvisionClients) -> str | None:
     """Mint (or re-mint) this tenant's trial key and stash the material in memory.
 
@@ -527,6 +545,16 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # control-api remains the authoritative registrar (see _step_set_webhook).
         "TELEGRAM_WEBHOOK_URL": telegram_webhook_url(bot.id, settings),
         "TELEGRAM_WEBHOOK_SECRET": bot.webhook_secret,
+        # Defense-in-depth for the 1C public domain. Task 8 attaches a PUBLIC
+        # Railway domain to the shim port so the /connect page is reachable;
+        # that same domain exposes the webhook endpoint to the internet, where
+        # the Host-gate (which trusts the client-controllable Host header) would
+        # otherwise be the ONLY lock on forged Telegram updates. With this on,
+        # the shim ALSO requires the per-bot secret header on every delivery.
+        # This is safe because ingress re-stamps X-Telegram-Bot-Api-Secret-Token
+        # with this exact TELEGRAM_WEBHOOK_SECRET on every forward (verbatim and
+        # buffered-replay paths alike), so legitimate delivery still passes.
+        "SQUIRE_WEBHOOK_REQUIRE_AUTH": "true",
         "ANTHROPIC_BASE_URL": settings.effective_trial_base_url,
         "ANTHROPIC_API_KEY": trial_key or "",
         # The PRIVATE address when one is configured (see `control_api_internal_url`).
@@ -554,6 +582,14 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # with patch 006 (identity-refresh loop off). The image default stays 300
         # for dev/self-hosted, where nothing sleeps.
         "SQUIRE_HEARTBEAT_INTERVAL": str(settings.tenant_heartbeat_interval_seconds),
+        # 1C: the tenant's public domain, written explicitly so the connect
+        # CLI never depends on Railway's deploy-time RAILWAY_PUBLIC_DOMAIN
+        # injection actually happening. Read back by name from Railway (the
+        # domain is not stored in the control DB). Tenant code prefers
+        # RAILWAY_PUBLIC_DOMAIN and falls back to this.
+        "SQUIRE_PUBLIC_DOMAIN": clients.railway.get_service_domain(
+            tenant.railway_service_id
+        ) or "",
     }
     # 32 random bytes, base64. Generated only if we have not already set one: a
     # retry must not rotate the key out from under a volume already encrypted with
@@ -664,6 +700,7 @@ def _step_set_webhook(session: Session, tenant: Tenant, clients: ProvisionClient
 _STEP_HANDLERS = {
     ProvisionStep.CREATE_SERVICE: _step_create_service,
     ProvisionStep.ATTACH_VOLUME: _step_attach_volume,
+    ProvisionStep.CREATE_DOMAIN: _step_create_domain,
     ProvisionStep.CREATE_TRIAL_KEY: _step_create_trial_key,
     ProvisionStep.SET_VARIABLES: _step_set_variables,
     ProvisionStep.DEPLOY: _step_deploy,
@@ -1121,7 +1158,7 @@ def record_heartbeat(session: Session, fields: dict) -> Heartbeat:
     function never sees free-form input.
     """
     tenant_id = fields["tenant_id"]
-    get_tenant(session, tenant_id)  # raises TenantNotFound -> 404
+    tenant = get_tenant(session, tenant_id)  # raises TenantNotFound -> 404
 
     row = session.get(Heartbeat, tenant_id)
     if row is None:
@@ -1133,6 +1170,14 @@ def record_heartbeat(session: Session, fields: dict) -> Heartbeat:
     session.add(row)
     session.commit()
     session.refresh(row)
+    # 1C reconciliation backstop: a converted tenant whose
+    # /internal/llm-connected call was lost still gets its trial key revoked
+    # on the next beat. Idempotent (revoke_trial_key no-ops once inactive);
+    # worst case on a missed beat, the trial cap still bounds spend.
+    if fields.get("llm_connected") and tenant.trial_key_active:
+        log.info("heartbeat reconciliation: tenant %s connected an LLM but the "
+                 "trial key is still active — revoking", tenant_id)
+        revoke_trial_key(session, tenant_id)
     return row
 
 
@@ -1194,3 +1239,18 @@ def revoke_trial_key(
     tenant.trial_key_active = False
     _touch(session, tenant)
     return revoked
+
+
+def record_llm_connected(
+    session: Session, tenant_id: str, provider: str,
+    clients: ProvisionClients | None = None,
+) -> bool:
+    """The conversion moment, control-plane side: record the provider NAME and
+    revoke the trial key immediately (PRD §2: their traffic never touches our
+    infrastructure again). Returns whether a key was actually revoked --
+    idempotent, because the tenant retries and the heartbeat backstop can race.
+    """
+    tenant = get_tenant(session, tenant_id)
+    tenant.connected_provider = provider
+    _touch(session, tenant)
+    return revoke_trial_key(session, tenant_id, clients=clients)

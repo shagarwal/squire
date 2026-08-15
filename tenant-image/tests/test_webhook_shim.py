@@ -661,6 +661,109 @@ finally:
     check("race path went through the relay backstop, not the probe",
           "upstream unavailable" in out, out[-300:])
 
+print("== Host gating: a public domain must not expose the webhook ==")
+# Attaching a Railway public domain (1C connect page) points the INTERNET at
+# this port. A forged Telegram update delivered via the public domain is the
+# account-takeover / message-injection path, so when a public domain is
+# configured, /webhook/telegram and /health answer ONLY for private-looking
+# Hosts (railway.internal, IP literals, localhost). /connect/* is the single
+# public surface. With no public domain configured (every section above),
+# nothing changes.
+import http.client  # noqa: E402
+
+PUB = "tenant-test.up.railway.app"
+
+
+def raw_request(method, path, body=None, host=None, extra=None):
+    """http.client so we control the Host header exactly (urllib rewrites it)."""
+    conn = http.client.HTTPConnection("127.0.0.1", SHIM_PORT, timeout=10)
+    headers = {"Content-Type": "application/json"}
+    if host is not None:
+        headers["Host"] = host
+    headers.update(extra or {})
+    data = json.dumps(body).encode() if body is not None else None
+    if data is not None:
+        headers["Content-Length"] = str(len(data))
+    conn.request(method, path, body=data, headers=headers)
+    resp = conn.getresponse()
+    payload = resp.read()
+    conn.close()
+    return resp.status, payload
+
+# Harness cleanup: the "probe-passed-then-died race" section above leaves its
+# _accept_and_slam daemon thread blocked in racer.accept(). racer.close() does
+# NOT wake a thread already inside accept(), so that closed-but-still-listening
+# socket keeps UPSTREAM_PORT bound and our fresh adapter6 cannot claim it. A
+# throwaway connect is accepted by the zombie listener, the thread closes it and
+# loops, and its next accept() on the now-fully-closed fd raises -> thread exits
+# and the port frees. Retry the bind a few times to ride out the wakeup.
+for _attempt in range(20):
+    try:
+        _drain = socket.create_connection(("127.0.0.1", UPSTREAM_PORT), timeout=0.5)
+        _drain.close()
+    except OSError:
+        pass
+    try:
+        adapter6 = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), FakeAdapter)
+        break
+    except OSError:
+        time.sleep(0.2)
+else:
+    raise RuntimeError("could not rebind UPSTREAM_PORT for the Host-gating section")
+adapter6.daemon_threads = True
+threading.Thread(target=adapter6.serve_forever, daemon=True).start()
+received.clear()
+proc = run({"SQUIRE_TELEGRAM_UPSTREAM_PATH": UPSTREAM_PATH,
+            "SQUIRE_PUBLIC_DOMAIN": PUB})
+try:
+    update = {"update_id": 5000, "message": {"text": "forged"}}
+
+    # The attack: a Telegram-shaped POST arriving with the public domain's Host.
+    status, _ = raw_request("POST", "/webhook/telegram", update, host=PUB)
+    check("public Host: webhook POST -> 403", status == 403, status)
+    check("public Host: nothing was forwarded upstream", len(received) == 0, received)
+
+    # Even WITH valid delivery credentials: the public edge is not ingress.
+    status, _ = raw_request("POST", "/webhook/telegram", update, host=PUB,
+                            extra={"X-Telegram-Bot-Api-Secret-Token": SECRET})
+    check("public Host + valid secret: still 403", status == 403, status)
+    check("still nothing forwarded", len(received) == 0, received)
+
+    # Port suffix and case must not dodge the gate.
+    status, _ = raw_request("POST", "/webhook/telegram", update, host=PUB.upper() + ":443")
+    check("public Host with port/case: still 403", status == 403, status)
+
+    # An unknown public-looking Host fails closed too.
+    status, _ = raw_request("POST", "/webhook/telegram", update, host="evil.example.com")
+    check("unknown non-private Host: 403 (fail closed)", status == 403, status)
+
+    # /health follows the webhook: private only, once a public domain exists.
+    status, _ = raw_request("GET", "/health", host=PUB)
+    check("public Host: /health -> 403", status == 403, status)
+
+    # The gate counts rejections so the fleet can see probing.
+    _, metrics = get("/metrics")
+    check("public-Host webhook posts counted as rejected",
+          metrics.get("updates_rejected", 0) >= 3, metrics)
+
+    # Private-looking Hosts keep working: this is how ingress and Railway's
+    # private network actually address the shim.
+    status, _ = raw_request("POST", "/webhook/telegram",
+                            {"update_id": 5001, "message": {"text": "hello"}},
+                            host="tenant-abc.railway.internal:8080")
+    check("railway.internal Host: webhook delivers", status == 200, status)
+    status, _ = raw_request("GET", "/health", host="tenant-abc.railway.internal")
+    check("railway.internal Host: /health 200", status == 200, status)
+    status, _ = raw_request("GET", "/health", host="127.0.0.1:18080")
+    check("IP-literal Host: /health 200", status == 200, status)
+    status, _ = raw_request("GET", "/health", host="healthcheck.railway.app")
+    check("Railway healthcheck Host: /health 200", status == 200, status)
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+    adapter6.shutdown()
+    adapter6.server_close()
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

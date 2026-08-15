@@ -195,6 +195,59 @@ class RailwayClient:
             return None
         return set(variables.keys())
 
+    # -- public domains (1C connect page) ----------------------------------
+    # !! UNVERIFIED against the live API (unlike everything above -- see the
+    # module header). Shapes follow Railway's public schema:
+    # serviceDomainCreate(input:{environmentId, serviceId}) and the `domains`
+    # query. Verify live during the 1C staging rollout and update this note.
+
+    def get_service_domain(self, service_id: str) -> str | None:
+        """The service's generated public domain, or None if none exists yet.
+
+        The probe half of create_service_domain's idempotency: domain creation
+        has not been proven idempotent, so (exactly like attach_volume) we
+        never mutate without first establishing absence.
+        """
+        query = """
+        query domains($projectId: String!, $environmentId: String!, $serviceId: String!) {
+          domains(
+            projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId
+          ) {
+            serviceDomains { domain }
+          }
+        }
+        """
+        data = self._gql(
+            query,
+            {
+                "projectId": self.project_id,
+                "environmentId": self.environment_id,
+                "serviceId": service_id,
+            },
+        )
+        for entry in ((data.get("domains") or {}).get("serviceDomains")) or []:
+            domain = (entry or {}).get("domain")
+            if domain:
+                return domain
+        return None
+
+    def create_service_domain(self, service_id: str) -> str:
+        """Generate a Railway public domain (`tenant-….up.railway.app`) for the
+        service. Callers must probe with get_service_domain first."""
+        mutation = """
+        mutation serviceDomainCreate($input: ServiceDomainCreateInput!) {
+          serviceDomainCreate(input: $input) { id domain }
+        }
+        """
+        data = self._gql(
+            mutation,
+            {"input": {"environmentId": self.environment_id, "serviceId": service_id}},
+        )
+        domain = (data.get("serviceDomainCreate") or {}).get("domain")
+        if not domain:
+            raise RailwayError(f"serviceDomainCreate returned no domain: {data}")
+        return domain
+
     def create_service(
         self,
         name: str,

@@ -54,6 +54,7 @@ import os
 import socket
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -98,6 +99,11 @@ except ImportError:  # pragma: no cover - defensive
     defang_start_command = None
     strip_start_payload = None
 
+try:
+    import squire_connect
+except ImportError:  # pragma: no cover - defensive; page 404s, webhook unaffected
+    squire_connect = None
+
 # Telegram updates are small; the largest realistic body is a long message with
 # a big entity list. 2 MiB is generous and stops an unbounded read.
 MAX_BODY = 2 * 1024 * 1024
@@ -118,6 +124,46 @@ REQUIRE_AUTH = os.environ.get("SQUIRE_WEBHOOK_REQUIRE_AUTH", "false").lower() in
     "yes",
     "on",
 )
+
+# --- Public-domain Host gating (1C) -----------------------------------------
+# Attaching a Railway public domain (for the /connect page) exposes this port
+# to the internet. Everything except /connect/* must then answer ONLY for
+# requests that addressed the shim by a private name. Railway injects
+# RAILWAY_PUBLIC_DOMAIN once a domain exists; provisioning also writes
+# SQUIRE_PUBLIC_DOMAIN explicitly so this gate cannot depend on platform
+# injection timing. Unset (dev, plain docker run) => no gating at all.
+PUBLIC_DOMAIN = (
+    os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("SQUIRE_PUBLIC_DOMAIN") or ""
+).strip().lower()
+
+
+def _request_host(headers) -> str:
+    """The Host header, lowercased, port stripped. '[::1]:80' handled too."""
+    host = (headers.get("Host") or "").strip().lower()
+    if host.startswith("["):  # bracketed IPv6
+        return host.split("]", 1)[0].lstrip("[")
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def _host_is_private(headers) -> bool:
+    """True when the request addressed us by a name only the private network,
+    the container itself, or Railway's own health prober would use.
+
+    Fail-closed: with a public domain configured, an unrecognised Host is
+    treated as public. An attacker reaching the public edge cannot make the
+    edge route an arbitrary Host to this container, but this code must not
+    rely on that — 'not provably private' is the safe reading.
+    """
+    host = _request_host(headers)
+    if host in ("", "localhost", "healthcheck.railway.app"):
+        return True
+    if host.endswith(".railway.internal"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True  # IP literal: private-network or loopback addressing
+    except ValueError:
+        return False
 
 
 def log(msg: str) -> None:
@@ -152,6 +198,35 @@ def count(name: str) -> None:
 def counters_snapshot() -> dict:
     with _COUNTERS_LOCK:
         return dict(_COUNTERS)
+
+
+# --- /connect abuse limiting -------------------------------------------------
+# Per-IP failure backoff for the connect page. In-memory (resets on restart),
+# which matches the threat: online guessing of a live nonce. Nonce lookups are
+# already constant-time; this bounds the request RATE.
+_CONNECT_FAILS: dict = {}
+_CONNECT_FAILS_LOCK = threading.Lock()
+CONNECT_MAX_FAILS = 5
+CONNECT_LOCKOUT_SECONDS = 60.0
+
+
+def _connect_throttled(ip: str) -> bool:
+    import time as _time
+    with _CONNECT_FAILS_LOCK:
+        count_, until = _CONNECT_FAILS.get(ip, (0, 0.0))
+        return count_ >= CONNECT_MAX_FAILS and _time.monotonic() < until
+
+
+def _connect_record_failure(ip: str) -> None:
+    import time as _time
+    with _CONNECT_FAILS_LOCK:
+        count_, _until = _CONNECT_FAILS.get(ip, (0, 0.0))
+        _CONNECT_FAILS[ip] = (count_ + 1, _time.monotonic() + CONNECT_LOCKOUT_SECONDS)
+
+
+def _connect_clear(ip: str) -> None:
+    with _CONNECT_FAILS_LOCK:
+        _CONNECT_FAILS.pop(ip, None)
 
 
 def _authorised(headers) -> bool:
@@ -265,8 +340,152 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _respond_html(self, status: int, html: str):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _client_ip(self) -> str:
+        """The throttle key: the real external client's IP.
+
+        Behind Railway's HTTP edge, self.client_address is the proxy hop —
+        identical for every external user — so keying the per-IP backoff on it
+        would (a) fail to isolate clients and (b) let anyone lock the real owner
+        out. The real client is the RIGHTMOST X-Forwarded-For entry: that is the
+        hop closest to us, the value Railway's OWN edge appended, and it is the
+        edge's trusted view of who connected. Taking the leftmost instead would
+        trust a client-supplied XFF and let one user spoof another's IP to lock
+        them out — so rightmost, deliberately, is the only safe choice.
+
+        http.server joins repeated X-Forwarded-For headers with ", " into one
+        value, so split on "," and take the last non-empty entry. An
+        empty/whitespace header falls back to client_address. Railway sends a
+        bare IP (no port) in XFF, but tolerate a stray :port just in case.
+        """
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            # Rightmost non-empty entry = the trusted edge's view of the client.
+            for part in reversed(xff.split(",")):
+                candidate = part.strip()
+                if candidate:
+                    # Bare IP is expected; strip a trailing :port defensively
+                    # (only for IPv4 "a.b.c.d:p" — never for bracketless IPv6,
+                    # which Railway does not send here).
+                    if candidate.count(":") == 1:
+                        candidate = candidate.rsplit(":", 1)[0]
+                    return candidate
+        # No usable XFF: fall back to the direct peer (dev, private-network,
+        # or a request that never traversed the edge).
+        return (self.client_address or ("",))[0]
+
+    def _handle_connect_post(self, path: str) -> None:
+        """POST /connect/<nonce>: validate the pasted key with the provider,
+        store it, consume the nonce, kick the connected pipeline. An invalid
+        key is stated plainly, stores nothing, and leaves the nonce live."""
+        if squire_connect is None:
+            self._respond(404, {"error": "not found"})
+            return
+
+        ip = self._client_ip()
+        if _connect_throttled(ip):
+            log("throttled /connect attempt")
+            self._respond(429, {"error": "too many attempts"},
+                          extra_headers=(("Retry-After", "60"),))
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._respond(400, {"error": "bad Content-Length"})
+            return
+        if length <= 0 or length > 64 * 1024:
+            self._respond(413, {"error": "body missing or too large"})
+            return
+        try:
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._respond(400, {"error": "bad form body"})
+            return
+        provider = (form.get("provider") or [""])[0]
+        api_key = (form.get("api_key") or [""])[0].strip()
+
+        candidate = path[len("/connect/"):]
+        if squire_connect.find_nonce(None, candidate) is None:
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_invalid_page())
+            return
+        if provider not in ("openai", "anthropic") or len(api_key) < 20:
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_connect_page(
+                candidate, error="That didn't look like a key — pick a provider and paste the whole key."))
+            return
+
+        ok, message = squire_connect.validate_key(provider, api_key)
+        if not ok:
+            # Stated plainly, nothing stored, nonce still valid (spec).
+            _connect_record_failure(ip)
+            self._respond_html(200, squire_connect.render_connect_page(candidate, error=message))
+            return
+
+        # Store FIRST, then consume: a consume that lost a race after a store
+        # is harmless (same credential), while the reverse order could burn
+        # the nonce with nothing saved.
+        #
+        # store_api_key fails CLOSED: it refuses to write if the target would
+        # land on the persistent volume instead of tmpfs (the one forbidden
+        # outcome — a plaintext credential on disk). If it raises, the store
+        # runs BEFORE consume, so the nonce is untouched and stays live for a
+        # retry. Render our own fixed copy — never the exception text — and do
+        # not log the key or the exception detail.
+        try:
+            squire_connect.store_api_key(provider, api_key)
+        except Exception:
+            log("connect: credential store refused (non-tmpfs target); nonce left live")
+            self._respond_html(200, squire_connect.render_connect_page(
+                candidate,
+                error="Something went wrong saving that — ask your agent for a fresh link."))
+            return
+        squire_connect.consume_nonce(None, candidate)
+        _connect_clear(ip)
+        # Never log the provider *response* or the key; the provider NAME is fine.
+        log(f"connect: stored {provider} credential; nonce consumed")
+
+        # Background thread: a supervisord gateway restart can take ~45s and
+        # must not hold the browser's response open that long.
+        threading.Thread(
+            target=squire_connect.run_connected_pipeline, args=(provider,),
+            daemon=True,
+        ).start()
+        self._respond_html(200, squire_connect.render_done_page(provider))
+
     def do_GET(self):  # noqa: N802 - stdlib naming
-        if self.path.split("?", 1)[0] in ("/health", "/healthz"):
+        path = self.path.split("?", 1)[0]
+        # Public-domain gate: with a domain attached, only /connect/* is public.
+        if PUBLIC_DOMAIN and not _host_is_private(self.headers):
+            if not path.startswith("/connect/"):
+                log("rejected public-Host GET outside /connect")
+                self._respond(403, {"error": "forbidden"})
+                return
+        if path.startswith("/connect/"):
+            # One-time credential hand-off page (1C). GET never consumes the
+            # nonce — the user may reload before submitting.
+            if squire_connect is None:
+                self._respond(404, {"error": "not found"})
+                return
+            candidate = path[len("/connect/"):]
+            if squire_connect.find_nonce(None, candidate) is None:
+                # Same friendly page for invalid/expired/used — never an error
+                # dump, and never an oracle for which nonces exist.
+                self._respond_html(200, squire_connect.render_invalid_page())
+                return
+            self._respond_html(200, squire_connect.render_connect_page(candidate))
+            return
+        if path in ("/health", "/healthz"):
             self._respond(
                 200,
                 {
@@ -280,7 +499,7 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if self.path.split("?", 1)[0] == "/metrics":
+        if path == "/metrics":
             # LOOPBACK (or an authenticated caller) ONLY.
             #
             # This listener is bound to 0.0.0.0, and every tenant in the project
@@ -302,6 +521,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 - stdlib naming
         path = self.path.split("?", 1)[0]
+
+        # Public-domain gate (see do_GET). A forged Telegram update arriving
+        # via the public domain — even with a stolen delivery secret — is the
+        # injection path this exists to close. Counted so probing is visible.
+        if PUBLIC_DOMAIN and not _host_is_private(self.headers):
+            if not path.startswith("/connect/"):
+                log("rejected public-Host POST outside /connect")
+                count("updates_rejected")
+                self._respond(403, {"error": "forbidden"})
+                return
+
+        if path.startswith("/connect/"):
+            self._handle_connect_post(path)
+            return
+
         if path != WEBHOOK_PATH:
             self._respond(404, {"error": "not found"})
             return

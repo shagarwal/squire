@@ -239,16 +239,20 @@ Then ask ONE question: which of these three they already have. Read
 labels intact:
 
   - **OpenAI API key** — fully supported
-  - **ChatGPT subscription**, used via Codex — coming soon; OpenAI's Codex
-    team openly supports third-party agents using ChatGPT sign-in (unlike
-    Anthropic), though there's no formal written guarantee and OpenAI could
-    change this — and the sign-in flow is not live in this alpha yet
+  - **ChatGPT subscription**, used via Codex — uses your existing paid
+    ChatGPT plan via a device sign-in you approve on OpenAI's own site (no
+    key to paste); OpenAI's Codex team openly supports third-party agents
+    using ChatGPT sign-in (unlike Anthropic), though there's no formal
+    written guarantee and OpenAI could change this
   - **Anthropic API key** — fully supported
 
-Never drop the "coming soon" flag from the ChatGPT-subscription line —
-picking it is welcome, but nobody should pick it expecting to finish
-connecting today — and never inflate the Codex team's open support into a
-formal OpenAI endorsement: there is no written guarantee to promise.
+Keep the ChatGPT line's honest caveat intact — the Codex team's open support
+is real, but there's no formal written guarantee and OpenAI could change it,
+so never inflate it into a formal OpenAI endorsement. Device sign-in is a
+beta ChatGPT setting they may first need to enable (chatgpt.com -> Settings
+-> Security -> "device code authorization"); mention that real caveat if it
+comes up — but the path itself is live and connectable today, so never call
+it unavailable.
 
 If they ask about connecting a Claude subscription (earlier alphas offered
 one, so they may have seen it): read the `claude_subscription` entry in the
@@ -295,126 +299,123 @@ to the picked option's exact id — "openai_api_key", "openai_codex_oauth" or
 "anthropic_api_key". The next step reads that key to give them the right
 hand-off. If they picked nothing, leave the value as it is.
 
-If they picked the OpenAI API key or the Anthropic API key — the paths that
-are live today — confirm it in one warm line and get the
-credential moving. Read {skill_file} under `providers`
-for that option's detail and its `fallback`. THE ONE-TIME LINK DOES NOT EXIST
-YET — the tenant-served `/connect/<nonce>` endpoint ships in Phase 1C — so
-never invent a URL: ask them to paste the credential here and say you will
-secure it the moment it lands. Explain the missing link at most once in the
-whole conversation — after this message, never repeat that explanation. Keep
-the whole reply to a few short lines with a blank line between steps — this
-is a quick hand-off, not a form.
+If they picked the OpenAI API key or the Anthropic API key: confirm it in
+one warm line, then run this with the terminal tool:
 
-If they picked the ChatGPT subscription (via Codex): that path is COMING
-SOON and cannot be connected in this alpha yet. Send one warm message that
-does exactly three things: confirm it is a good choice and it is coming —
-their subscription will be usable the moment the sign-in flow ships; offer
-the OpenAI API key path (a key from platform.openai.com) as what works
-today; and promise nothing else. Never say a sign-in starts "in a moment",
-never offer to kick off a flow that does not exist, and never ask them to
-confirm they are ready for one.
+    /opt/squire/bin/squire-llm-connect mint-link
 
-If they asked about connecting a Claude subscription (earlier alphas offered
-one): read the `claude_subscription` entry in the `facts` block of the same
-file and answer from it — it isn't available, Anthropic's terms don't permit
-it for third-party apps, and an Anthropic API key is the way to run Claude
-models here. Answer only when asked — never volunteer it.
+and send them the "url" it prints. Tell them, in two short lines: the link
+is served by their own private container, it is single-use and expires in
+15 minutes, and the key they paste there goes straight to their agent —
+never through Telegram or Squire's shared servers. If the command prints
+no_public_domain, they can paste the key here instead — handle a paste
+exactly as the next step's rules say, including the transit disclosure.
+
+If they picked the ChatGPT subscription (via Codex): run this with the
+terminal tool:
+
+    /opt/squire/bin/squire-llm-connect start openai-device
+
+If it prints a user_code and verification_url, relay BOTH exactly — they
+are safe for chat — and tell them: open that URL, sign in to their ChatGPT
+account, type the code, done; the code expires in 15 minutes. If it prints
+"not_enabled" instead, relay its instructions once (chatgpt.com ->
+Settings -> Security -> turn on "device code authorization"; a Team or
+Enterprise workspace needs an admin) and offer to start again once they
+have flipped it. Never paste tokens in chat and never ask them to.
 
 If they asked about the allowance, Squire's own pricing, or the difference,
-read the `facts` block in the same file and answer with the values written
-there — never from memory. Keep the two bills separate: AI usage on their own
-account is their provider's bill; a Squire subscription pays for the assistant
-itself, later, and is no part of this setup.
+read the `facts` block in {skill_file} and answer with the values written
+there — never from memory. Keep the two bills separate.
 
-If they have none of these, or say "not now": accept it immediately without
-nagging, say the built-in allowance keeps working meanwhile, and move on —
-write the state as "ask_timezone" instead, and ask ONE question: where are
-they, or what timezone, so that when you say "tomorrow morning" you mean
-it.""",
-    "awaiting_credential": """This person is sending, or about to send, an AI account credential.
+If they have none of the three, or say "not now": accept it immediately
+without nagging, say the built-in allowance keeps working meanwhile, and
+move on — write the state as "ask_timezone" instead, and ask ONE question:
+where are they, or what timezone, so that when you say "tomorrow morning"
+you mean it.""",
+    "awaiting_credential": """This person is mid-connect on an API-key path: they have a one-time link
+served by their own container.
 
-Ask them to paste the key here, and handle it exactly as below. Never invent
-a URL, and never re-explain why there is no one-time link — that explanation
-was already given when they chose, and it is said at most once per
-conversation. Read {skill_file} under `awaiting_credential` for
-the detail.
+When they say they've submitted the key (or after a natural pause), run this
+with the terminal tool and read the "state" it prints:
 
-When they paste an API key into the chat: store it in {env_file}
-immediately, then DELETE their Telegram message right away without asking, then
-tell them once, plainly and without scolding — two or three short lines, not a
-security lecture — that the key worked, that you removed the message, and that
-a pasted key did travel through Telegram and Squire's relay, so they can
-rotate it if they want to be careful. State that disclosure straight and never
-minimise it: qualifiers like "totally fine", "don't worry" and "perfectly
-safe" are banned. The deletion and the rotation offer are the reassurance —
-the words must not editorialise.
+    /opt/squire/bin/squire-llm-connect status
 
-If the credential is rejected, say what the provider said in one line and offer
-that provider's `fallback` from the same file. Never retry more than twice —
+"connected": move on — in the STEP 1 command set the state to "connected".
+"none" or still pending: they likely haven't finished; offer help, and if
+the link expired, run `/opt/squire/bin/squire-llm-connect mint-link` and
+send the fresh URL without ceremony.
+
+If they paste an API key into the chat instead, that still works: store it
+in {env_file} immediately, then DELETE their Telegram message right away
+without asking, then tell them once, plainly and without scolding — two or
+three short lines — that the key worked, that you removed the message, and
+that a pasted key did travel through Telegram and Squire's relay, so they
+can rotate it if they want to be careful. Never minimise that disclosure:
+qualifiers like "totally fine", "don't worry" and "perfectly safe" are
+banned.
+
+If the page rejected their key, say what it said in one line and offer that
+provider's `fallback` from {skill_file}. Never retry more than twice —
 offer to come back to it later instead.
 
-If they have gone quiet on it or changed the subject, drop it: answer what they
-actually asked and write the state as "complete". You can raise it again when
-the trial is nearly up.""",
-    "connected": """Their own AI account is connected. This is good news — sound pleased about
-it. Confirm which provider is live in one warm line, say their own key is in
-use from now on so the built-in allowance's caps no longer apply to them, and
-offer one concrete thing you can now do better. Short lines, not a paragraph.
+If they have gone quiet on it or changed the subject, drop it: answer what
+they actually asked and write the state as "complete". You can raise it
+again when the trial is nearly up.""",
+    "connected": """Their own AI account is connected — this is the conversion moment, and it is
+good news: sound genuinely pleased about it.
 
-Do NOT say the trial key has been revoked or that their traffic now goes
-direct — neither is true yet.
+In a few short lines: confirm which provider is live, and say truthfully
+that their key is stored encrypted on their own volume, their AI traffic
+now goes directly to their provider (it no longer touches Squire's AI
+infrastructure), and Squire's built-in trial key for them has been revoked
+— their own account is the engine now.
 
-Then ask ONE question: where are they, or what timezone, so that when you say
-"tomorrow morning" you mean it.""",
+Offer one concrete thing you can now do better. Short lines, not a
+paragraph.
+
+Then ask ONE question: where are they, or what timezone, so that when you
+say "tomorrow morning" you mean it.""",
 }
 
-# ---------------------------------------------------------------------------
-# Coming-soon providers: on the menu, honestly flagged, but NOT connectable
-# today — nothing in this image implements their credential flow (device-code
-# sign-in is Phase 1C roadmap). Mirrors `status: coming_soon` in
-# state-machine.yaml's providers block; the test suite asserts the two sets
-# are identical.
-#
-# How the choice reaches this hook: concierge-state.json carries an `llm` key
-# (seeded "trial" by squire-entrypoint.sh), the STEP 1 write command carries
-# every key of that file, and the connect_llm directive tells the model to set
-# `llm` to the picked provider's id. On the next turn this hook reads the file
-# and, for `awaiting_credential`, swaps in the variant below — so a user who
-# picked a coming-soon option is never hit with "paste your API key" as if
-# that were what they chose (live incident, 2026-08-14).
-# ---------------------------------------------------------------------------
-_COMING_SOON_PROVIDERS = {"openai_codex_oauth"}
+# 1C: nothing is coming-soon any more — all three paths are live. The set is
+# kept (empty) because the drift suite pins hook-set == YAML-status-set.
+_COMING_SOON_PROVIDERS: set = set()
 
-# The `awaiting_credential` directive used when the recorded choice is a
-# coming-soon provider. One honest, warm hand-off: no paste demand, no
-# sign-in promise, the API-key path offered as what works today.
-_AWAITING_COMING_SOON = """This person picked the ChatGPT subscription (via Codex). That path is COMING
-SOON and cannot be connected in this alpha yet — there is no sign-in flow to
-start, so never announce or "kick off" a sign-in, and never demand a
-credential as if the subscription itself could land that way.
+# Providers whose credential lands via the in-chat device flow rather than the
+# one-time link. The awaiting_credential directive branches on this.
+_DEVICE_FLOW_PROVIDERS = {"openai_codex_oauth"}
 
-If they are asking to go ahead: say once, warmly, that their subscription
-will be usable the moment the sign-in flow ships, and that the OpenAI API
-key path (a key from platform.openai.com) works today if they would rather
-not wait. Never say "in a moment", and never re-explain why there is no
-one-time link — that was already said, at most once per conversation.
+# The `awaiting_credential` directive when the recorded choice is the ChatGPT
+# device flow: relay/poll the flow, never demand a paste.
+_AWAITING_DEVICE_FLOW = """This person is mid-connect on the ChatGPT device flow: they have (or need)
+a short code and the verification URL.
 
-If they paste an OpenAI API key: that is the live path — store it in
-{env_file} immediately, then DELETE their Telegram message right away
-without asking, and in the STEP 1 command set "llm" to "openai_api_key".
-Then tell them once, plainly and without scolding — two or three short
-lines — that the key worked, that you removed the message, and that a pasted
-key did travel through Telegram and Squire's relay, so they can rotate it if
-they want to be careful. Never minimise that disclosure: qualifiers like
-"totally fine", "don't worry" and "perfectly safe" are banned.
+If the flow has not started or they want a fresh code, run this with the
+terminal tool and relay the user_code and verification_url it prints —
+both are safe for chat:
 
-If they would rather wait for the sign-in flow: accept warmly, say the
-built-in allowance keeps working meanwhile — in the STEP 1 command set "llm"
-to "trial" and the state to "ask_timezone" — and ask ONE question: where are
-they, or what timezone, so that when you say "tomorrow morning" you mean it.
-Only let the state advance to "connected" when a credential has actually
-landed."""
+    /opt/squire/bin/squire-llm-connect start openai-device
+
+If that prints "not_enabled": relay its instructions once — device sign-in
+is a beta ChatGPT feature, off by default; they enable it at chatgpt.com ->
+Settings -> Security -> "device code authorization" (a Team/Enterprise
+workspace needs an admin) — then offer to start again.
+
+While they approve it in the browser, poll with the terminal tool:
+
+    /opt/squire/bin/squire-llm-connect status
+
+"connected": move on — in the STEP 1 command set the state to "connected".
+"denied" mentioning the free plan: say plainly that a paid ChatGPT plan is
+required, and offer the OpenAI API-key path (in the STEP 1 command set
+"llm" to "openai_api_key"). "timed_out": the code expired — offer to start
+again. Never ask them to paste any token into the chat.
+
+If they would rather switch to an API key or come back later, accept
+warmly — the built-in allowance keeps working meanwhile; for later, write
+the state as "ask_timezone" and ask ONE question: where are they, or what
+timezone."""
 
 # Where each state goes once its work is done. Mirrors the `then:` edges in
 # state-machine.yaml; the test suite asserts the two agree.
@@ -572,13 +573,11 @@ def _build_context(state: str, state_file: Path, raw: dict) -> str:
     # runs in front of every message and must not be able to fail.
     directive = _DIRECTIVES[state]
 
-    # Per-provider branch: when the recorded choice (the `llm` key the
-    # connect_llm turn wrote) is a coming-soon provider, the credential step
-    # must not demand a paste or promise a sign-in — it gets the honest
-    # variant instead. Any other value — a live provider id, "trial", or a
-    # missing key on an older state file — keeps the live paste path.
-    if state == "awaiting_credential" and str(raw.get("llm") or "").strip() in _COMING_SOON_PROVIDERS:
-        directive = _AWAITING_COMING_SOON
+    # Per-provider branch: the ChatGPT device flow lands its credential in
+    # chat + on the provider's site, so its awaiting step relays/polls the
+    # flow instead of pointing at the one-time link.
+    if state == "awaiting_credential" and str(raw.get("llm") or "").strip() in _DEVICE_FLOW_PROVIDERS:
+        directive = _AWAITING_DEVICE_FLOW
     for token, value in (
         ("{skill_file}", _skill_file()),
         ("{config_file}", str(_home() / "config.yaml")),

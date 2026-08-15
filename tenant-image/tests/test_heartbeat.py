@@ -53,6 +53,7 @@ ALLOWED_FIELDS = {
     "hindsight_ops_processing",
     "hindsight_ops_failed",
     "backup_last_success_age_seconds",
+    "llm_connected",
 }
 
 received = []
@@ -431,6 +432,62 @@ with tempfile.TemporaryDirectory() as home:
               all(d is not None and 1620 <= d <= 1980 for d in slow), delays)
     except Exception as exc:  # noqa: BLE001 - fail-first reporting, not a crash
         check("run_loop(stop) drives the cadence", False, f"raised {exc!r}")
+
+print("== llm_connected marker (1C reconciliation backstop) ==")
+# One boolean, derived from credential ARTIFACTS (env key names + auth.json
+# token presence). No value ever leaves the container; the whitelist test
+# above still pins the full payload.
+import importlib.util as _ilu  # noqa: E402
+
+
+def _load_hb(tag, home):
+    saved = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = home
+    try:
+        spec = _ilu.spec_from_file_location(tag, EMITTER)
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if saved is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved
+
+
+home_none = tempfile.mkdtemp()
+hb = _load_hb("hb_llm_none", home_none)
+check("no artifacts -> llm_connected False", hb.llm_connected() is False)
+check("llm_connected is whitelisted for the payload",
+      "llm_connected" in hb.PAYLOAD_FIELDS, hb.PAYLOAD_FIELDS)
+
+home_env = tempfile.mkdtemp()
+with open(os.path.join(home_env, ".env"), "w") as fh:
+    fh.write("SOMETHING_ELSE=1\nOPENAI_API_KEY=sk-test-connected-000\n")
+hb = _load_hb("hb_llm_env", home_env)
+check(".env provider key -> llm_connected True", hb.llm_connected() is True)
+
+home_empty = tempfile.mkdtemp()
+with open(os.path.join(home_empty, ".env"), "w") as fh:
+    fh.write("OPENAI_API_KEY=\n")  # present but EMPTY: not connected
+hb = _load_hb("hb_llm_empty", home_empty)
+check("empty marker value -> not connected", hb.llm_connected() is False)
+
+home_auth = tempfile.mkdtemp()
+with open(os.path.join(home_auth, "auth.json"), "w") as fh:
+    json.dump({"auth_mode": "chatgpt",
+               "tokens": {"access_token": "at-x", "refresh_token": "rt-x",
+                          "id_token": "", "account_id": "a"}}, fh)
+hb = _load_hb("hb_llm_auth", home_auth)
+check("auth.json OAuth artifact -> llm_connected True (the CONNECTED_MARKERS gap)",
+      hb.llm_connected() is True)
+
+home_corrupt = tempfile.mkdtemp()
+with open(os.path.join(home_corrupt, "auth.json"), "w") as fh:
+    fh.write("{ not json")
+hb = _load_hb("hb_llm_corrupt", home_corrupt)
+check("corrupt auth.json reads as not connected (collector never raises)",
+      hb.llm_connected() is False)
 
 print()
 if failures:

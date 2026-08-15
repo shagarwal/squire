@@ -380,6 +380,21 @@ jobs:
         # proof that owner binding lands BEFORE the update is forwarded.
         run: python3 tenant-image/tests/test_webhook_shim.py
 
+      - name: Credential connect flow (1C)
+        if: steps.present.outputs.exists == 'true'
+        # Nonce lifecycle (single-use, 15-min TTL, constant-time), the
+        # /connect page GET/POST through the real shim against faked provider
+        # validation, credential writes resolving the tmpfs symlinks, and the
+        # connected pipeline's switch -> restart -> notify ordering.
+        run: python3 tenant-image/tests/test_connect.py
+
+      - name: Codex device flow + squire-llm-connect CLI (1C)
+        if: steps.present.outputs.exists == 'true'
+        # The four spike-pinned device-flow calls against a fake issuer, the
+        # 404-not-enabled onboarding branch, free-plan gating, rotating-token
+        # refresh discipline, and the CLI's no-credentials-in-output contract.
+        run: python3 tenant-image/tests/test_llm_connect_cli.py
+
       - name: Fleet heartbeat is counts-only
         if: steps.present.outputs.exists == 'true'
         # The emitter is the only process that talks to the control plane on a

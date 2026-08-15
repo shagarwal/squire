@@ -8,6 +8,7 @@ without coordinating.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -142,6 +143,28 @@ class RevokeTrialKeyResponse(BaseModel):
     revoked: bool
 
 
+class LlmConnectedRequest(BaseModel):
+    """POST /internal/llm-connected -- a tenant reports its owner connected an LLM.
+
+    `provider` is a CLOSED vocabulary on purpose: three literals fit through
+    this field and nothing else, so it is structurally unable to smuggle key
+    material into the control plane. `extra="forbid"` for the same reason as
+    every other tenant-writable schema here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    provider: Literal["openai", "anthropic", "chatgpt"]
+
+
+class LlmConnectedResponse(BaseModel):
+    tenant_id: str
+    provider: str
+    connected_provider_recorded: bool
+    trial_key_revoked: bool
+
+
 # ---------------------------------------------------------------------------
 # Heartbeat / fleet (Task 0.6)
 # ---------------------------------------------------------------------------
@@ -195,6 +218,11 @@ class HeartbeatRequest(BaseModel):
     backup_last_success_age_seconds: int | None = Field(
         default=None, ge=0, le=_MAX_COUNTER
     )
+
+    #: 1C reconciliation backstop: the tenant's own "owner has connected an
+    #: LLM" flag, derived from credential artifacts on the tenant side. A
+    #: True against a still-active trial key triggers revocation.
+    llm_connected: bool | None = None
 
 
 class HeartbeatResponse(BaseModel):

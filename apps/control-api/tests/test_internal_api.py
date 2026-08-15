@@ -324,3 +324,143 @@ def test_bot_pool_stats(client, auth):
     r = client.get("/internal/bots", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"total": 2, "available": 1, "assigned": 1, "disabled": 0}
+
+
+# ---------------------------------------------------------------------------
+# POST /internal/llm-connected (1C): the tenant reports its owner connected an
+# LLM; control-api records the provider NAME and revokes the trial key.
+# ---------------------------------------------------------------------------
+
+
+class TestLlmConnected:
+    def _tenant_with_trial_key(self, session):
+        tenant = Tenant(
+            id="t-conn-1",
+            email="conn@example.com",
+            status=TenantStatus.RUNNING,
+            trial_key_alias="squire-trial-t-conn-1",
+            trial_key_active=True,
+        )
+        session.add(tenant)
+        session.commit()
+        return tenant
+
+    @respx.mock
+    def test_records_provider_and_revokes_trial_key(self, client, auth, session):
+        self._tenant_with_trial_key(session)
+        delete = respx.post("https://trial-proxy.squire.test/key/delete").mock(
+            return_value=httpx.Response(200, json={"deleted_keys": 1})
+        )
+        response = client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t-conn-1", "provider": "openai"},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "tenant_id": "t-conn-1",
+            "provider": "openai",
+            "connected_provider_recorded": True,
+            "trial_key_revoked": True,
+        }
+        assert delete.called
+
+        with db.session_scope() as s:
+            tenant = s.get(Tenant, "t-conn-1")
+            assert tenant.connected_provider == "openai"
+            assert tenant.trial_key_active is False
+
+    def test_idempotent_when_trial_key_already_gone(self, client, auth, session):
+        session.add(Tenant(id="t-conn-2", email="conn2@example.com",
+                           status=TenantStatus.RUNNING, trial_key_active=False))
+        session.commit()
+        response = client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t-conn-2", "provider": "chatgpt"},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert response.json()["trial_key_revoked"] is False
+        assert response.json()["connected_provider_recorded"] is True
+
+    def test_unknown_tenant_404(self, client, auth):
+        response = client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t-none", "provider": "openai"},
+            headers=auth,
+        )
+        assert response.status_code == 404
+
+    def test_requires_internal_token(self, client):
+        assert client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t", "provider": "openai"},
+        ).status_code == 401
+
+    def test_provider_vocabulary_is_closed(self, client, auth, session):
+        self._tenant_with_trial_key(session)
+        # Not a provider name -> 422. This is the privacy guard: the field can
+        # never carry key material because only three literals fit through it.
+        response = client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t-conn-1", "provider": "sk-ant-api03-oops"},
+            headers=auth,
+        )
+        assert response.status_code == 422
+
+    def test_extra_fields_are_rejected(self, client, auth, session):
+        self._tenant_with_trial_key(session)
+        response = client.post(
+            "/internal/llm-connected",
+            json={"tenant_id": "t-conn-1", "provider": "openai",
+                  "api_key": "sk-should-never-fit"},
+            headers=auth,
+        )
+        assert response.status_code == 422
+
+
+class TestHeartbeatReconciliation:
+    @respx.mock
+    def test_connected_beat_with_live_trial_key_revokes_it(self, client, auth, session):
+        session.add(Tenant(id="t-beat-1", email="beat@example.com",
+                           status=TenantStatus.RUNNING,
+                           trial_key_alias="squire-trial-t-beat-1",
+                           trial_key_active=True))
+        session.commit()
+
+        delete = respx.post("https://trial-proxy.squire.test/key/delete").mock(
+            return_value=httpx.Response(200, json={"deleted_keys": 1})
+        )
+        response = client.post(
+            "/internal/heartbeat",
+            json={"tenant_id": "t-beat-1", "uptime_seconds": 10,
+                  "gateway_up": True, "hindsight_up": True,
+                  "llm_connected": True},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert delete.called, "backstop must revoke the orphaned trial key"
+
+        with db.session_scope() as s:
+            assert s.get(Tenant, "t-beat-1").trial_key_active is False
+
+    @respx.mock
+    def test_unconnected_beat_leaves_the_trial_key_alone(self, client, auth, session):
+        session.add(Tenant(id="t-beat-2", email="beat2@example.com",
+                           status=TenantStatus.RUNNING,
+                           trial_key_alias="squire-trial-t-beat-2",
+                           trial_key_active=True))
+        session.commit()
+
+        delete = respx.post("https://trial-proxy.squire.test/key/delete").mock(
+            return_value=httpx.Response(200, json={"deleted_keys": 1})
+        )
+        response = client.post(
+            "/internal/heartbeat",
+            json={"tenant_id": "t-beat-2", "uptime_seconds": 10,
+                  "gateway_up": True, "hindsight_up": True,
+                  "llm_connected": False},
+            headers=auth,
+        )
+        assert response.status_code == 200
+        assert not delete.called
