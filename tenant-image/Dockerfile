@@ -522,6 +522,26 @@ ENV SQUIRE_TELEGRAM_IDENTITY_TTL=0
 # in this file.
 ENV SQUIRE_SHUTDOWN_NOTICES=0
 
+# --- Status notices OFF: hermes operator chatter is not user-facing ----------
+# The GENERAL fix, of which SQUIRE_SHUTDOWN_NOTICES above is one special case.
+# _prepare_gateway_status_message in gateway/run.py is the single chokepoint
+# every agent status callback passes through on its way to a chat surface
+# (lifecycle/warn/compacted). Genuine provider errors are recognised by text
+# shape and REWRITTEN to a short user-safe reply one branch above (those still
+# reach the user); everything else that reaches the terminal return is
+# operator-flavoured info/lifecycle/aux/compression chatter — e.g. the
+# "ℹ Codex gpt-5.4 caps context at 272K, so auto-compaction was raised …"
+# banner Squire users kept seeing at bad moments. Patch 005 gates that residue
+# behind this knob.
+#
+# 0 (or unset/empty/"off") = suppress the operator chatter; any other value
+# (e.g. "all") = upstream behaviour unchanged, an escape hatch for debugging.
+# The patch already defaults to quiet when the variable is absent — the
+# explicit 0 here makes the policy visible in the image definition and gives a
+# per-tenant Railway override (set it to "all" while debugging) the same
+# discoverability as every other ENV in this file.
+ENV SQUIRE_STATUS_NOTICES=0
+
 # --- Hindsight (docs/reference/hindsight-optimization-guide.md) -------------
 # The guide's systemd-unit knobs, translated to this container. Cgroup limits
 # from the guide are NOT set here: on Railway the whole service is one cgroup,

@@ -1,7 +1,59 @@
 diff --git a/gateway/run.py b/gateway/run.py
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -9138,6 +9138,40 @@
+@@ -630,6 +630,51 @@
+             return None
+     if _looks_like_gateway_provider_error(text):
+         return _gateway_provider_error_reply(text)
++    # (squire patch 005) THE STATUS-NOTICE CHOKEPOINT. Every agent status
++    # callback hermes would forward to a chat surface funnels through this
++    # one function as event_type in {"lifecycle", "warn", "compacted"}
++    # (run_agent._emit_status / _emit_warning; conversation_compression's
++    # "compacted" done-status). There is NO dedicated "error" category:
++    # genuine provider/API failures are recognised by TEXT SHAPE
++    # (_looks_like_gateway_provider_error) and REWRITTEN to a short,
++    # user-safe reply in the branch immediately above -- so by the time
++    # control reaches this terminal `return text`, the payload is exactly
++    # the operator-flavoured residue: the info/lifecycle/auxiliary/
++    # compression chatter that is neither a provider error nor already
++    # dropped above as noisy status.
++    #
++    # Incident history -- raw hermes OPERATOR notices kept leaking to
++    # Squire end users at the worst moments. "Gateway shutting down" and
++    # "Gateway online" are gated elsewhere (stop() +
++    # gateway_restart_notification). "Provider authentication failed" is a
++    # REWRITE and MUST survive -- a user deserves a sanitised "something
++    # went wrong", not silence. The one that finally motivated a GENERAL
++    # fix is the auto-compaction banner replayed on turn 1:
++    #   "Codex gpt-5.4 caps context at 272K, so auto-compaction was
++    #    raised to 92% (from 80%) ..."
++    # (agent_init._build_codex_gpt5_autoraise_notice, stashed in
++    # agent._compression_warning and re-emitted via
++    # status_callback("lifecycle", ...)). The audience is non-technical;
++    # this internal chatter is noise, never actionable.
++    #
++    # So gate the terminal return -- the operator-info residue -- behind
++    # one env var. Positioned AFTER the provider-error rewrite ON PURPOSE,
++    # so the suppress-vs-keep boundary is STRUCTURAL, not a fragile
++    # category allowlist: user-facing provider errors already returned
++    # above and are untouched; the local/CLI raw-diagnostic path and the
++    # already-dropped noisy-status path above are likewise untouched; only
++    # the info/lifecycle/aux/compression residue is silenced. Polarity
++    # matches the shutdown-notices gate and is DEFAULT-QUIET:
++    #
++    #   SQUIRE_STATUS_NOTICES unset / "" / "0" / "off"  -> suppress (None)
++    #   any other value (e.g. "all")                    -> upstream, unchanged
++    #
++    # Default-quiet is safe even where the var is absent: a self-hosted
++    # hermes without Squire's overlay never runs this patch at all, and the
++    # tenant image bakes SQUIRE_STATUS_NOTICES=0 in the Dockerfile so the
++    # policy is explicit rather than implied by absence.
++    if os.environ.get("SQUIRE_STATUS_NOTICES", "0").strip().lower() in ("", "0", "off"):
++        return None
+     return text
+ 
+ 
+@@ -9138,6 +9183,40 @@
          messages can be delivered. Best-effort: individual send failures are
          logged and swallowed so they never block the shutdown sequence.
          """
@@ -42,7 +94,7 @@ diff --git a/gateway/run.py b/gateway/run.py
          active = self._snapshot_running_agents()
          restart_source = self._restart_command_source if self._restart_requested else None
  
-@@ -17186,6 +17220,39 @@
+@@ -17186,6 +17265,39 @@
          # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
          # system-prompt diff and agent rebuild.
          if not history and not await self.async_session_store.has_any_sessions():
@@ -82,7 +134,7 @@ diff --git a/gateway/run.py b/gateway/run.py
              # Default first-contact note: a brief self-introduction.
              _intro_note = (
                  "[System note: This is the user's very first message ever. "
-@@ -17211,16 +17278,18 @@
+@@ -17211,16 +17323,18 @@
                      profile_build_mode(_onb_cfg) == "ask"
                      and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                  ):
@@ -104,7 +156,7 @@ diff --git a/gateway/run.py b/gateway/run.py
          
          # One-time prompt if no home channel is set for this platform
          # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-@@ -17258,6 +17327,55 @@
+@@ -17258,6 +17372,55 @@
                              home_env = "set"
                  except Exception:
                      pass

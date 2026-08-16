@@ -182,6 +182,25 @@ upstream-shutdown-notify	gateway/run.py	async def _notify_active_sessions_of_shu
 squire-005-shutdown-notices-env	gateway/run.py	SQUIRE_SHUTDOWN_NOTICES	required
 squire-005-shutdown-quiet	gateway/run.py	shutdown notices suppressed	required
 
+# 005 (status-notice chokepoint) — the GENERAL fix for raw hermes operator
+#       notices leaking to end users. _prepare_gateway_status_message is the
+#       single function every agent status callback funnels through before a
+#       chat surface sees it (event_type lifecycle/warn/compacted). Provider
+#       errors are recognised by text shape and REWRITTEN one branch above and
+#       must survive; the terminal `return text` is the operator-info residue —
+#       the info/lifecycle/aux/compression chatter, e.g. the "Codex … caps
+#       context … auto-compaction was raised" banner the user kept seeing.
+#       Patch 005 gates that terminal return behind SQUIRE_STATUS_NOTICES
+#       (unset/empty/"0"/"off" -> suppress; any other value -> upstream). The
+#       Dockerfile bakes the variable to 0.
+#
+#       The upstream-anchor row proves the chokepoint function still exists: if
+#       a refactor renames or inlines it, the hunk could "apply" somewhere
+#       harmless while a regrown path starts leaking operator chatter again.
+upstream-status-chokepoint	gateway/run.py	def _prepare_gateway_status_message(	required
+squire-005-status-notices-env	gateway/run.py	SQUIRE_STATUS_NOTICES	required
+squire-005-status-chokepoint	gateway/run.py	THE STATUS-NOTICE CHOKEPOINT	required
+
 # 006 — serverless-sleep identity refresh TTL (plugins/platforms/telegram/
 #       adapter.py), added 2026-08-10 after the Gate G1 sleep investigation.
 #

@@ -373,6 +373,18 @@ jobs:
         # plus the baked-0 image default.
         run: python3 tenant-image/tests/test_shutdown_notices_gate.py
 
+      - name: Operator status chatter is silenced (patch 005 — general fix)
+        if: steps.present.outputs.exists == 'true'
+        # The GENERAL fix, of which the shutdown gate above is one special
+        # case: raw hermes OPERATOR notices kept leaking to non-technical end
+        # users (most recently "ℹ Codex … caps context … auto-compaction was
+        # raised …"). _prepare_gateway_status_message is the single chokepoint
+        # every agent status callback passes through; patch 005 gates the
+        # operator-info residue behind SQUIRE_STATUS_NOTICES while preserving
+        # the provider-error rewrite. This suite applies the hunk for real,
+        # proves errors still pass, and pins the env semantics + baked-0 default.
+        run: python3 tenant-image/tests/test_status_notices_gate.py
+
       - name: Webhook shim contract
         if: steps.present.outputs.exists == 'true'
         # Verbatim forwarding, secret-token stamping, auth modes, retryable 503s,
