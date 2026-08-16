@@ -708,11 +708,31 @@ try:
         check("pipeline completes even when the proactive send fails", True)
     except Exception as exc:  # noqa: BLE001
         check("pipeline completes even when the proactive send fails", False, repr(exc))
+    check("a failed send leaves a diagnosable breadcrumb (poller stdout is DEVNULL)",
+          os.path.exists(os.path.join(home_f, ".squire", "celebration-error.json")),
+          os.listdir(os.path.join(home_f, ".squire")) if os.path.isdir(
+              os.path.join(home_f, ".squire")) else "no .squire")
 finally:
     os.environ.pop("SQUIRE_FAKE_HERMES_RC", None)
     os.environ.pop("SQUIRE_HERMES_BIN", None)
     os.environ.pop("SQUIRE_SUPERVISORCTL", None)
     os.environ.pop("CONTROL_API_URL", None)
+
+# --- Test 4b: the hermes binary is resolved ABSOLUTELY, never bare "hermes" ---
+# Live 2026-08-16: notify_owner_connected shelled bare "hermes". It runs from the
+# DETACHED device-flow poller — a supervisord grandchild inheriting supervisord's
+# frozen environment — so the name did not resolve, FileNotFoundError was
+# swallowed, and the celebration silently never sent while every other part of
+# the connect succeeded. supervisord.conf documents this exact trap for
+# [program:gateway]; this pins that we do not fall into it again.
+print("== hermes binary is resolved absolutely (supervisord PATH trap) ==")
+check("the default hermes binary is an absolute path",
+      squire_connect.HERMES_BIN_DEFAULT.startswith("/"), squire_connect.HERMES_BIN_DEFAULT)
+check("it is the venv binary supervisord uses, not the privilege-drop shim",
+      squire_connect.HERMES_BIN_DEFAULT == "/opt/hermes/.venv/bin/hermes",
+      squire_connect.HERMES_BIN_DEFAULT)
+check("the resolver never returns a bare name",
+      os.path.isabs(squire_connect._hermes_binary()), squire_connect._hermes_binary())
 
 # --- Test 5: config.yaml carries the compression notice gate & still parses --
 print("== config.yaml compression notice gate ==")

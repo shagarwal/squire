@@ -657,6 +657,48 @@ def _advance_concierge_after_connect(provider: str, hermes_home: str | None) -> 
         pass
 
 
+#: Where the real hermes CLI lives. NOT bare "hermes", and NOT
+#: /opt/hermes/bin/hermes: supervisord.conf spells out why for [program:gateway]
+#: — /opt/hermes/bin is a docker-exec privilege-drop shim that goes first on
+#: PATH, and a supervisord-spawned process inherits supervisord's own frozen
+#: environment, which need not contain it at all. This function runs from the
+#: DETACHED device-flow poller (a supervisord grandchild), so bare "hermes"
+#: raised FileNotFoundError and the celebration silently never sent — live on
+#: 2026-08-16. Use the venv binary supervisord itself uses.
+HERMES_BIN_DEFAULT = "/opt/hermes/.venv/bin/hermes"
+
+
+def _hermes_binary() -> str:
+    """The venv hermes if it is there, else whatever PATH offers (dev boxes)."""
+    if os.path.exists(HERMES_BIN_DEFAULT):
+        return HERMES_BIN_DEFAULT
+    import shutil
+    return shutil.which("hermes") or HERMES_BIN_DEFAULT
+
+
+def _record_celebration_failure(hermes_home: str | None, detail: str) -> None:
+    """Leave a breadcrumb a human can actually find.
+
+    The device-flow poller is detached with stdout/stderr on DEVNULL, so a
+    print() here goes nowhere — which is exactly why the first live failure took
+    a container autopsy to explain. Record the reason next to the connect status
+    file instead. Best-effort: never raise, never block the pipeline.
+    """
+    try:
+        state_dir = os.environ.get("SQUIRE_STATE_DIR") or os.path.join(
+            hermes_home or os.environ.get("HERMES_HOME") or "/opt/data", ".squire"
+        )
+        os.makedirs(state_dir, exist_ok=True)
+        _atomic_write_0600(
+            os.path.join(state_dir, "celebration-error.json"),
+            json.dumps({"error": detail[:500], "at": time.time()}).encode("utf-8"),
+        )
+    except Exception:  # noqa: BLE001 -- a breadcrumb must never break the flow
+        pass
+    print("[squire-connect] proactive celebration send failed; "
+          "owner can still message the bot", flush=True)
+
+
 def notify_owner_connected(provider: str, hermes_home: str | None = None) -> bool:
     """Proactively tell the owner "you're connected" and continue the flow.
 
@@ -678,17 +720,22 @@ def notify_owner_connected(provider: str, hermes_home: str | None = None) -> boo
         return False
 
     text = _celebration_text(provider)
-    hermes_bin = os.environ.get("SQUIRE_HERMES_BIN") or "hermes"
+    hermes_bin = os.environ.get("SQUIRE_HERMES_BIN") or _hermes_binary()
     try:
         result = subprocess.run(
             [hermes_bin, "send", "--to", f"telegram:{chat_id}", text],
             capture_output=True, timeout=30, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        print("[squire-connect] hermes send failed; owner can still message the bot", flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _record_celebration_failure(hermes_home, f"{type(exc).__name__}: {exc}")
         return False
     if result.returncode != 0:
-        print("[squire-connect] hermes send returned non-zero; owner can still message the bot", flush=True)
+        # stderr is OUR OWN send tool's diagnostics (never credential material):
+        # the text we send is the celebration copy and the only argument is a
+        # chat id, so recording a trimmed tail is safe and is the only way to
+        # ever see why a detached-poller send failed.
+        detail = (result.stderr or b"")[-300:].decode("utf-8", "replace").strip()
+        _record_celebration_failure(hermes_home, f"rc={result.returncode} {detail}")
         return False
 
     # Only once the celebration is actually out do we advance the flow past it.
