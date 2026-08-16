@@ -168,6 +168,15 @@ hooks:
 # one of the things the PRD sells (§2 "cross-chat approvals"), and re-deriving
 # its policy here would fork behaviour we want to inherit from upstream.
 
+# --- Compression -----------------------------------------------------------
+# Kills the raw "ℹ️ Codex gpt-5.4 caps context…" operator notice that leaked to a
+# user at the connect moment (2026-08-16), while KEEPING the beneficial
+# auto-compaction threshold raise itself. Same product rule as the other
+# lifecycle notices here: infrastructure detail is invisible to end users.
+# (Upstream gate: agent_init.py:1850/2699-2706.)
+compression:
+  codex_gpt55_autoraise_notice: false
+
 # --- Logging ---------------------------------------------------------------
 # The gateway sees every message the user sends. Its stdout is shipped to
 # Railway's log aggregator, which sits OUTSIDE the tenant's isolation boundary

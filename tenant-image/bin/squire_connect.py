@@ -543,11 +543,170 @@ def notify_control_api(provider: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Proactive owner celebration.
+#
+# The connect happens OUTSIDE any chat turn — in the detached squire-llm-connect
+# device-flow poller, or in the /connect POST handler's background thread. So
+# the agent never gets a turn in which to notice "you're connected" and tell the
+# user; before this, the user had to message the bot ("check again") to find out
+# it had happened. The fix: the moment the credential lands, push the celebration
+# straight to the owner's DM.
+#
+# MECHANISM — `hermes send` (NOT a raw Telegram call, NOT cron):
+#   `hermes send --to "telegram:<chat_id>" "<text>"` sends as the bot to a
+#   specific chat, runs NO LLM turn, and MIRRORS the text into the matching
+#   gateway session as an ASSISTANT turn — so the agent remembers having said it
+#   (no fake user message, no transcript pollution). The CLI is on PATH in the
+#   tenant container. Confirmed upstream at tools/send_message_tool.py +
+#   hermes_cli/send_cmd.py.
+#
+# The owner's chat_id, for a Telegram DM, IS the owner's Telegram user id — which
+# squire_autopair wrote into the approved-owner store when the tenant was bound.
+# We read it back through autopair's own helpers rather than hand-parsing.
+# ---------------------------------------------------------------------------
+
+#: Human-facing provider labels for the celebration copy. Anything not listed
+#: falls back to the raw id (defensive; the three live paths are all covered).
+_PROVIDER_LABELS = {"openai": "OpenAI", "anthropic": "Anthropic", "chatgpt": "ChatGPT"}
+
+
+def _celebration_text(provider: str) -> str:
+    """Warm 'you're connected' copy for `provider`, mirroring the concierge
+    `connected` state's INTENT (state-machine.yaml + the hook's
+    _DIRECTIVES["connected"]): confirm which provider is live, say plainly and
+    truthfully that their key is stored encrypted on their own volume and their
+    AI traffic now goes directly to their provider, that the built-in
+    allowance's caps no longer apply — then ask exactly ONE question, their
+    timezone/location.
+
+    Style rules (formatting block of state-machine.yaml): short lines, **bold**
+    only (hermes converts standard markdown -> MarkdownV2), NEVER underscores.
+    No trial/pricing pitch and no operator jargon — this is the user's warm
+    conversion moment, not an ops notice.
+    """
+    label = _PROVIDER_LABELS.get(provider, provider)
+    return (
+        f"**{label} is connected.** 🎉\n"
+        "\n"
+        "Your key is stored encrypted on your own private volume — only your "
+        "agent can reach it.\n"
+        "\n"
+        "From now on your messages run straight through your own account, so "
+        "the built-in allowance's caps no longer apply to you.\n"
+        "\n"
+        'Where are you (or just your timezone)? So I get "tomorrow morning" '
+        "right."
+    )
+
+
+def _resolve_owner_chat_id(hermes_home: str | None) -> str | None:
+    """The owner's Telegram chat_id from the autopair approved-owner store, or
+    None when the tenant is somehow still unbound (shouldn't happen post-connect,
+    but this must be safe rather than raise). For a Telegram DM the chat_id is
+    the owner's user id, which is exactly the KEY autopair stores the record
+    under — so the store's single key is the chat_id."""
+    home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+    try:
+        import squire_autopair  # bin/ is on sys.path via the shim/CLI importer
+        approved = squire_autopair.load_approved(squire_autopair.approved_path(home))
+    except Exception:
+        return None
+    if not isinstance(approved, dict) or not approved:
+        return None
+    # Autopair binds exactly one owner; take the first (only) key deterministically.
+    return next(iter(approved))
+
+
+def _concierge_state_path(hermes_home: str | None) -> str:
+    """The concierge state file, resolved the SAME way squire-concierge-hook.py
+    resolves it: SQUIRE_STATE_DIR if set, else <hermes_home>/.squire."""
+    state_dir = os.environ.get("SQUIRE_STATE_DIR")
+    if not state_dir:
+        home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+        state_dir = os.path.join(home, ".squire")
+    return os.path.join(state_dir, "concierge-state.json")
+
+
+def _advance_concierge_after_connect(provider: str, hermes_home: str | None) -> None:
+    """Advance the concierge flow past `connected` WITHOUT double-celebrating.
+
+    The celebration already happened via `hermes send` above, so we set the
+    stored step to the one that FOLLOWS `connected` in the state machine —
+    `ask_timezone` (see state-machine.yaml flow order) — and, if the file
+    already carries an `llm` key, point it at the provider that just connected.
+    All other keys are preserved (merge, not overwrite). Atomic 0600 write, same
+    discipline as every other write in this module. Absent/corrupt state file =>
+    skip silently: this is non-fatal onboarding polish, never a hard dependency.
+    """
+    state_file = _concierge_state_path(hermes_home)
+    try:
+        raw = json.loads(open(state_file, "r", encoding="utf-8").read())
+    except (OSError, ValueError):
+        return  # no state file, unreadable, or not JSON — nothing to advance
+    if not isinstance(raw, dict):
+        return
+    raw["state"] = "ask_timezone"  # the step after connected
+    if "llm" in raw:
+        raw["llm"] = provider
+    try:
+        _atomic_write_0600(state_file, json.dumps(raw).encode("utf-8"))
+    except OSError:
+        # Advancing the flow is best-effort: a failed write just means the hook
+        # re-runs the `connected` directive, which is recoverable, not fatal.
+        pass
+
+
+def notify_owner_connected(provider: str, hermes_home: str | None = None) -> bool:
+    """Proactively tell the owner "you're connected" and continue the flow.
+
+    Runs OUTSIDE any chat turn (detached poller / connect handler), so it pushes
+    the message itself via `hermes send`, which also mirrors the text into the
+    gateway session as an assistant turn (the agent remembers saying it). Then it
+    advances the concierge state so the flow does not re-celebrate.
+
+    Returns True iff the send succeeded (rc == 0). Every failure path is
+    non-fatal and returns False — a failed proactive send must never fail the
+    connect pipeline; the user can still message the bot.
+
+    NEVER logs the chat_id or any credential.
+    """
+    chat_id = _resolve_owner_chat_id(hermes_home)
+    if not chat_id:
+        # Unbound post-connect shouldn't happen, but is not worth failing over.
+        print("[squire-connect] no bound owner; skipping proactive celebration", flush=True)
+        return False
+
+    text = _celebration_text(provider)
+    hermes_bin = os.environ.get("SQUIRE_HERMES_BIN") or "hermes"
+    try:
+        result = subprocess.run(
+            [hermes_bin, "send", "--to", f"telegram:{chat_id}", text],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("[squire-connect] hermes send failed; owner can still message the bot", flush=True)
+        return False
+    if result.returncode != 0:
+        print("[squire-connect] hermes send returned non-zero; owner can still message the bot", flush=True)
+        return False
+
+    # Only once the celebration is actually out do we advance the flow past it.
+    _advance_concierge_after_connect(provider, hermes_home)
+    return True
+
+
 def run_connected_pipeline(provider: str, hermes_home: str | None = None) -> None:
     """The conversion moment. Order matters: the model must point at the new
     provider BEFORE the gateway restarts (or it boots back onto the trial
     model), and the trial key is revoked only AFTER the tenant can serve
-    without it."""
+    without it.
+
+    notify_owner_connected runs LAST and is non-fatal: the proactive DM is a
+    nicety on top of an already-complete conversion, and a failed send must not
+    fail the pipeline (a stored credential with a missed celebration is still a
+    connected tenant)."""
     switch_gateway_model(provider, hermes_home)
     restart_gateway()
     notify_control_api(provider)
+    notify_owner_connected(provider, hermes_home)

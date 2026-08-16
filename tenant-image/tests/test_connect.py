@@ -572,6 +572,173 @@ for var in ("SQUIRE_SUPERVISORCTL", "SQUIRE_SUPERVISORD_CONF",
             "CONTROL_API_URL", "INTERNAL_API_TOKEN", "TENANT_ID"):
     os.environ.pop(var, None)
 
+# ---------------------------------------------------------------------------
+# Proactive owner celebration: the moment the credential lands (in a detached
+# poller or the /connect handler, OUTSIDE any chat turn), the tenant sends the
+# "you're connected" message to the owner's DM via `hermes send` and advances
+# the concierge flow to ask_timezone so the agent does NOT double-celebrate.
+# ---------------------------------------------------------------------------
+print("== proactive owner celebration (notify_owner_connected) ==")
+
+# squire_autopair holds the approved-owner store; reuse its exact helpers so
+# this test resolves the owner id the same way production does.
+import squire_autopair  # noqa: E402
+
+# Words the celebration must NEVER contain: trial/pricing pitch + operator
+# jargon. (These are the substrings the test enforces; keep the copy clear of
+# all of them.)
+FORBIDDEN_WORDS = [
+    "trial", "price", "pricing", "cost", "$", "subscription", "pay", "budget",
+    # operator jargon
+    "gateway", "supervisor", "container", "tmpfs", "proxy", "revoke", "nonce",
+    "webhook",
+]
+
+
+def make_fake_hermes(bindir):
+    """A fake `hermes` binary that records its argv (NUL-separated so the text
+    arg's own newlines don't corrupt the record) and exits with the rc named by
+    SQUIRE_FAKE_HERMES_RC (default 0)."""
+    argv_log = os.path.join(bindir, "hermes-argv")
+    script = os.path.join(bindir, "hermes")
+    open(script, "w").write(
+        "#!/bin/sh\n"
+        'for a in "$@"; do printf "%s\\000" "$a" >> "' + argv_log + '"; done\n'
+        'exit ${SQUIRE_FAKE_HERMES_RC:-0}\n'
+    )
+    os.chmod(script, 0o755)
+    return script, argv_log
+
+
+def read_argv(argv_log):
+    """Decode the NUL-separated argv the fake hermes recorded."""
+    if not os.path.exists(argv_log):
+        return None
+    raw = open(argv_log, "rb").read()
+    parts = raw.split(b"\x00")
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
+    return [p.decode("utf-8") for p in parts]
+
+
+# --- Test 1: resolves the owner and invokes `hermes send --to telegram:<id>` --
+home_n = tempfile.mkdtemp()
+OWNER_ID = "998877665"
+# Seed the approved-owner store exactly as autopair writes it.
+squire_autopair._atomic_write_0600(
+    squire_autopair.approved_path(home_n),
+    {OWNER_ID: {"user_name": "owner", "approved_at": 1.0, "approved_by": "test"}},
+)
+# Seed a concierge-state file mid-flow (state=connected, plus other keys that
+# must survive the merge).
+state_dir_n = os.path.join(home_n, ".squire")
+os.makedirs(state_dir_n, exist_ok=True)
+cs_path = os.path.join(state_dir_n, "concierge-state.json")
+open(cs_path, "w").write(json.dumps(
+    {"state": "connected", "name": "Sam", "llm": "openai_api_key"}))
+
+bindir_n = tempfile.mkdtemp()
+fake_hermes, argv_log = make_fake_hermes(bindir_n)
+
+_saved_state_dir = os.environ.get("SQUIRE_STATE_DIR")
+os.environ["SQUIRE_STATE_DIR"] = state_dir_n  # same file the hook reads
+os.environ["SQUIRE_HERMES_BIN"] = fake_hermes
+os.environ.pop("SQUIRE_FAKE_HERMES_RC", None)
+try:
+    ok = squire_connect.notify_owner_connected("chatgpt", hermes_home=home_n)
+    check("notify_owner_connected returns True on a successful send", ok is True, ok)
+
+    argv = read_argv(argv_log)
+    check("hermes was invoked once", argv is not None, argv)
+    if argv:
+        check("argv is `send --to telegram:<owner id>`",
+              argv[:3] == ["send", "--to", f"telegram:{OWNER_ID}"], argv[:3])
+        text = argv[3] if len(argv) >= 4 else ""
+        check("celebration names the provider label (ChatGPT)", "ChatGPT" in text, text)
+        check("celebration asks the timezone question", "timezone" in text.lower(), text)
+        low = text.lower()
+        offenders = [w for w in FORBIDDEN_WORDS if w in low]
+        check("celebration has no trial/pricing/operator words", offenders == [], offenders)
+        check("celebration uses no underscores (MarkdownV2 renders them literally)",
+              "_" not in text, text)
+
+    # --- Test 2: concierge state advanced to ask_timezone, other keys merged --
+    advanced = json.loads(open(cs_path).read())
+    check("concierge state advanced connected -> ask_timezone",
+          advanced.get("state") == "ask_timezone", advanced)
+    check("pre-existing concierge keys survive the merge",
+          advanced.get("name") == "Sam", advanced)
+    check("llm field set to the connected provider id",
+          advanced.get("llm") == "chatgpt", advanced)
+finally:
+    if _saved_state_dir is None:
+        os.environ.pop("SQUIRE_STATE_DIR", None)
+    else:
+        os.environ["SQUIRE_STATE_DIR"] = _saved_state_dir
+
+# --- Test 3: no owner in the store -> False, no send, non-fatal --------------
+home_empty = tempfile.mkdtemp()
+bindir_e = tempfile.mkdtemp()
+fake_hermes_e, argv_log_e = make_fake_hermes(bindir_e)
+os.environ["SQUIRE_HERMES_BIN"] = fake_hermes_e
+res_empty = squire_connect.notify_owner_connected("openai", hermes_home=home_empty)
+check("unbound tenant -> notify returns False (non-fatal)", res_empty is False, res_empty)
+check("unbound tenant -> no hermes send attempted", read_argv(argv_log_e) is None,
+      read_argv(argv_log_e))
+
+# --- Test 4: hermes send non-zero exit -> False, pipeline still completes ----
+home_f = tempfile.mkdtemp()
+squire_autopair._atomic_write_0600(
+    squire_autopair.approved_path(home_f),
+    {OWNER_ID: {"user_name": "owner", "approved_at": 1.0}},
+)
+open(os.path.join(home_f, "config.yaml"), "w").write('model: "anthropic:claude-sonnet-5"\n')
+open(os.path.join(home_f, ".env"), "w").close()
+bindir_f = tempfile.mkdtemp()
+fake_hermes_f, argv_log_f = make_fake_hermes(bindir_f)
+os.environ["SQUIRE_HERMES_BIN"] = fake_hermes_f
+os.environ["SQUIRE_FAKE_HERMES_RC"] = "1"
+os.environ["SQUIRE_SUPERVISORCTL"] = "/bin/true"
+os.environ["CONTROL_API_URL"] = ""
+try:
+    res_fail = squire_connect.notify_owner_connected("anthropic", hermes_home=home_f)
+    check("hermes send rc!=0 -> notify returns False", res_fail is False, res_fail)
+    try:
+        squire_connect.run_connected_pipeline("anthropic", hermes_home=home_f)
+        check("pipeline completes even when the proactive send fails", True)
+    except Exception as exc:  # noqa: BLE001
+        check("pipeline completes even when the proactive send fails", False, repr(exc))
+finally:
+    os.environ.pop("SQUIRE_FAKE_HERMES_RC", None)
+    os.environ.pop("SQUIRE_HERMES_BIN", None)
+    os.environ.pop("SQUIRE_SUPERVISORCTL", None)
+    os.environ.pop("CONTROL_API_URL", None)
+
+# --- Test 5: config.yaml carries the compression notice gate & still parses --
+print("== config.yaml compression notice gate ==")
+try:
+    import yaml  # noqa: E402
+    _have_yaml = True
+except Exception:
+    _have_yaml = False
+
+cfg_path = IMAGE_ROOT / "home-template" / "config.yaml"
+cfg_text = cfg_path.read_text()
+check("config.yaml has compression.codex_gpt55_autoraise_notice: false",
+      "codex_gpt55_autoraise_notice: false" in cfg_text, cfg_text[-400:])
+if _have_yaml:
+    parsed = yaml.safe_load(cfg_text)
+    check("config.yaml still parses as YAML", isinstance(parsed, dict), type(parsed))
+    check("compression gate parses to the boolean false",
+          parsed.get("compression", {}).get("codex_gpt55_autoraise_notice") is False,
+          parsed.get("compression"))
+    check("the hooks block is intact after the edit",
+          isinstance(parsed.get("hooks", {}).get("pre_llm_call"), list)
+          and parsed["hooks"]["pre_llm_call"][0].get("command")
+          == "/opt/squire/bin/squire-concierge-hook.py", parsed.get("hooks"))
+else:
+    check("PyYAML present to validate config.yaml", False, "PyYAML not importable")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
