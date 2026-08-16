@@ -370,6 +370,9 @@ RUN /opt/squire/venv/bin/python -m py_compile \
         /opt/squire/bin/squire-hindsight-healthcheck.py \
         /opt/squire/bin/squire-heartbeat.py \
         /opt/squire/bin/squire-concierge-hook.py \
+        /opt/squire/bin/squire_connect.py \
+        /opt/squire/bin/squire_codex_device.py \
+        /opt/squire/bin/squire-llm-connect \
  && chmod -R a+rX /opt/squire \
  && mkdir -p /opt/squire/run \
  && chown hermes:hermes /opt/squire/run

@@ -47,7 +47,19 @@ class DeviceFlowConfig:
     code_lifetime_seconds: int = 900  # user code expires in 15 minutes
 
 
+#: auth.openai.com sits behind Cloudflare, which BLOCKS urllib's default
+#: "Python-urllib/3.x" User-Agent with an HTTP 530 (an edge error, not an API
+#: response — it looks exactly like an OpenAI outage and was misdiagnosed as one
+#: live on 2026-08-16). Any explicit UA gets through. Set it on every
+#: device-flow call, not just the first: all four hit the same edge.
+#: NOTE the asymmetry — api.openai.com and api.anthropic.com (the key-validation
+#: paths in squire_connect.py) are NOT behind this filter and answer urllib
+#: fine, which is why only this module needs the header.
+USER_AGENT = "squire-llm-connect/1.0"
+
+
 def _default_transport(url: str, body: bytes, headers: dict) -> tuple[int, bytes]:
+    headers = {"User-Agent": USER_AGENT, **headers}
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:

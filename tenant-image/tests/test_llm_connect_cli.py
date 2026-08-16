@@ -346,6 +346,61 @@ check("access token was NOT written as plaintext to the volume auth.json",
 check("failure detail carries no token material",
       "at-cli-secret" not in json.dumps(final2), final2)
 
+print("== the real transport sends an explicit User-Agent (Cloudflare 530 guard) ==")
+# auth.openai.com is behind Cloudflare, which rejects urllib's default
+# "Python-urllib/3.x" UA with HTTP 530 — an edge error that reads exactly like
+# an OpenAI outage (misdiagnosed as one live on 2026-08-16). The injected
+# transport used by every test above cannot catch this, because the header is
+# set inside _default_transport, so pin it against a real socket here.
+ua_seen = []
+
+
+class UACapture(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        return
+
+    def do_POST(self):
+        ua_seen.append(self.headers.get("User-Agent"))
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        body = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+UA_PORT = 18087
+ua_server = ThreadingHTTPServer(("127.0.0.1", UA_PORT), UACapture)
+ua_server.daemon_threads = True
+threading.Thread(target=ua_server.serve_forever, daemon=True).start()
+try:
+    dev._default_transport(
+        f"http://127.0.0.1:{UA_PORT}/usercode", b"{}", {"Content-Type": "application/json"}
+    )
+    check("the real transport sent a User-Agent", bool(ua_seen and ua_seen[0]), ua_seen)
+    check(
+        "it is NOT urllib's default (Cloudflare 530s that one)",
+        bool(ua_seen) and "Python-urllib" not in (ua_seen[0] or ""),
+        ua_seen,
+    )
+    check(
+        "it is the pinned squire UA",
+        bool(ua_seen) and ua_seen[0] == dev.USER_AGENT,
+        (ua_seen, dev.USER_AGENT),
+    )
+    # Caller-supplied headers must survive alongside the injected UA.
+    ua_seen.clear()
+    dev._default_transport(
+        f"http://127.0.0.1:{UA_PORT}/usercode", b"{}", {"User-Agent": "caller-override/9"}
+    )
+    check("an explicit caller UA still wins", ua_seen == ["caller-override/9"], ua_seen)
+finally:
+    ua_server.shutdown()
+    ua_server.server_close()
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
