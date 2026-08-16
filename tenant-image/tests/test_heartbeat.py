@@ -482,6 +482,30 @@ hb = _load_hb("hb_llm_auth", home_auth)
 check("auth.json OAuth artifact -> llm_connected True (the CONNECTED_MARKERS gap)",
       hb.llm_connected() is True)
 
+# The chatgpt connect path writes the HERMES ENVELOPE (version/active_provider/
+# providers), and — since 2026-08-16 — writes NO OPENAI_API_KEY into .env,
+# because an OAuth access token is not an API key. So auth.json is the ONLY
+# artifact left for this backstop to see: miss the nested shape and control-api
+# never revokes the trial key for a ChatGPT-subscription tenant.
+home_envelope = tempfile.mkdtemp()
+with open(os.path.join(home_envelope, "auth.json"), "w") as fh:
+    json.dump({"version": 1, "active_provider": "openai-codex",
+               "providers": {"openai-codex": {
+                   "auth_mode": "chatgpt",
+                   "tokens": {"access_token": "at-x", "refresh_token": "rt-x"},
+                   "last_refresh": "2026-08-16T00:00:00Z"}},
+               "updated_at": "2026-08-16T00:00:00Z"}, fh)
+hb = _load_hb("hb_llm_envelope", home_envelope)
+check("hermes-envelope auth.json -> llm_connected True",
+      hb.llm_connected() is True)
+
+home_empty_env = tempfile.mkdtemp()
+with open(os.path.join(home_empty_env, "auth.json"), "w") as fh:
+    json.dump({"version": 1, "providers": {"openai-codex": {"tokens": {}}}}, fh)
+hb = _load_hb("hb_llm_envelope_empty", home_empty_env)
+check("an envelope with no access_token reads as not connected",
+      hb.llm_connected() is False)
+
 home_corrupt = tempfile.mkdtemp()
 with open(os.path.join(home_corrupt, "auth.json"), "w") as fh:
     fh.write("{ not json")

@@ -114,23 +114,80 @@ check("plan gate: free is rejected", dev.plan_allowed({"chatgpt_plan_type": "fre
 check("plan gate: unknown/missing does not hard-fail",
       dev.plan_allowed({}) is True)
 
+print("== auth.json is the HERMES envelope, not the bare codex record ==")
+# Live 2026-08-16: we wrote the codex-cli record ({auth_mode, tokens, ...}) as
+# the WHOLE auth.json. Hermes reads its own envelope (version/active_provider/
+# providers) and, finding nothing it recognised, fell through to OpenRouter —
+# every message died with "Missing Authentication header". Verified against a
+# known-working hermes install.
 auth = dev.build_auth_json(tokens)
-check("auth.json has the spike's shape",
-      auth["auth_mode"] == "chatgpt"
-      and set(auth["tokens"]) == {"id_token", "access_token", "refresh_token", "account_id"}
-      and auth["tokens"]["account_id"] == "acct-9"
-      and isinstance(auth["last_refresh"], str), auth)
+entry = (auth.get("providers") or {}).get("openai-codex") or {}
+check("envelope carries version/active_provider/updated_at",
+      auth.get("version") == 1
+      and auth.get("active_provider") == "openai-codex"
+      and isinstance(auth.get("updated_at"), str), auth)
+check("providers['openai-codex'] carries auth_mode chatgpt",
+      entry.get("auth_mode") == "chatgpt", auth)
+check("provider entry carries BOTH tokens (no refresh_token = hermes never refreshes)",
+      (entry.get("tokens") or {}).get("access_token") == "at-secret-1"
+      and (entry.get("tokens") or {}).get("refresh_token") == "rt-secret-1", auth)
+check("provider entry carries last_refresh + a tenant label",
+      isinstance(entry.get("last_refresh"), str)
+      and str(entry.get("label", "")).startswith("tenant-"), auth)
+check("no credential_pool is hand-written (hermes seeds it from the singleton)",
+      "credential_pool" not in auth, auth)
+
+print("== auth.json merge safety (never clobber another provider) ==")
+existing = {
+    "version": 1,
+    "active_provider": "anthropic",
+    "providers": {"anthropic": {"auth_mode": "api_key",
+                                "tokens": {"access_token": "anthropic-at"}}},
+    "credential_pool": {"keep": "me"},
+}
+merged = dev.build_auth_json(tokens, existing=existing)
+check("the other provider's credentials survive",
+      merged["providers"]["anthropic"]["tokens"]["access_token"] == "anthropic-at", merged)
+check("openai-codex is added alongside it",
+      merged["providers"]["openai-codex"]["tokens"]["access_token"] == "at-secret-1", merged)
+check("unrelated top-level keys survive",
+      merged.get("credential_pool") == {"keep": "me"}, merged)
+check("a non-blank active_provider is NOT overwritten",
+      merged["active_provider"] == "anthropic", merged)
+check("the document handed in is not mutated in place",
+      set(existing["providers"]) == {"anthropic"}, existing)
+check("a blank active_provider IS filled in",
+      dev.build_auth_json(tokens, existing={"active_provider": "   "})[
+          "active_provider"] == "openai-codex")
+check("a non-dict existing document is ignored, not crashed on",
+      dev.build_auth_json(tokens, existing=["nonsense"])["version"] == 1)
 
 print("== refresh policy ==")
-fresh = dict(auth)
+fresh = dev.build_auth_json(tokens)
 check("fresh tokens do not need refresh", dev.needs_refresh(fresh, now=time.time()) is False)
-soon = dev.build_auth_json({**tokens, "id_token": tokens["id_token"]})
+soon = dev.build_auth_json(tokens)
 soon["access_token_exp"] = time.time() + 60  # within the 5-minute window
 check("exp within 5 min triggers refresh", dev.needs_refresh(soon, now=time.time()) is True)
-stale = dict(auth)
-stale["last_refresh"] = dev.iso_utc(time.time() - 9 * 86400)  # > 8 days
+# The stored document no longer carries an id_token, so the ACCESS token's own
+# exp claim is what drives refresh (it is a real JWT from the issuer).
+jwt_soon = dev.build_auth_json(
+    {**tokens, "access_token": fake_jwt({"exp": int(time.time()) + 60})})
+check("an access token whose own exp is within 5 min triggers refresh",
+      dev.needs_refresh(jwt_soon, now=time.time()) is True, jwt_soon)
+stale = dev.build_auth_json(tokens)
+stale["providers"]["openai-codex"]["last_refresh"] = dev.iso_utc(time.time() - 9 * 86400)
 check("last_refresh older than 8 days triggers refresh",
       dev.needs_refresh(stale, now=time.time()) is True)
+# A tenant that connected before this fix has the old FLAT document on disk;
+# the refresh policy must still read it rather than refresh-looping forever.
+legacy = {"auth_mode": "chatgpt", "last_refresh": dev.iso_utc(time.time()),
+          "tokens": {"access_token": "at-legacy", "refresh_token": "rt-legacy",
+                     "id_token": tokens["id_token"], "account_id": "acct-9"}}
+check("a legacy flat document is still understood (fresh)",
+      dev.needs_refresh(legacy, now=time.time()) is False, legacy)
+check("provider_entry pulls the tokens out of either shape",
+      dev.provider_entry(auth)["tokens"]["refresh_token"] == "rt-secret-1"
+      and dev.provider_entry(legacy)["tokens"]["refresh_token"] == "rt-legacy")
 
 
 def transport_refresh(url, body, headers):
@@ -216,7 +273,14 @@ os.makedirs(os.path.join(home, ".squire"), exist_ok=True)
 # Reproduce the tmpfs-symlink shape here (mirrors test_connect.py) and assert
 # against the tmpfs target file.
 env_tmpfs = tempfile.mkdtemp()
-open(os.path.join(env_tmpfs, ".env"), "w").close()
+# Pre-seed the two BOGUS variables the old chatgpt branch wrote (an OAuth
+# access token is not an API key, and pointing OPENAI_BASE_URL at the codex
+# backend misroutes the gateway). A tenant that connected before this fix has
+# them on disk, so the connect path must leave .env WITHOUT them afterwards.
+with open(os.path.join(env_tmpfs, ".env"), "w") as fh:
+    fh.write("OPENAI_API_KEY=stale-oauth-token\n"
+             "OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex\n"
+             "TELEGRAM_BOT_TOKEN=unrelated-must-survive\n")
 os.symlink(os.path.join(env_tmpfs, ".env"), os.path.join(home, ".env"))
 # auth.json (the ChatGPT OAuth tokens) is ALSO a tmpfs symlink in the real
 # container -- store_chatgpt_tokens now applies the same fail-closed
@@ -224,6 +288,13 @@ os.symlink(os.path.join(env_tmpfs, ".env"), os.path.join(home, ".env"))
 # tmpfs-symlink shape or the write is (correctly) refused. The negative test
 # below proves the refusal when auth.json is a plain file on the volume.
 os.symlink(os.path.join(env_tmpfs, "auth.json"), os.path.join(home, "auth.json"))
+# A pre-existing auth.json with ANOTHER provider in it: the chatgpt connect
+# must merge into this document, never replace it.
+with open(os.path.join(env_tmpfs, "auth.json"), "w") as fh:
+    json.dump({"version": 1, "active_provider": "",
+               "providers": {"anthropic": {"auth_mode": "api_key",
+                                           "tokens": {"access_token": "keep-me"}}},
+               "squire_note": "unrelated-top-level-key"}, fh)
 CLI_ENV = dict(os.environ)
 CLI_ENV.update({
     "HERMES_HOME": home,
@@ -293,14 +364,27 @@ check("status names the provider, not the tokens",
 auth_path = os.path.join(home, "auth.json")
 check("auth.json written", os.path.exists(auth_path), auth_path)
 auth = json.loads(open(auth_path).read())
-check("auth.json carries the granted tokens",
-      auth["tokens"]["access_token"] == "at-cli-secret"
-      and auth["tokens"]["account_id"] == "acct-cli"
-      and auth["auth_mode"] == "chatgpt", auth)
+cli_entry = (auth.get("providers") or {}).get("openai-codex") or {}
+check("auth.json carries the granted tokens under providers['openai-codex']",
+      (cli_entry.get("tokens") or {}).get("access_token") == "at-cli-secret"
+      and (cli_entry.get("tokens") or {}).get("refresh_token") == "rt-cli-secret"
+      and cli_entry.get("auth_mode") == "chatgpt", auth)
+check("the CLI writes the hermes envelope",
+      auth.get("version") == 1 and auth.get("active_provider") == "openai-codex", auth)
+check("the pre-existing anthropic provider + unrelated key survived the write",
+      auth["providers"]["anthropic"]["tokens"]["access_token"] == "keep-me"
+      and auth.get("squire_note") == "unrelated-top-level-key", auth)
+
 env_text = open(os.path.join(env_tmpfs, ".env")).read()  # follow the symlink to tmpfs
-check("gateway env got the access token + codex base url",
-      "OPENAI_API_KEY=at-cli-secret" in env_text
-      and "OPENAI_BASE_URL=https://chatgpt.com/backend-api/codex" in env_text, env_text)
+env_keys = {line.split("=", 1)[0] for line in env_text.splitlines() if "=" in line}
+check("the chatgpt path writes NO OPENAI_API_KEY (an OAuth token is not an API key)",
+      "OPENAI_API_KEY" not in env_keys, env_text)
+check("the chatgpt path writes NO OPENAI_BASE_URL (it misroutes the gateway)",
+      "OPENAI_BASE_URL" not in env_keys, env_text)
+check("the access token never reaches .env at all",
+      "at-cli-secret" not in env_text, env_text)
+check("unrelated .env variables survive the cleanup",
+      "TELEGRAM_BOT_TOKEN=unrelated-must-survive" in env_text, env_text)
 
 # --- fail-closed: auth.json write is refused on a non-tmpfs target -------
 # If the entrypoint's auth.json symlink were ever missing, auth.json would

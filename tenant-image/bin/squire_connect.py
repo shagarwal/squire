@@ -359,8 +359,38 @@ def env_upsert(env_path: str, updates: dict) -> None:
     _atomic_write_0600(target, ("\n".join(kept) + "\n").encode("utf-8"))
 
 
+def env_remove(env_path: str, keys) -> None:
+    """Strip `keys` from the tenant's .env, leaving every other line untouched.
+
+    The counterpart to env_upsert, and used by exactly one caller: the ChatGPT
+    connect path, which until 2026-08-16 wrote OPENAI_API_KEY=<oauth token> and
+    OPENAI_BASE_URL=<codex backend>. Those two made hermes route a ChatGPT
+    subscription down the OpenAI API-key path; a tenant that connected under the
+    old code still has them on disk, so fixing auth.json alone would not fix the
+    tenant.
+
+    No-ops when the file is absent or carries none of the keys — a rewrite that
+    is not needed is a rewrite that can only go wrong.
+    """
+    keys = set(keys)
+    target = os.path.realpath(env_path)
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    kept = [line for line in lines if line.split("=", 1)[0] not in keys]
+    if kept == lines:
+        return
+    _assert_tmpfs_target(env_path)  # fail closed before touching the target
+    _atomic_write_0600(target, ("\n".join(kept) + "\n").encode("utf-8"))
+
+
 ANTHROPIC_DIRECT_BASE_URL = "https://api.anthropic.com"
-CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+# There is deliberately no CHATGPT_CODEX_BASE_URL any more. Pointing
+# OPENAI_BASE_URL at the codex backend was one of the three wiring errors fixed
+# on 2026-08-16: hermes selects that backend itself once auth.json names the
+# openai-codex provider, and an explicit base URL only misroutes the gateway.
 
 
 def store_api_key(provider: str, key: str, hermes_home: str | None = None) -> None:
@@ -397,12 +427,24 @@ import re
 import subprocess
 
 
+#: Hermes's provider name for a ChatGPT subscription (see squire_codex_device).
+CHATGPT_HERMES_PROVIDER = "openai-codex"
+
+
 def _gateway_model_for(provider: str) -> str:
     """Env-overridable so a model rename never needs an image rebuild.
-    anthropic keeps the trial's model id — same model, now direct + unmetered."""
+
+    anthropic keeps the trial's model id — same model, now direct + unmetered.
+    chatgpt is a BARE SLUG, not a `provider:model` string: it goes into the
+    `default:` key of the model mapping below, with the provider named
+    separately. Valid slugs for a ChatGPT account today are gpt-5.4, gpt-5.5,
+    gpt-5.4-mini and gpt-5.3-codex; upstream lists gpt-5.2-codex,
+    gpt-5.1-codex-max and gpt-5.1-codex-mini as backend-REJECTED for ChatGPT
+    accounts, so never default to one of those.
+    """
     defaults = {
         "openai": "openai:gpt-4.1",
-        "chatgpt": "openai:gpt-5-codex",
+        "chatgpt": "gpt-5.4",
         "anthropic": "anthropic:claude-sonnet-5",
     }
     env_names = {
@@ -413,17 +455,47 @@ def _gateway_model_for(provider: str) -> str:
     return os.environ.get(env_names.get(provider, ""), "") or defaults[provider]
 
 
+def _model_yaml_block(provider: str) -> str:
+    """The replacement for config.yaml's `model:` entry.
+
+    ChatGPT subscriptions need a MAPPING, not a scalar. Live 2026-08-16: we
+    wrote `model: "openai:gpt-5-codex"`, which hermes does not resolve to its
+    openai-codex provider at all — it fell through to OpenRouter and every
+    message came back "Missing Authentication header". Verified against a
+    known-working hermes install.
+
+    Deliberately NOT written here: `api_mode` (hermes forces codex_responses for
+    this provider), `base_url` and `model.api_key` (the credential lives in
+    auth.json), and `model.openai_runtime` (that opt-in needs a `codex` binary
+    the image does not ship).
+    """
+    if provider == "chatgpt":
+        return ('model:\n'
+                f'  provider: "{CHATGPT_HERMES_PROVIDER}"\n'
+                f'  default: "{_gateway_model_for(provider)}"')
+    return f'model: "{_gateway_model_for(provider)}"'
+
+
+#: The `model:` entry INCLUDING any indented mapping lines under it. Matching
+#: the continuation lines matters in both directions: writing a scalar over the
+#: first line of a mapping would strand `  provider:` / `  default:` under it,
+#: which is invalid YAML and stops the gateway booting at all.
+_MODEL_ENTRY_RE = re.compile(r'(?m)^model:[^\n]*(?:\n[ \t]+[^\n]*)*')
+
+
 def switch_gateway_model(provider: str, hermes_home: str | None = None) -> bool:
-    """Anchored per-line rewrite of the `model:` line ONLY — the same targeted
+    """Anchored rewrite of the `model:` entry ONLY — the same targeted
     discipline as the concierge hook's timezone command, and for the same
     reason: config.yaml also carries the hooks block that makes onboarding
     work, and a YAML round-trip is how that gets silently dropped."""
     home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
     config_path = os.path.join(home, "config.yaml")
-    model = _gateway_model_for(provider)
+    block = _model_yaml_block(provider)
     try:
         text = open(config_path, "r", encoding="utf-8").read()
-        new_text = re.sub(r'(?m)^model:.*$', f'model: "{model}"', text, count=1)
+        # A lambda replacement, not a string: a literal would let a backslash or
+        # a \g in a model slug be read as a group reference.
+        new_text = _MODEL_ENTRY_RE.sub(lambda _m: block, text, count=1)
         if new_text != text:
             _atomic_write_0600(os.path.realpath(config_path), new_text.encode("utf-8"))
         return True

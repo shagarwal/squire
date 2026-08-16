@@ -89,10 +89,22 @@ def cmd_status() -> int:
 
 
 def store_chatgpt_tokens(tokens: dict) -> None:
-    """auth.json (sealed name — secrets-sync encrypts it) + gateway env.
-    Both writes resolve symlinks (see squire_connect.env_upsert's rationale)."""
+    """Write the OAuth tokens into $HERMES_HOME/auth.json — and NOWHERE else.
+
+    auth.json is a sealed name (secrets-sync encrypts it) and the write resolves
+    the symlink, same rationale as squire_connect.env_upsert.
+
+    NO .env WRITE. Until 2026-08-16 this also put OPENAI_API_KEY=<oauth access
+    token> and OPENAI_BASE_URL=<codex backend> into the tenant's .env. Both are
+    wrong — an OAuth access token is not an API key — and they made hermes route
+    the ChatGPT subscription down the OpenAI API-key path, which is how a
+    correctly-acquired token still produced "Missing Authentication header" on
+    every message. The connect path now actively strips them, because a tenant
+    that connected under the old code has them on disk and hermes would keep
+    misrouting on the stale values. (store_api_key(), the openai/anthropic
+    API-key path, is untouched: those two genuinely do belong in .env.)
+    """
     home = os.environ.get("HERMES_HOME") or "/opt/data"
-    auth = dev.build_auth_json(tokens)
     # auth.json is normally a SYMLINK the entrypoint points into tmpfs, so the
     # write follows the link off the persistent volume. Apply the SAME
     # fail-closed guard the .env write already uses (env_upsert ->
@@ -106,13 +118,27 @@ def store_chatgpt_tokens(tokens: dict) -> None:
     auth_link = os.path.join(home, "auth.json")
     squire_connect._assert_tmpfs_target(auth_link)  # fail closed
     auth_path = os.path.realpath(auth_link)
+    # MERGE onto whatever is already in auth.json: it is a multi-provider
+    # document and another provider's credentials must never be clobbered.
+    # Anything unreadable/unparseable is treated as "no document" rather than
+    # aborting — refusing to store a freshly-granted token because of a corrupt
+    # file would strand the user mid-onboarding.
+    existing = None
+    try:
+        loaded = json.loads(open(auth_path, "rb").read())
+        if isinstance(loaded, dict):
+            existing = loaded
+    except (OSError, ValueError):
+        existing = None
+    auth = dev.build_auth_json(tokens, existing=existing)
     squire_connect._atomic_write_0600(
         auth_path, json.dumps(auth, indent=2).encode("utf-8")
     )
-    squire_connect.env_upsert(os.path.join(home, ".env"), {
-        "OPENAI_API_KEY": auth["tokens"]["access_token"],
-        "OPENAI_BASE_URL": squire_connect.CHATGPT_CODEX_BASE_URL,
-    })
+    # Remove the two variables the old (broken) chatgpt branch wrote. See the
+    # docstring: leaving a stale OAuth token in OPENAI_API_KEY keeps hermes
+    # misrouting even after auth.json is correct.
+    squire_connect.env_remove(os.path.join(home, ".env"),
+                              ("OPENAI_API_KEY", "OPENAI_BASE_URL"))
 
 
 def cmd_start_openai_device() -> int:
@@ -208,8 +234,16 @@ def cmd_refresh_openai_device() -> int:
         print(json.dumps({"state": "fresh"}))
         return 0
     cfg = dev.DeviceFlowConfig()
+    # provider_entry reads BOTH document shapes, so a tenant whose auth.json is
+    # still the pre-2026-08-16 flat record refreshes normally (and is rewritten
+    # into the hermes envelope by store_chatgpt_tokens below).
     try:
-        tokens = dev.refresh_tokens(cfg, auth["tokens"]["refresh_token"])
+        refresh_token = dev.provider_entry(auth)["tokens"]["refresh_token"]
+    except (KeyError, TypeError):
+        print(json.dumps({"state": "error", "detail": "auth.json has no refresh token"}))
+        return 1
+    try:
+        tokens = dev.refresh_tokens(cfg, refresh_token)
     except dev.DeviceFlowError:
         # Terminal (reused/expired/revoked): the agent must offer a re-link.
         write_status("error", provider="chatgpt", detail="refresh rejected; re-link needed")
@@ -219,6 +253,10 @@ def cmd_refresh_openai_device() -> int:
     # crash after use-before-persist would strand us with a burned token.
     # Same fail-closed guard as the connect path: a non-tmpfs target is refused
     # cleanly rather than writing the rotated token to the volume or crashing.
+    # A refresh response that omits refresh_token means the old one is still
+    # valid — carry it forward rather than storing an empty string, which would
+    # leave hermes unable to ever refresh again.
+    tokens = {**tokens, "refresh_token": tokens.get("refresh_token") or refresh_token}
     try:
         store_chatgpt_tokens(tokens)
     except RuntimeError:

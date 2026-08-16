@@ -497,14 +497,67 @@ check("notify carries the internal bearer",
       notified and notified[0]["auth"] == "Bearer internal-tok-test", notified)
 
 # Model choice per provider (env-overridable, defaults locked here).
-open(config_path, "w").write('model: "anthropic:claude-sonnet-5"\n')
-squire_connect.switch_gateway_model("chatgpt", home3)
-check("chatgpt switches to the codex model",
-      'model: "openai:gpt-5-codex"' in open(config_path).read(), open(config_path).read())
+# The API-KEY providers keep the scalar `model:` line.
 open(config_path, "w").write('model: "anthropic:claude-sonnet-5"\n')
 squire_connect.switch_gateway_model("anthropic", home3)
 check("anthropic keeps the sonnet model (direct, no proxy)",
       'model: "anthropic:claude-sonnet-5"' in open(config_path).read())
+
+# --- ChatGPT subscription: hermes needs a MAPPING, not a scalar -------------
+# Live 2026-08-16: we wrote `model: "openai:gpt-5-codex"`, which hermes does not
+# resolve to its openai-codex provider at all — it fell through to OpenRouter
+# and every message died with "Missing Authentication header". Verified against
+# a known-working hermes install: the openai-codex provider is selected by a
+# mapping, and api_mode/base_url are hermes's to decide, not ours.
+TRIAL_CONFIG = ('model: "anthropic:claude-sonnet-5"\n'
+                "\n"
+                "hooks:\n  pre_llm_call:\n"
+                '    - command: "/opt/squire/bin/squire-concierge-hook.py"\n'
+                "      timeout: 10\n"
+                'timezone: "UTC"\n')
+open(config_path, "w").write(TRIAL_CONFIG)
+squire_connect.switch_gateway_model("chatgpt", home3)
+chat_text = open(config_path).read()
+check("chatgpt writes the model MAPPING hermes actually resolves",
+      'model:\n  provider: "openai-codex"\n  default: "gpt-5.4"\n' in chat_text, chat_text)
+check("the old scalar model line is gone",
+      "anthropic:claude-sonnet-5" not in chat_text
+      and "openai:gpt-5-codex" not in chat_text, chat_text)
+check("the hooks block and the rest of config.yaml survive byte-for-byte",
+      "pre_llm_call:" in chat_text
+      and '- command: "/opt/squire/bin/squire-concierge-hook.py"' in chat_text
+      and "timeout: 10" in chat_text
+      and 'timezone: "UTC"' in chat_text, chat_text)
+check("no api_mode/base_url/api_key/openai_runtime is written (hermes owns those)",
+      "api_mode" not in chat_text and "base_url" not in chat_text
+      and "api_key" not in chat_text and "openai_runtime" not in chat_text, chat_text)
+# Backend-REJECTED slugs for a ChatGPT account must never be the default.
+check("the default slug is not one upstream lists as rejected",
+      not any(bad in chat_text for bad in
+              ("gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini")), chat_text)
+
+# The slug stays env-overridable so a model rename never needs an image rebuild.
+open(config_path, "w").write(TRIAL_CONFIG)
+os.environ["SQUIRE_CONNECT_MODEL_CHATGPT"] = "gpt-5.3-codex"
+try:
+    squire_connect.switch_gateway_model("chatgpt", home3)
+finally:
+    os.environ.pop("SQUIRE_CONNECT_MODEL_CHATGPT", None)
+override_text = open(config_path).read()
+check("SQUIRE_CONNECT_MODEL_CHATGPT overrides only the slug",
+      'model:\n  provider: "openai-codex"\n  default: "gpt-5.3-codex"\n' in override_text,
+      override_text)
+
+# Switching AWAY from chatgpt must remove the whole mapping block, not just its
+# first line — an orphaned `  provider:` under a scalar is invalid YAML and the
+# gateway would refuse to boot.
+squire_connect.switch_gateway_model("openai", home3)
+back_text = open(config_path).read()
+check("switching back to a key provider replaces the whole mapping block",
+      'model: "openai:gpt-4.1"' in back_text
+      and "openai-codex" not in back_text and "default:" not in back_text, back_text)
+check("the hooks block survived the mapping -> scalar switch too",
+      "pre_llm_call:" in back_text and 'timezone: "UTC"' in back_text, back_text)
 
 # A notify failure must not blow up the pipeline (heartbeat backstop covers it).
 control.shutdown()

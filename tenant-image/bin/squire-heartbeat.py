@@ -347,9 +347,20 @@ def llm_connected() -> bool:
     try:
         with open(os.path.join(HERMES_HOME, "auth.json"), encoding="utf-8") as fh:
             data = json.load(fh)
-        tokens = data.get("tokens") if isinstance(data, dict) else None
-        if isinstance(tokens, dict) and tokens.get("access_token"):
-            return True
+        if isinstance(data, dict):
+            # Hermes's envelope: {"providers": {"<name>": {"tokens": {...}}}}.
+            # Since 2026-08-16 the ChatGPT path writes NO OPENAI_API_KEY into
+            # .env (an OAuth token is not an API key), so this document is the
+            # ONLY artifact left for the backstop to see — miss it and the trial
+            # key is never revoked for a ChatGPT-subscription tenant.
+            candidates = [data]  # legacy flat document, still readable
+            providers = data.get("providers")
+            if isinstance(providers, dict):
+                candidates += [p for p in providers.values() if isinstance(p, dict)]
+            for candidate in candidates:
+                tokens = candidate.get("tokens")
+                if isinstance(tokens, dict) and tokens.get("access_token"):
+                    return True
     except (OSError, ValueError):
         pass
     return False

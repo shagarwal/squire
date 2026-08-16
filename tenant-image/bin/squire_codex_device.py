@@ -188,36 +188,106 @@ def iso_utc(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
-def build_auth_json(tokens: dict) -> dict:
-    """The $CODEX_HOME/auth.json shape from the spike, stored at
-    $HERMES_HOME/auth.json (already a sealed name — secrets-sync encrypts it
-    onto the volume with AAD 'auth.json')."""
-    claims = jwt_claims(tokens.get("id_token", ""))
-    account_id = str(
-        claims.get("chatgpt_account_id")
-        or (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id", "")
-    )
+#: Hermes's own name for the ChatGPT-subscription provider inside auth.json.
+#: NOT "openai" (that is the API-key provider) and NOT the `openai:<model>`
+#: string form — selecting this provider is what makes hermes talk to the Codex
+#: backend with the OAuth token instead of falling through to OpenRouter.
+HERMES_AUTH_PROVIDER = "openai-codex"
+
+
+def tenant_label() -> str:
+    """Human-readable label hermes shows for the credential. Tenant id when we
+    have one; never anything derived from the credential itself."""
+    tenant_id = (os.environ.get("TENANT_ID") or "").strip()
+    return f"tenant-{tenant_id}" if tenant_id else "tenant-squire"
+
+
+def build_provider_entry(tokens: dict) -> dict:
+    """The per-provider record that lives at providers['openai-codex'].
+
+    MINIMAL AND SUFFICIENT (confirmed against a working hermes install):
+    * access_token — must be the real JWT; its `exp` claim drives refresh.
+    * refresh_token — MUST be present or hermes never refreshes and the tenant
+      dies silently when the (short-lived) access token expires.
+    id_token/account_id are deliberately NOT stored: they are used here for plan
+    gating only, and hermes derives what it needs from the access token.
+    """
     return {
-        "auth_mode": "chatgpt",
         "tokens": {
-            "id_token": tokens.get("id_token", ""),
             "access_token": tokens["access_token"],
             "refresh_token": tokens.get("refresh_token", ""),
-            "account_id": account_id,
         },
         "last_refresh": iso_utc(time.time()),
+        "auth_mode": "chatgpt",
+        "label": tenant_label(),
     }
+
+
+def build_auth_json(tokens: dict, existing: dict | None = None) -> dict:
+    """The HERMES auth.json envelope, merged onto whatever is already there.
+
+    Stored at $HERMES_HOME/auth.json (a sealed name — secrets-sync encrypts it
+    onto the volume with AAD 'auth.json').
+
+    Live 2026-08-16: we used to write the bare codex-cli record
+    ({auth_mode, tokens, last_refresh}) as the WHOLE file. Hermes reads its own
+    envelope — version / active_provider / providers — found nothing it
+    recognised, and fell through to OpenRouter, so every message came back
+    "Missing Authentication header" despite a perfectly good OAuth token on
+    disk.
+
+    MERGE, never replace: auth.json is a multi-provider document. Another
+    provider's credentials (and any key hermes writes that we do not model,
+    e.g. its credential_pool, which it seeds from this singleton on first load
+    and which we must NOT hand-write) have to survive our write untouched.
+    `active_provider` is only filled in when it is unset/blank, so connecting
+    ChatGPT never silently steals an active provider the user chose.
+    """
+    document = dict(existing) if isinstance(existing, dict) else {}
+    providers = document.get("providers")
+    # Copy rather than mutate: callers hand us a parsed on-disk document and
+    # must not see it change under them if the write later fails.
+    providers = dict(providers) if isinstance(providers, dict) else {}
+    providers[HERMES_AUTH_PROVIDER] = build_provider_entry(tokens)
+    document["providers"] = providers
+    document["version"] = 1
+    if not str(document.get("active_provider") or "").strip():
+        document["active_provider"] = HERMES_AUTH_PROVIDER
+    document["updated_at"] = iso_utc(time.time())
+    return document
+
+
+def provider_entry(auth: dict) -> dict:
+    """The openai-codex record out of EITHER document shape.
+
+    Falls back to the document itself for the legacy flat file written before
+    2026-08-16, so a tenant that connected under the old code can still be
+    refreshed (and re-written into the envelope) instead of refresh-looping.
+    """
+    providers = auth.get("providers")
+    if isinstance(providers, dict) and isinstance(providers.get(HERMES_AUTH_PROVIDER), dict):
+        return providers[HERMES_AUTH_PROVIDER]
+    return auth
 
 
 def needs_refresh(auth: dict, now: float) -> bool:
     """Spike policy: refresh when the access token expires within 5 minutes or
-    last_refresh is more than 8 days old."""
-    exp = auth.get("access_token_exp")
+    last_refresh is more than 8 days old. Reads either document shape."""
+    entry = provider_entry(auth)
+    tokens = entry.get("tokens") or {}
+    # Top-level first so a caller (or a legacy flat document) can state these
+    # directly; otherwise read them out of the provider entry.
+    exp = auth.get("access_token_exp", entry.get("access_token_exp"))
     if exp is None:
-        exp = jwt_claims((auth.get("tokens") or {}).get("id_token", "")).get("exp")
+        # The stored document no longer carries an id_token, so the ACCESS
+        # token's own exp claim is the authority (id_token kept as a fallback
+        # for legacy files).
+        exp = jwt_claims(tokens.get("access_token", "")).get("exp")
+    if exp is None:
+        exp = jwt_claims(tokens.get("id_token", "")).get("exp")
     if isinstance(exp, (int, float)) and exp - now < 300:
         return True
-    last = auth.get("last_refresh", "")
+    last = auth.get("last_refresh") or entry.get("last_refresh") or ""
     try:
         parsed = time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
     except (ValueError, TypeError):
