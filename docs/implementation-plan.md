@@ -60,41 +60,62 @@ Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive
 
 Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
 
-> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-09, end of second session)
+> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-19, after the 1C live-verification day)
 >
-> **Phase 0 code is complete and LIVE. A real tenant was provisioned end-to-end and held a real conversation.** All six tasks merged to `main` through implementer + spec + quality review. What remains is (a) three UX/security fixes discovered by live use, (b) Gate G1 measurement + tuning, (c) real alpha users.
+> **Phase 0 code is complete and LIVE, and workstream 1C shipped early and is
+> VERIFIED end-to-end** — a real user connected a real ChatGPT subscription,
+> the trial key revoked itself, and the proactive "connected 🎉" DM arrived
+> within seconds. Everything below the line is the earlier session-two detail,
+> now historical: the three live-use defects (double reply, /sethome, deep-link
+> nonce binding) all SHIPPED — the nonce design landed exactly as specified
+> (`SQUIRE_BIND_NONCE` end-to-end, cleared on delete so recycled bots carry
+> nothing; verified across many recycles on 2026-08-19).
 >
-> **Live staging** (see memory `staging-deployment.md`): project `squire-staging` `ddbcfda7-e6f6-47a9-87cd-903b6efeb8c6`, env `production` `0923ea14-9a5e-4d87-990b-be31e5bc76ed`. Services: `control-api` (https://control-api-production-588b.up.railway.app, /healthz ok), `ingress` (https://ingress-production-6c96.up.railway.app), `trial-proxy` (internal :4000), `control-db`, `litellm-db`. Images `hermes-tenant:0.1.0/0.1.1/0.1.2` on GHCR (public). Bot pool: 5 bots (`squire_alpha_01..05_bot`), 4 free. Live tenant: `86b245e9cc9c5a4d` on `@squire_alpha_02_bot`. Tenant `38c2ebc966c30509` was crypto-shredded to verify deprovisioning (volume marked pending-delete, service gone, bot released — all correct).
+> **Live staging** (see memory `staging-deployment.md`): project
+> `squire-staging`. Image `hermes-tenant:0.2.9` on GHCR is `TENANT_IMAGE`.
+> Bot pool: 5 bots, all assigned. Fleet: two CONVERTED tenants
+> (`+1ctest6`/alpha_05, `+1ctest7`/alpha_02 — both on the founder's ChatGPT
+> subscription), one fresh onboarding-test tenant (`+1ctest9`/alpha_03,
+> v0.2.9), two stale 0.1.x tenants (+alpha6, +alpha8) held as recycle fodder.
 >
-> **Trial config as of now:** model `anthropic:claude-sonnet-5` (raised from Haiku), budget `$10` hard cap (raised from $2 so the advertised 75 msgs/day is actually reachable), PRD §4/§5.3/§6 + CAC line updated to match.
+> **Shipped since the last rewrite (v0.1.3 → v0.2.9, all tagged):** deep-link
+> nonce binding; Cloudflare-530 UA fix; ChatGPT-subscription wiring
+> (auth.json singleton + model mapping); proactive LLM-connect celebration +
+> `SQUIRE_STATUS_NOTICES` operator-chatter gate; celebration delivery chain
+> hardened three times (absolute hermes path → env re-sourcing → **delegation
+> to the webhook shim**, the fix that actually worked — the poller runs under
+> the gateway's secret-scrubbed tool env and can never see
+> `TELEGRAM_BOT_TOKEN`); onboarding copy v2.1 (greeting = identity + three
+> capabilities + name; connect debuts in message two; post-timezone message
+> is a concrete examples menu + real connections list — GitHub / Google
+> Workspace / Notion / email via the bundled upstream skill library, guided
+> in chat, never "one tap").
 >
-> #### 1. FIRST: finish the in-flight branch `fix/onboarding-double-reply` (pushed to origin, HEAD `ee3fc07`)
-> The deterministic-onboarding work SHIPPED as v0.1.2 and **works** — founder tapped Start and got the intended greeting (identity, three concrete capabilities, trial + connect-your-LLM, one question). Mechanism: entrypoint seeds `.squire/concierge-state.json`, a `pre_llm_call` shell hook restates the current step until `complete`, patch 005 suppresses upstream's competing "one or two sentences max" note, SOUL.md mandate is section 1. Verify a fresh tenant with `hermes hooks list` → `pre_llm_call ... ✓ allowed`.
-> Three defects found in live use. Branch `origin/fix/onboarding-double-reply` @ `ee3fc07` contains work on (a) and (b) — it touches `squire-concierge-hook.py`, `patches/005-*.patch`, `markers.tsv`, `tests/test_concierge_onboarding.py`. **It has NOT been reviewed and (c) is NOT in it.** Verify what actually landed before trusting this list:
-> - **(a) Double reply — DONE in `ee3fc07`.** The coordinator's first diagnosis ("hook fires per LLM call") was WRONG and was disproved: `pre_llm_call` fires once per user turn, single call site at `agent/conversation_loop.py:1297`, before the API loop. Real cause: one turn emitted two assistant text blocks (greeting → tool call → trailing "Done…") and the gateway ships mid-turn prose as its own Telegram message (`interim_assistant_messages`, `config_defaults.py:1193`). Decisive tell: the second message re-asked for the NAME — a re-injection would have asked for the TIMEZONE. Fix = write state first and silently, then send exactly one message, with an explicit ban on a trailing "done"; turn-id dedupe added as insurance.
-> - **(b) `/sethome` notice — DONE in `ee3fc07`.** Patch 005 now SETS the owner's DM as home via upstream `persist_home_channel`/`HomeChannel`, and also updates the live in-memory config (on-disk alone leaves the running gateway still believing no home is set). Folded into 005 rather than a new 006, to preserve the file-disjoint rule `apply-patches.sh` relies on; two marker rows added.
-> - **(c) Deep-link nonce binding (SECURITY) — NOT STARTED. This is the top priority.** Bots are recycled between tenants and the previous owner keeps the chat forever; autopair binds "first human when the store is empty", so a previous owner can silently become owner of the NEXT tenant on that bot.
->   **Design already decided — do not re-litigate.** All in `tenant-image/bin/squire_autopair.py` (+ `tests/test_autopair.py`): add `BIND_NONCE_ENV = "SQUIRE_BIND_NONCE"`, `configured_bind_nonce()`, `extract_start_payload(update)`. In `maybe_bind_owner`: if a nonce IS configured, bind only when the update is `/start <payload>` and `hmac.compare_digest(payload, nonce)`; else no bind + loud log. If the var is UNSET, keep today's behaviour and log "unauthenticated mode" — do NOT fail closed (that bricks provisioning if the contract lands out of order). `extract_sender` already enforces private-chat/non-bot/message-shaped and the shim already gates on the per-bot secret; the nonce is purely additive.
->   **Start here:** `defang_start_command` currently KEEPS the payload (`msg["text"] = f"start {rest}"`) — that is a nonce leak into the transcript and Hindsight memory. Change it to always emit `"start"`. Correct to do regardless of how the binding half lands. (Entity-remap needs no change: it only remaps when `delta == 1` and otherwise drops entities.)
->   **Single-use:** control-api should rotate/clear it, NOT a tenant-side "used" marker — the empty-store precondition already makes binding at-most-once per store lifetime, and a marker's failure mode is "marker present + store empty → nobody can ever bind".
->   **control-api contract change (that side is UNBRIEFED):** var `SQUIRE_BIND_NONCE`, `secrets.token_urlsafe(32)`, set in the `variables = {...}` dict at `provisioning.py:487-512` next to `TELEGRAM_WEBHOOK_SECRET` (`:496`); persist on the tenant row so retries don't rotate it (mirror the `SQUIRE_DEK` guard at `:514`); clear it on delete/recycle so a recycled bot never carries the old tenant's nonce; hand out `https://t.me/<bot>?start=<nonce>` instead of the bare link; check for any exact-set assertion over the provisioning dict before landing.
+> **Known bug, non-blocking:** after every connect-flow gateway restart, an s6
+> `gateway-default` service takes the gateway over and supervisord's copy goes
+> FATAL (`hermes gateway run --replace` in `gateway_state.json` is the tell).
+> The bot keeps working; `gateway_up` telemetry reads false-negative and
+> `supervisorctl restart gateway` becomes a no-op. Root cause is upstream
+> redirect internals — see memory `connect-gateway-restart-fatal.md`.
 >
-> #### 2. THEN: Gate G1 — the architectural decision Phase 0 exists to make
+> **Trial config:** model `anthropic:claude-sonnet-5`, `$10` hard cap.
+>
+> #### 1. FIRST: Gate G1 — the architectural decision Phase 0 exists to make
 > Measured idle RSS on a live tenant: **~1.3GB vs the 512MB target** (Hindsight local embeddings + CPU torch + embedded PG + gateway). Both levers are built but unpulled:
 > - Point `HINDSIGHT_API_EMBEDDINGS_PROVIDER` at a cloud embedder (knob exposed in the image, currently unset) — biggest single win.
 > - Confirm Railway serverless sleep actually engages. **Root cause found (2026-08-10, live):** upstream's Telegram adapter runs an identity-refresh loop in webhook mode — a `get_me()` HTTPS call every 300s, forever — so no tenant ever looked idle. Patch 006 gates it behind `SQUIRE_TELEGRAM_IDENTITY_TTL` (image default `0` = loop never starts; unset = upstream's 300s). Our own 300s heartbeat was a contributing factor, already raised to 1800s on staging — `SQUIRE_HEARTBEAT_INTERVAL` is that knob and `HEARTBEAT_STALE_SECONDS` must move with it. Re-run the quiet-gap sleep check on a tenant running the patched image.
 > Then measure real $/tenant/mo and p95 wake latency across tenants. **Pass = ≤$3/tenant AND p95 wake ≤8s → stay on Railway. Fail → tenant data plane moves to Hetzner.**
 >
-> #### 3. THEN: the rest of Phase 0's exit criteria
+> #### 2. THEN: the rest of Phase 0's exit criteria
 > - Run `infra/upgrade_drill.py` for real (canary → roll → rollback) — tooling is live-verified but the drill has never driven an actual fleet; needs ≥2 tenants.
 > - Onboard 10 alpha users (needs ~7 more BotFather bots, or see workstream **1H** below).
 > - Backups: code ships but is inert until a **Backblaze B2** account exists. Do not claim backups work until a real restore has been performed.
 >
 > #### Known gaps / decisions parked
-> - **No template-migration path.** `seed_template` is keep-existing, so EXISTING tenants get none of a new image's config/skills/SOUL.md — only a re-provision does. This bit us twice tonight. A baked `template-version` marker that refreshes image-managed files while leaving agent-owned ones alone would fix it.
+> - **No template-migration path.** `seed_template` is keep-existing, so EXISTING tenants get none of a new image's config/skills/SOUL.md — only a re-provision does. This bit us twice on 2026-08-09 and again on 2026-08-19 (onboarding-copy changes only reach FRESH tenants; a redeploy leaves the volume's yaml stale while the image's hook updates — live mirror drift). A baked `template-version` marker that refreshes image-managed files while leaving agent-owned ones alone would fix it.
 > - **Workstream 1H (added tonight)**: shared bots + an `egress` service, so tenants stop holding `TELEGRAM_BOT_TOKEN` and one bot can serve unlimited users. Decide before investing in more Telegram accounts.
 > - Gate G2 secrets hardening (fleet-wide `INTERNAL_API_TOKEN` blast radius — the autopair takeover was one symptom).
-> - Follow-up: hindsight `claude-code` provider for Claude Max tenants; `CONNECTED_MARKERS` only inspects `.env` and needs revisiting when 1C writes `auth.json`.
+> - Follow-up: hindsight `claude-code` provider for Claude Max tenants. (The `CONNECTED_MARKERS`/auth.json revisit happened as part of 1C.)
 > - Deploy quirk: `railway up` from inside the repo dir fails (`exclude-patterns` non-printable-ASCII); deploy from a clean copy outside the repo, or rely on CI `deploy.yml`. Local CLI 5.34.2.
 >
 > #### Shaurya one-offs still open
@@ -110,12 +131,12 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 - [x] Bake productized `~/.hermes` template: SOUL.md (de-personalized), skills, config.yaml with Telegram adapter (webhook mode via shim), Hindsight tuned per guide (with corrections — guide's MAX_SLOTS knob was a deprecated no-op alias).
 - [x] Concierge skill v1 (baked): 9-state machine in `state-machine.yaml`, 4 provider options with honest labels.
 - [x] Secrets init shim: AES-256-GCM, plaintext only on tmpfs (/dev/shm), first-boot init, wrong-DEK boot refusal, volume-durability gates.
-- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s. *(Needs first live deploy.)*
+- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s. *(Partial: idle RSS measured ~1.3GB — levers identified, unpulled; sleep now verified to engage after patch 006. The $/tenant and p95-wake halves are the open G1 work.)*
 
 ### Task 0.3 — Control API v0 + provisioning
 - [x] FastAPI + SQLModel on `control-db`: `tenants`, `bots`, `provision_jobs` tables (140 tests; privacy-schema guard is build-breaking).
 - [x] Railway GraphQL client: create service from GHCR image, attach volume, set variables, deploy, delete. Idempotent state machine with atomic job claims + retries. *(Every mutation still unverified against the live API — in-code first-live-deploy checklist.)*
-- [ ] Bot pool: manual BotFather batch (20 bots via Shaurya's Telegram) → tokens loaded via CLI script (`infra/load_bots.py` ready) → `control-api` assigns + sets webhook. *(Code done; Shaurya's BotFather batch pending.)*
+- [x] Bot pool: mechanism fully live — 5 bots loaded, assigned, webhooked, and recycled many times over (2026-08-19 exercised the full assign/release cycle repeatedly). *(Growing past 5 awaits either the BotFather batch or the 1H shared-bot decision — decide 1H first.)*
 - [x] CLI command (`infra/provision.py`): `provision --email x@y.com` → tenant live + t.me link printed. **This is the alpha signup.**
 
 ### Task 0.4 — Ingress v0
@@ -127,7 +148,7 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 ### Task 0.6 — Alpha operations
 - [x] Heartbeat: tenant emits counts-only metrics to `control-api`; `/internal/fleet` status endpoint.
 - [x] Nightly restic → B2, client-side encrypted with tenant DEK (in-container supervisord loop — Railway cron can't exec into a running service; documented deviation). *(Inert until B2 account exists.)*
-- [ ] Upgrade drill: build image vN+1 → redeploy 1 canary tenant → verify → roll fleet via API loop. Rollback = redeploy previous image tag. *(Tooling landed — `infra/upgrade_drill.py` + redeploy endpoint; the drill itself needs a live fleet.)*
+- [ ] Upgrade drill: build image vN+1 → redeploy 1 canary tenant → verify → roll fleet via API loop. Rollback = redeploy previous image tag. *(Tooling landed; the redeploy endpoint was exercised against a live tenant with an explicit image_tag on 2026-08-19 — but the full canary→roll→rollback drill has still never been run.)*
 - [ ] Onboard 10 invited alpha users. Run 2 weeks. **Measure G1.**
 
 ---
@@ -139,7 +160,7 @@ Each workstream gets a detailed plan at kickoff. Exit criteria: stranger can sig
 - **1A Signup web app**: Next.js on Railway; Auth.js (email+password, Google); signup → `control-api` provision → "agent waking up" page with t.me deep link; status page (running/plan/connected-LLM only).
 - **1B Billing**: Stripe Checkout ($5 Starter / $10 Pro / annual $50/$100 push); 3-day trial state machine (no card) → hard stop at 72h (subscribe-link-only replies) → hibernate +48h (Railway service stop) → crypto-shred day 14 (delete service + volume + wrapped DEK); webhook-driven resume on payment.
   - **Never-said-hello email nudge** (added 2026-08-09 after the first live signup walkthrough): Telegram forbids a bot from contacting a user who has not messaged it first, so a tenant whose owner never taps **Start** is unreachable *on Telegram entirely* — the trial clock runs down in silence and we cannot say a word about it in-channel. Email is the only channel we have for that user. Fire a nudge from `control-api` when a tenant has been `running` for N hours with zero inbound updates (`updates_forwarded == 0` on the heartbeat already reports this — see Task 0.6 `/internal/fleet`), re-linking the `t.me` deep link and explaining the one tap needed. Suppress once the first update arrives. Same constraint applies to WhatsApp in 2A (24h session window), so treat this as the general "user hasn't opened the channel yet" path, not a Telegram special case.
-- **1C Credential one-time link**: tenant serves `GET /connect/<nonce>` on its Railway-provided domain; all 4 LLM paths (Anthropic/OpenAI × key/OAuth device-code); Telegram paste-fallback with immediate message delete; trial-proxy key revoked on connect.
+- **1C Credential one-time link — ✅ SHIPPED EARLY (during Phase 0) and VERIFIED LIVE 2026-08-19**: tenant serves `GET /connect/<nonce>` on its Railway-provided domain; **3** LLM paths, not 4 — OpenAI API key, ChatGPT subscription via Codex device flow, Anthropic API key (the Claude-subscription path was dropped 2026-08-14: Anthropic's Consumer ToS bans third-party subscription use, enforced server-side); Telegram paste-fallback with immediate message delete; trial-proxy key revoked on connect (plus a heartbeat reconciliation backstop); proactive "connected 🎉" DM delivered via the webhook shim. End-to-end verified on a real ChatGPT subscription: connect → revoke → celebration in seconds.
 - **1D Gate G2 — secrets hardening**: move DEK delivery off Railway variables → `control-api` hands a one-time sealed token at boot; KMS decrypt only in-tenant; CloudTrail alerting; break-glass policy doc.
 - **1E Abuse & fair use**: one trial per Telegram ID, disposable-email block, velocity limits, egress allowlist for trial tenants, cron-frequency + storage quotas, anomaly auto-suspend.
 - **1F Fleet automation**: canary-ring rollout (ring 0 = our own tenants), bot-pool watermark alerts + BYO-bot nudge flow, synthetic signup canary in CI (<60s SLA).
