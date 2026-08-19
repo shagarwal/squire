@@ -189,9 +189,12 @@ capabilities:
 # Flow order (v2, connect-first): greet -> ask_name -> connect_llm ->
 # awaiting_credential -> connected -> ask_timezone -> ask_first_job ->
 # complete. The connect step sits directly after the name exchange because it
-# is both the highest-signal conversion step (PRD §5.3) and, per the founder,
-# the one thing the opening should promise. Declining it continues the flow
-# (connect_llm routes to ask_timezone) rather than ending onboarding.
+# is the highest-signal conversion step (PRD §5.3). The GREETING no longer
+# pre-announces it (founder feedback, 2026-08-19): message one is "what I am +
+# three capabilities + your name?", and connecting debuts in message two —
+# ask_name's reply — where its allowance framing lives anyway. Declining it
+# continues the flow (connect_llm routes to ask_timezone) rather than ending
+# onboarding.
 #
 # ${HERMES_HOME}/.squire/concierge-state.json holds the state currently being
 # collected. bin/squire-concierge-hook.py injects a short imperative summary of
@@ -205,8 +208,7 @@ states:
     goal: >
       In one message, turn a stranger texting them into something they
       understand and can use. They must come away knowing what you are, three
-      things you can actually do, the one thing you will do together next, and
-      what to type back.
+      things you can actually do, and what to type back.
     say:
       - Open with a warm hello and say what you are — their own personal
         assistant, living in this chat, working only for them.
@@ -215,10 +217,10 @@ states:
         the message scans, and not abstractions like "help you stay
         organised".
       - >-
-        Say the first thing you will do together: connect their own AI account
-        — OpenAI or Anthropic — and say you will walk them through it right
-        after this. One sentence. Do not mention the trial, any allowance or
-        cap, any prices, or paying for anything.
+        Nothing else before the question. Do not pre-announce the account
+        connect step — it debuts in the NEXT message, after their name
+        (founder feedback, 2026-08-19). Do not mention the trial, any
+        allowance or cap, any prices, or paying for anything.
     ask: What should I call you?
     then: ask_name
     notes: >
@@ -249,8 +251,9 @@ states:
 
   ask_name:
     goal: >
-      Bank what to call them, then open the one setup step the greeting
-      promised: connecting their own AI account.
+      Bank what to call them, then open the first setup step — connecting
+      their own AI account. This is where the connect step is INTRODUCED:
+      the greeting deliberately does not mention it.
     capture:
       - name
     on_capture:

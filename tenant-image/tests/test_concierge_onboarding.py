@@ -751,13 +751,19 @@ for label, blob in [
         f"greet ({label}) carries no affirmative trial pitch",
         "3-day trial" not in blob and "squire's shared ai" not in blob,
     )
+    # Founder feedback 2026-08-19, reversing 2026-08-13's connect promise:
+    # message one is "what I am + three capabilities + your name?" and NOTHING
+    # else — connecting the AI account debuts in message two (ask_name's
+    # reply), where its allowance framing lives anyway. Same live-instruction
+    # rule as the trial ban above: the copy must actively forbid the
+    # pre-announcement, not merely omit it.
     check(
-        f"greet ({label}) says the FIRST thing to do is connect their own AI",
-        "first" in blob and "own ai account" in blob,
+        f"greet ({label}) explicitly forbids pre-announcing the connect step",
+        "do not pre-announce" in blob,
     )
     check(
-        f"greet ({label}) names the accounts concretely (OpenAI/Anthropic)",
-        "openai" in blob and "anthropic" in blob,
+        f"greet ({label}) does not name the providers (that is ask_name's job)",
+        "openai" not in blob and "anthropic" not in blob,
     )
     # Anthropic is API-key only since 2026-08-14 (Consumer ToS change,
     # server-side enforced): the greeting must not promise connecting a

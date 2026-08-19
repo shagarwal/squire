@@ -189,7 +189,7 @@ _DIRECTIVES = {
 ever sent you. They do not know what you are, what you can do, or what they are
 supposed to do next. Right now the burden is entirely on you.
 
-Reply with ONE chat message that does all four of these, in your own voice —
+Reply with ONE chat message that does all three of these, in your own voice —
 warm, human, and glad they showed up, never salesy. Shape it as short lines
 with a blank line between thoughts, not one paragraph block, and bold the few
 words that carry the message (the FORMATTING rules below say exactly what
@@ -204,11 +204,12 @@ renders):
    follow up on your own later, including on a schedule; and you check with
    them before anything that deletes, spends money, or goes out to another
    person.
-3. Say the first thing you will do together: connect their own AI account —
-   OpenAI or Anthropic — and say you will walk them through it right after
-   this. One sentence. Do not mention the trial, any allowance or cap, any
-   prices, or paying for anything.
-4. End on exactly ONE question, on its own line: what should you call them?
+3. End on exactly ONE question, on its own line: what should you call them?
+
+Nothing else between the examples and the question. Do NOT pre-announce
+connecting their AI account — that is the NEXT message's job, after they
+answer. Do not mention the trial, any allowance or cap, any prices, or paying
+for anything.
 
 KEEP IT UNDER 120 WORDS, and under 8 short lines of text — blank lines
 between them are free, and welcome. This is a text message, not a landing
@@ -221,8 +222,10 @@ commands or /help. Do not offer to build a profile of them.""",
 name, take it, use the short form, and thank them warmly in half a sentence —
 do not make a production of it. Save it with the hindsight_retain tool.
 
-Then open the setup step the greeting promised: getting them onto their own AI
-account. This message is a friendly menu, not a settings page. Shape it as: a
+Then open the first setup step — getting them onto their own AI account. The
+greeting deliberately did not mention this, so introduce it fresh here: one
+line saying this is the first thing to set up together, then the menu. This
+message is a friendly menu, not a settings page. Shape it as: a
 short warm intro of two or three lines, a blank line, then the three options
 ONE PER LINE — each a **bolded label** plus a one-line plain-language
 description — and the question last, on its own line.
