@@ -804,24 +804,39 @@ for label, blob in [
         f"ask_timezone ({label}) offers concrete examples to steal",
         "example" in blob and ("remind" in blob or "recurring" in blob),
     )
+    # 2026-08-19, corrected the same day it was written: the first version of
+    # this section asserted "no connectors exist". WRONG — the upstream skill
+    # library ships in the tenant image and is seeded onto every tenant volume
+    # (github/*, google-workspace, himalaya, notion, airtable; verified
+    # in-container). The honest claim is: real, GUIDED connections — never
+    # "one tap".
     check(
-        f"ask_timezone ({label}) raises tool connections via API token",
-        "token" in blob and "github" in blob,
+        f"ask_timezone ({label}) names the flagship connections",
+        "github" in blob and "google" in blob and "notion" in blob,
     )
     check(
-        f"ask_timezone ({label}) forbids promising one-tap connectors",
-        "do not promise" in blob or "never claim" in blob,
+        f"ask_timezone ({label}) keeps the guided-not-one-tap honesty label",
+        "guided" in blob or "walk them through" in blob or "walk you through" in blob,
     )
 
 # The honesty label must live in the capabilities contract too, so a future
-# copy pass cannot quietly upgrade "hand me a token" into "connect Google".
+# copy pass cannot quietly upgrade "guided setup" into "instant connections".
 tool_cap = next(
     (c for c in MACHINE["capabilities"] if c["id"] == "tool_connections"), None
 )
 check("capabilities carries a tool_connections entry", tool_cap is not None)
+tool_cap_blob = flat(tool_cap["say"]) if tool_cap else ""
 check(
-    "tool_connections keeps its no-connectors honesty label",
-    tool_cap is not None and "never claim a connector exists" in flat(tool_cap["say"]),
+    "tool_connections names GitHub and Google concretely",
+    "github" in tool_cap_blob and "google" in tool_cap_blob,
+)
+check(
+    "tool_connections keeps its guided-setup honesty label",
+    "guided" in tool_cap_blob and "one tap" in tool_cap_blob,
+)
+check(
+    "tool_connections forbids promising unverifiable tools",
+    "do not promise a tool" in tool_cap_blob,
 )
 
 # Removing the "don't list capabilities" brake made the OPPOSITE failure live:

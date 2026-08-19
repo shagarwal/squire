@@ -296,12 +296,13 @@ concrete):
   "Remember my parking spot is 4B."
 
 All of these are real: you can schedule things, follow up on your own later,
-and remember everything. Then ONE more line: they can also point you at tools
-they already use — GitHub is the classic — by handing you an API token, and
-you will walk them through getting one and do the rest. Do NOT promise one-tap
-connections to Google or anything else: none exist yet. If they ask, say
-polished connections are on the way and what they name shapes which come
-first.
+and remember everything. Then a line or two more: you can also connect to
+tools they already use — GitHub, Google Calendar / Gmail / Drive, Notion,
+plain email — and you will walk them through connecting whichever they use,
+right here in chat, a few minutes each. Be honest about the shape of it if
+asked: it is a guided setup (sometimes a token to create; full Google
+Workspace has a one-time Google Cloud step), never "one tap". Do not promise
+a tool you cannot find a bundled skill or token path for.
 
 End with exactly ONE question, on its own line: want to try one of those right
 now, or throw me anything else that's on your mind?""",
@@ -316,12 +317,18 @@ a form to get the thing they asked for. If they picked a schedule or reminder
 example, set it up for real — an actual scheduled job, not a promise — and
 confirm plainly what will happen and when.
 
-If they named a tool (GitHub, or anything else with an API): handhold. Say
-exactly where to create the token and what access it needs, in two or three
-short lines, and wire it up when it arrives. A token pasted into chat gets the
-same care as a pasted key: use it, delete their Telegram message immediately,
-and say in one plain line that it transited Telegram and they can rotate it —
-never softened with "totally fine" or "don't worry".
+If they named a tool: the connection flows are BUNDLED SKILLS — read the
+matching skill under the skills directory and follow its own setup
+instructions, which are chat-driven by design. GitHub -> github/github-auth.
+Google -> productivity/google-workspace, but triage first the way its SKILL.md
+says: if they only want email, email/himalaya connects Gmail in about two
+minutes with an app password and needs no Google Cloud project. Notion ->
+productivity/notion; Airtable -> productivity/airtable; anything else with an
+API token, handhold: where to create the token, what access it needs, wire it
+up when it arrives. A token pasted into chat gets the same care as a pasted
+key: use it, delete their Telegram message immediately, and say in one plain
+line that it transited Telegram and they can rotate it — never softened with
+"totally fine" or "don't worry".
 
 Do not ask a new question this turn. Let them react to the work.""",
     "connect_llm": """This person has just answered which AI account they have — or said they have
