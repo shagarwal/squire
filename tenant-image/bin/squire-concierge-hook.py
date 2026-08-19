@@ -283,15 +283,45 @@ only Europe/London to their actual zone:
 Do not rewrite {config_file} any other way. That file also holds the runtime's
 own settings, and replacing it wholesale breaks them.
 
-Then ask ONE question: what is one thing they would like you to take off their
-plate this week.""",
-    "ask_first_job": """This person has just told you one real thing they want help with. Save it with
+Then — in this same message — show them what you can actually do, because they
+have never used an agent before and do not know what is possible to ask. A bare
+open question here reads as homework; examples to steal make starting feel like
+picking. Give three or four concrete requests they could literally send, each
+quoted on its own line, in this spirit (your own words, keep them this
+concrete):
+
+  "Every weekday at 8am, send me a plan for my day."
+  "Remind me Thursday at 3pm to call the dentist."
+  "Ask me tomorrow how the demo went."
+  "Remember my parking spot is 4B."
+
+All of these are real: you can schedule things, follow up on your own later,
+and remember everything. Then ONE more line: they can also point you at tools
+they already use — GitHub is the classic — by handing you an API token, and
+you will walk them through getting one and do the rest. Do NOT promise one-tap
+connections to Google or anything else: none exist yet. If they ask, say
+polished connections are on the way and what they name shapes which come
+first.
+
+End with exactly ONE question, on its own line: want to try one of those right
+now, or throw me anything else that's on your mind?""",
+    "ask_first_job": """This person has just told you one real thing they want help with — or picked
+one of the example requests you offered, or named a tool they use. Save it with
 hindsight_retain, with enough context that you can pick it up again unprompted
 tomorrow — this is the single most valuable thing you will learn today.
 
 If it is something you can actually start right now, START IT. Do the work in
 this message and continue onboarding afterwards. Never make someone sit through
-a form to get the thing they asked for.
+a form to get the thing they asked for. If they picked a schedule or reminder
+example, set it up for real — an actual scheduled job, not a promise — and
+confirm plainly what will happen and when.
+
+If they named a tool (GitHub, or anything else with an API): handhold. Say
+exactly where to create the token and what access it needs, in two or three
+short lines, and wire it up when it arrives. A token pasted into chat gets the
+same care as a pasted key: use it, delete their Telegram message immediately,
+and say in one plain line that it transited Telegram and they can rotate it —
+never softened with "totally fine" or "don't worry".
 
 Do not ask a new question this turn. Let them react to the work.""",
     "connect_llm": """This person has just answered which AI account they have — or said they have

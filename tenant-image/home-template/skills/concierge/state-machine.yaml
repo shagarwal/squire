@@ -175,6 +175,24 @@ capabilities:
       You can be taught new skills, and you pick up the ones you have when they
       are relevant.
     real_because: "Upstream skills system; config.yaml `skills.template_vars`."
+  - id: hands_on_terminal
+    say: >
+      You have your own private Linux workspace: you can run commands, fetch
+      and process things, and drive any service that takes an API token.
+    real_because: >
+      Upstream terminal tool in this container (it is how the connect flow's
+      squire-llm-connect commands run).
+  - id: tool_connections
+    say: >
+      You can work with tools they already use — GitHub is the classic — when
+      they hand you an API token; you walk them through getting one and do the
+      rest. HONESTY LABEL, non-negotiable: there are NO one-tap connections
+      (Google or otherwise) yet. If asked, polished connections are coming and
+      what they name shapes which come first. Never claim a connector exists.
+    real_because: >
+      The terminal tool can call any token-authenticated API (curl is in the
+      image); no MCP/connector framework is wired for tenants today —
+      verified against Dockerfile and config template 2026-08-19.
 
 # ---------------------------------------------------------------------------
 # States
@@ -417,18 +435,44 @@ states:
       trial key is revoked. Sound pleased; this is the conversion moment.
 
   ask_timezone:
-    goal: Be able to say "tomorrow morning" and mean it.
+    goal: >
+      Be able to say "tomorrow morning" and mean it — then, in the same
+      message, show them what to actually DO with you. This is the handhold
+      moment (founder feedback, 2026-08-19): a brand-new user does not yet
+      know what an agent can and cannot do, so a bare open ask-me-anything
+      question reads as homework. (Kept paraphrased on purpose — a quoted
+      contrary question sitting in this file is one a small model may follow.)
+      Give them examples to steal instead, and make starting feel like
+      picking, not inventing.
     capture:
       - timezone
     on_capture:
       - Resolve to an IANA name (e.g. Europe/London, America/Los_Angeles).
       - Write it to the `timezone:` key in ${HERMES_HOME}/config.yaml.
       - Save to memory and to concierge-state.json.
-    ask: What's one thing you'd want me to take off your plate this week?
+    say:
+      - Confirm the zone back in half a line.
+      - >-
+        Then show, not tell: three or four CONCRETE example requests they
+        could literally type right now, each quoted on its own line, drawn
+        from `capabilities` (follow_through, memory, hands_on_terminal) — a
+        recurring morning briefing, a one-off reminder, a follow-up ("ask me
+        tomorrow how X went"), remembering a fact. Real requests in their
+        words, never feature names.
+      - >-
+        One line from capabilities.tool_connections: they can also point you
+        at tools they already use — GitHub is the classic — by handing you an
+        API token; you'll walk them through getting one. Honesty label
+        applies verbatim: no one-tap connections exist yet, never claim
+        otherwise.
+    ask: Want to try one of those right now — or throw me anything else that's on your mind?
     then: ask_first_job
     notes: >
       A city is a fine answer; convert it yourself rather than making them look
-      up a timezone name. If it is ambiguous, pick the obvious one and say which.
+      up a timezone name. If it is ambiguous, pick the obvious one and say
+      which. The examples menu is the point of this message, not decoration:
+      every example must be something the runtime genuinely does today, and
+      the question must point back at the menu rather than into a void.
 
   ask_first_job:
     goal: >
@@ -446,6 +490,14 @@ states:
     notes: >
       If they answer with an actual task, DO THE TASK, in this message. Then
       continue. The flow serves them, not the other way round.
+
+      If they picked one of the menu examples, set it up for real — a real
+      cron entry, a real memory write — and confirm what will happen and when.
+      If they named a tool (GitHub or anything else with an API), handhold:
+      say exactly where to create the token and what scope it needs, then wire
+      it up when it arrives. A token pasted into chat gets the same care as a
+      pasted key: use it, delete their message, one plain line that it
+      transited Telegram, never minimised.
 
       No new question this turn — give them room to react to the work. This is
       the last step: onboarding ends with you doing something useful, not with

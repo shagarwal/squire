@@ -781,6 +781,49 @@ for label, blob in [
         "do not mention slash commands or /help" in blob,
     )
 
+print()
+print("== 5b. ask_timezone hands the user a menu, not homework ==")
+
+# Founder feedback 2026-08-19: after name/account/timezone, the flow used to
+# end on "what's one thing you'd want me to take off your plate?" — a generic
+# open question a brand-new user cannot answer, because they do not yet know
+# what the agent can and cannot do. The message must instead offer concrete
+# example requests to steal, plus the honest tool-connection line. Both
+# mirrors, same as greet: the model may act on either.
+tz_state_blob = flat(json.dumps(states["ask_timezone"]))
+tz_directive = flat(context_for("ask_timezone", env_home=str(home)))
+for label, blob in [
+    ("state machine", tz_state_blob),
+    ("injected directive", tz_directive),
+]:
+    check(
+        f"ask_timezone ({label}) no longer ends on the generic plate question",
+        "take off" not in blob,
+    )
+    check(
+        f"ask_timezone ({label}) offers concrete examples to steal",
+        "example" in blob and ("remind" in blob or "recurring" in blob),
+    )
+    check(
+        f"ask_timezone ({label}) raises tool connections via API token",
+        "token" in blob and "github" in blob,
+    )
+    check(
+        f"ask_timezone ({label}) forbids promising one-tap connectors",
+        "do not promise" in blob or "never claim" in blob,
+    )
+
+# The honesty label must live in the capabilities contract too, so a future
+# copy pass cannot quietly upgrade "hand me a token" into "connect Google".
+tool_cap = next(
+    (c for c in MACHINE["capabilities"] if c["id"] == "tool_connections"), None
+)
+check("capabilities carries a tool_connections entry", tool_cap is not None)
+check(
+    "tool_connections keeps its no-connectors honesty label",
+    tool_cap is not None and "never claim a connector exists" in flat(tool_cap["say"]),
+)
+
 # Removing the "don't list capabilities" brake made the OPPOSITE failure live:
 # a wall of text as message one. The YAML's "fifteen seconds" note is the
 # non-authoritative half — the hook directive is what the model actually reads.
