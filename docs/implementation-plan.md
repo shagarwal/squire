@@ -154,6 +154,44 @@ Each workstream gets a detailed plan at kickoff. Exit criteria: stranger can sig
 
 - **2A WhatsApp Cloud API** channel on Pro tier (programmatic numbers, 24h-window + template logic for cron output; re-check Meta's Oct 1 2026 in-window pricing before build).
 - **2B Tool connections** (Google Workspace, GitHub) via tenant-served OAuth callbacks.
+  - **Ships with 2A, not after it** (founder call, 2026-08-19): the Squire-owned
+    OAuth client below must be live when WhatsApp goes public — the two land
+    together as the "public polish" release.
+  - **What exists today (v0.2.9, no new plumbing):** the upstream skill library
+    is baked into the tenant image and seeded per-volume — `github/*`,
+    `productivity/google-workspace`, `email/himalaya`, `notion`, `airtable` —
+    and onboarding already offers guided chat-driven connects. The one rough
+    edge: full Google Workspace makes the USER create their own Google Cloud
+    OAuth "Desktop app" client (~5 console minutes, agent-handheld). Fine for
+    alpha, not for the public.
+  - **The 2B build — Squire-owned Google OAuth client:** one client owned by
+    Squire so connecting Google collapses to pure sign-in-and-approve.
+    - [ ] Create the GCP project + OAuth client (web-app type); enable Gmail /
+          Calendar / Drive / Sheets / Docs / People APIs; request only the
+          scopes the google-workspace skill actually uses (see
+          `google_token.json` scopes on the reference VPS).
+    - [ ] **Google verification** for sensitive/restricted scopes (Gmail is
+          restricted — expect a security assessment; budget WEEKS of lead
+          time, start the application well before the 2A build begins).
+    - [ ] Redirect/callback: reuse the 1C connect-page infrastructure — each
+          tenant already serves a public domain; either per-tenant redirect
+          URIs via a wildcard-ish registered pattern (Google forbids
+          wildcards, so likely) a single control-plane callback that relays
+          the code to the right tenant over the private network, same
+          trust shape as `/internal/llm-connected`.
+    - [ ] Client secret handling: the client secret is SQUIRE's credential —
+          serve it to tenants like the trial key (control-api → tenant env →
+          sealed tmpfs), never baked into the image; per-user refresh tokens
+          stay on the tenant's own volume exactly as the skill stores them
+          today (`google_token.json`).
+    - [ ] Onboarding copy: collapse the google-workspace connect branch to
+          the one-approve flow; keep himalaya as the no-Google-account
+          email path; keep the guided-not-one-tap honesty label accurate
+          (it genuinely becomes near-one-tap — update the drift test pins in
+          `test_concierge_onboarding.py` §5b when the copy changes).
+    - [ ] GitHub equivalent while we're in there: a Squire-owned GitHub OAuth
+          App (device flow — no callback needed) upgrades the PAT handhold to
+          sign-in-and-approve too. Small, do it in the same pass.
 - **2C Density push**: hibernation tuning or Hetzner migration per G1; re-price when unit economics are proven (PRD §5.4 raise plan).
 - **2D Hardening**: SOC2-lite audit logging, status page, on-call rotation.
 
