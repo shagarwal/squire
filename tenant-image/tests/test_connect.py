@@ -734,6 +734,113 @@ check("it is the venv binary supervisord uses, not the privilege-drop shim",
 check("the resolver never returns a bare name",
       os.path.isabs(squire_connect._hermes_binary()), squire_connect._hermes_binary())
 
+# --- Test 4c: `hermes send` gets the CURRENT .env, not the frozen one --------
+# Live 2026-08-19, the OTHER half of the trap 4b pins. The celebration failed
+# with "hermes send: Platform 'telegram' is not configured" while the identical
+# command run by hand inside the container worked. The pipeline runs in a thread
+# of [program:webhook] (priority 20), which supervisord starts with the
+# environment supervisord itself froze at boot — captured BEFORE secrets-sync
+# (priority 25) seals the platform credentials into tmpfs. So the token is never
+# in the inherited env no matter how long the tenant has been up. 4b fixed the
+# binary NAME not resolving; this fixes the CREDENTIALS not resolving.
+print("== hermes send is handed freshly-sourced credentials ==")
+
+home_env = tempfile.mkdtemp()
+open(os.path.join(home_env, ".env"), "w").write(
+    "# a comment line\n"
+    "\n"
+    "TELEGRAM_BOT_TOKEN=fresh-token-123\n"
+    "QUOTED_VALUE='quoted'\n"
+    "NOT_A_PAIR\n"
+    "STALE_KEY=fresh-wins\n"
+)
+vals = squire_connect._env_file_values(home_env)
+check("_env_file_values reads KEY=VALUE pairs",
+      vals.get("TELEGRAM_BOT_TOKEN") == "fresh-token-123", vals)
+check("_env_file_values strips surrounding quotes",
+      vals.get("QUOTED_VALUE") == "quoted", vals)
+check("_env_file_values skips comments, blanks and non-pairs",
+      "NOT_A_PAIR" not in vals and "" not in vals, vals)
+check("_env_file_values on a missing .env returns {} (never raises)",
+      squire_connect._env_file_values(tempfile.mkdtemp()) == {}, "raised or non-empty")
+
+os.environ["STALE_KEY"] = "frozen-loses"
+try:
+    senv = squire_connect._send_env(home_env)
+    check("the fresh .env value beats supervisord's frozen inherited one",
+          senv.get("STALE_KEY") == "fresh-wins", senv.get("STALE_KEY"))
+    check("the platform credential reaches the send environment",
+          senv.get("TELEGRAM_BOT_TOKEN") == "fresh-token-123",
+          senv.get("TELEGRAM_BOT_TOKEN"))
+    check("HERMES_HOME is pinned to the tenant home",
+          senv.get("HERMES_HOME") == home_env, senv.get("HERMES_HOME"))
+    check("HOME is pinned too (hermes send resolves ~/.hermes)",
+          senv.get("HOME") == home_env, senv.get("HOME"))
+finally:
+    os.environ.pop("STALE_KEY", None)
+
+# The credential must survive into the CHILD PROCESS, not merely into a dict:
+# a subprocess.run() that forgets env= would pass every assertion above and
+# still ship the exact bug this fixes.
+home_e2e = tempfile.mkdtemp()
+squire_autopair._atomic_write_0600(
+    squire_autopair.approved_path(home_e2e),
+    {OWNER_ID: {"user_name": "owner", "approved_at": 1.0}},
+)
+open(os.path.join(home_e2e, ".env"), "w").write("TELEGRAM_BOT_TOKEN=e2e-token-xyz\n")
+bindir_e2e = tempfile.mkdtemp()
+env_log = os.path.join(bindir_e2e, "hermes-env")
+script_e2e = os.path.join(bindir_e2e, "hermes")
+open(script_e2e, "w").write(
+    "#!/bin/sh\n"
+    'printf "%s" "${TELEGRAM_BOT_TOKEN:-MISSING}" > "' + env_log + '"\n'
+    "exit 0\n"
+)
+os.chmod(script_e2e, 0o755)
+os.environ["SQUIRE_HERMES_BIN"] = script_e2e
+try:
+    squire_connect.notify_owner_connected("chatgpt", hermes_home=home_e2e)
+    seen_tok = open(env_log).read() if os.path.exists(env_log) else "NO RUN"
+    check("the child `hermes send` process actually receives the credential",
+          seen_tok == "e2e-token-xyz", seen_tok)
+finally:
+    os.environ.pop("SQUIRE_HERMES_BIN", None)
+
+# --- Test 4d: the celebration goes out BEFORE the gateway restart -----------
+# hermes send needs no running gateway for a bot-token platform, so sending
+# after restart_gateway() bought nothing and cost startsecs=45 of dead air on
+# the most important 45 seconds of the product — and made the DM hostage to a
+# gateway that might never come back (live FATAL, 2026-08-19).
+print("== celebration precedes the gateway restart ==")
+home_ord = tempfile.mkdtemp()
+squire_autopair._atomic_write_0600(
+    squire_autopair.approved_path(home_ord),
+    {OWNER_ID: {"user_name": "owner", "approved_at": 1.0}},
+)
+open(os.path.join(home_ord, "config.yaml"), "w").write('model: "anthropic:claude-sonnet-5"\n')
+open(os.path.join(home_ord, ".env"), "w").close()
+bindir_ord = tempfile.mkdtemp()
+order_log = os.path.join(bindir_ord, "order")
+h_ord = os.path.join(bindir_ord, "hermes")
+open(h_ord, "w").write('#!/bin/sh\necho send >> "' + order_log + '"\nexit 0\n')
+os.chmod(h_ord, 0o755)
+ctl_ord = os.path.join(bindir_ord, "supervisorctl")
+open(ctl_ord, "w").write('#!/bin/sh\necho restart >> "' + order_log + '"\nexit 0\n')
+os.chmod(ctl_ord, 0o755)
+os.environ["SQUIRE_HERMES_BIN"] = h_ord
+os.environ["SQUIRE_SUPERVISORCTL"] = ctl_ord
+os.environ["CONTROL_API_URL"] = ""
+try:
+    squire_connect.run_connected_pipeline("chatgpt", hermes_home=home_ord)
+    seq = ([ln.strip() for ln in open(order_log).read().splitlines() if ln.strip()]
+           if os.path.exists(order_log) else [])
+    check("pipeline sends the celebration before restarting the gateway",
+          seq[:2] == ["send", "restart"], seq)
+finally:
+    os.environ.pop("SQUIRE_HERMES_BIN", None)
+    os.environ.pop("SQUIRE_SUPERVISORCTL", None)
+    os.environ.pop("CONTROL_API_URL", None)
+
 # --- Test 5: config.yaml carries the compression notice gate & still parses --
 print("== config.yaml compression notice gate ==")
 try:

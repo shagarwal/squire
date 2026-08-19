@@ -676,6 +676,70 @@ def _hermes_binary() -> str:
     return shutil.which("hermes") or HERMES_BIN_DEFAULT
 
 
+def _env_file_values(hermes_home: str | None = None) -> dict:
+    """Parse $HERMES_HOME/.env into a dict, following the tmpfs symlink.
+
+    Same `KEY=VALUE`, last-assignment-wins shape env_upsert writes. Blank lines,
+    `#` comments and lines without `=` are skipped; a single layer of matching
+    surrounding quotes is stripped. Best-effort: a missing or unreadable file
+    yields {} rather than raising, because every caller is on a non-fatal path.
+    """
+    home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+    target = os.path.realpath(os.path.join(home, ".env"))
+    values: dict = {}
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _send_env(hermes_home: str | None = None) -> dict:
+    """The environment `hermes send` needs, rebuilt from the CURRENT .env.
+
+    WHY THIS EXISTS — the second half of the supervisord frozen-environment
+    trap. HERMES_BIN_DEFAULT above fixed the binary NAME not resolving; this
+    fixes the CREDENTIALS not resolving, and it bit live on 2026-08-19: the
+    celebration failed with
+
+        hermes send: Platform 'telegram' is not configured.
+
+    while the very same command run by hand in the container worked fine.
+
+    The reason is ordering. This code runs in a thread of the webhook shim
+    ([program:webhook], priority 20), which supervisord starts with the frozen
+    environment supervisord itself booted with — captured BEFORE secrets-sync
+    (priority 25) seals the platform credentials into tmpfs. So the inherited
+    env never contains them, no matter how long the tenant has been up.
+    squire-hindsight-env.sh solves exactly this for Hindsight by re-sourcing
+    .env on every restart; `hermes send` needs the same treatment, so we read
+    .env at call time and let it WIN over the stale inherited values.
+
+    HOME and HERMES_HOME are pinned last: `hermes send` documents its config as
+    `~/.hermes/.env + ~/.hermes/config.yaml`, so a process that inherited some
+    other HOME would look in the wrong place entirely.
+    """
+    home = hermes_home or os.environ.get("HERMES_HOME") or "/opt/data"
+    env = os.environ.copy()
+    env.update(_env_file_values(home))  # fresh creds beat the frozen ones
+    env["HERMES_HOME"] = home
+    env["HOME"] = home
+    return env
+
+
 def _record_celebration_failure(hermes_home: str | None, detail: str) -> None:
     """Leave a breadcrumb a human can actually find.
 
@@ -725,6 +789,7 @@ def notify_owner_connected(provider: str, hermes_home: str | None = None) -> boo
         result = subprocess.run(
             [hermes_bin, "send", "--to", f"telegram:{chat_id}", text],
             capture_output=True, timeout=30, check=False,
+            env=_send_env(hermes_home),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         _record_celebration_failure(hermes_home, f"{type(exc).__name__}: {exc}")
@@ -744,16 +809,31 @@ def notify_owner_connected(provider: str, hermes_home: str | None = None) -> boo
 
 
 def run_connected_pipeline(provider: str, hermes_home: str | None = None) -> None:
-    """The conversion moment. Order matters: the model must point at the new
-    provider BEFORE the gateway restarts (or it boots back onto the trial
-    model), and the trial key is revoked only AFTER the tenant can serve
-    without it.
+    """The conversion moment. Order matters, and two constraints fix it:
 
-    notify_owner_connected runs LAST and is non-fatal: the proactive DM is a
-    nicety on top of an already-complete conversion, and a failed send must not
-    fail the pipeline (a stored credential with a missed celebration is still a
-    connected tenant)."""
+      1. the model must point at the new provider BEFORE the gateway restarts
+         (or it boots back onto the trial model), and
+      2. the trial key is revoked only AFTER the tenant can serve without it —
+         so notify_control_api stays behind restart_gateway.
+
+    notify_owner_connected goes SECOND, ahead of the restart, and is non-fatal:
+    the proactive DM is a nicety on top of an already-complete conversion, and a
+    failed send must not fail the pipeline (a stored credential with a missed
+    celebration is still a connected tenant).
+
+    WHY SECOND, not last. `hermes send` needs no running gateway for a bot-token
+    platform like Telegram — it uses the bot token directly. Sending it after
+    restart_gateway() therefore bought nothing and cost ~45s of dead air:
+    supervisorctl does not return until the new gateway clears startsecs=45, so
+    the owner sat watching an idle chat for the most important 45 seconds of the
+    product. Worse, it made the celebration hostage to gateway health — when the
+    gateway went FATAL live on 2026-08-19 the message could never be sent at
+    all. Sending first makes it land in ~2s and survive a restart that fails.
+
+    The restart still happens right behind it, and the shim answers 503 while it
+    runs, which ingress retries — so a reply typed into that window is delayed,
+    never dropped."""
     switch_gateway_model(provider, hermes_home)
+    notify_owner_connected(provider, hermes_home)
     restart_gateway()
     notify_control_api(provider)
-    notify_owner_connected(provider, hermes_home)
