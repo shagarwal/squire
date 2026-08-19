@@ -383,6 +383,58 @@ class Handler(BaseHTTPRequestHandler):
         # or a request that never traversed the edge).
         return (self.client_address or ("",))[0]
 
+    def _handle_llm_connected_post(self) -> None:
+        """POST /internal/llm-connected {"provider": ...} — loopback only.
+
+        The ChatGPT device-flow poller cannot deliver the celebration itself:
+        it runs under the gateway's scrubbed tool environment, which lacks
+        TELEGRAM_BOT_TOKEN, so its `hermes send` fails with "Platform
+        'telegram' is not configured" (live 2026-08-19). This shim inherits
+        supervisord's environment — token included — and already runs the same
+        pipeline for the API-key path (_handle_connect_post), so the poller
+        posts the job here and both connect paths finish in one proven context.
+
+        Loopback-only is the auth model: the caller is a process on this same
+        container. Anything else — including private-network peers — is 403'd,
+        and the public-domain Host gate in do_POST has already rejected
+        public traffic before we get here.
+        """
+        if squire_connect is None:
+            self._respond(404, {"error": "not found"})
+            return
+        peer = (self.client_address or ("",))[0]
+        if peer not in ("127.0.0.1", "::1"):
+            log("rejected non-loopback /internal/llm-connected")
+            self._respond(403, {"error": "forbidden"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._respond(400, {"error": "bad Content-Length"})
+            return
+        if length <= 0 or length > 1024:
+            self._respond(413, {"error": "body missing or too large"})
+            return
+        try:
+            provider = json.loads(self.rfile.read(length)).get("provider")
+        except ValueError:
+            self._respond(400, {"error": "bad json"})
+            return
+        # Same closed set the connect flow writes; anything else is a bug or
+        # a probe, and neither deserves a pipeline run.
+        if provider not in ("openai", "anthropic", "chatgpt"):
+            self._respond(400, {"error": "unknown provider"})
+            return
+        log(f"llm-connected delegation accepted for {provider}")
+        # Same background-thread shape as _handle_connect_post: the pipeline
+        # includes a supervisord gateway restart (~45s) and must not hold the
+        # poller's HTTP request open that long.
+        threading.Thread(
+            target=squire_connect.run_connected_pipeline, args=(provider,),
+            daemon=True,
+        ).start()
+        self._respond(202, {"status": "accepted"})
+
     def _handle_connect_post(self, path: str) -> None:
         """POST /connect/<nonce>: validate the pasted key with the provider,
         store it, consume the nonce, kick the connected pipeline. An invalid
@@ -531,6 +583,10 @@ class Handler(BaseHTTPRequestHandler):
                 count("updates_rejected")
                 self._respond(403, {"error": "forbidden"})
                 return
+
+        if path == "/internal/llm-connected":
+            self._handle_llm_connected_post()
+            return
 
         if path.startswith("/connect/"):
             self._handle_connect_post(path)

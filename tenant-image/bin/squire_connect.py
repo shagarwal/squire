@@ -808,6 +808,44 @@ def notify_owner_connected(provider: str, hermes_home: str | None = None) -> boo
     return True
 
 
+def delegate_connected_pipeline(provider: str, port: int | None = None,
+                                timeout: float = 5.0) -> bool:
+    """Hand the conversion pipeline to the webhook shim. True iff accepted.
+
+    WHY DELEGATE AT ALL. The ChatGPT device-flow poller is a grandchild of the
+    GATEWAY's agent tool exec, and the gateway scrubs platform secrets out of
+    tool subprocess environments (deliberately — the agent's shell must not see
+    the bot token). `hermes send` reads TELEGRAM_BOT_TOKEN from the ENVIRONMENT
+    (it is in no file under $HERMES_HOME), so a send from the poller fails with
+    "Platform 'telegram' is not configured" no matter what HOME/.env fixups we
+    do — live on 2026-08-19, twice, on two image versions. The webhook shim
+    inherits supervisord's environment, which carries the Railway-injected
+    token, and already runs this same pipeline for the API-key connect path —
+    so the poller posts the job there and both paths finish in the one context
+    known to deliver.
+
+    Loopback only, tiny JSON body, never raises: any failure returns False and
+    the caller falls back to running the pipeline locally — degraded (the
+    celebration will fail and leave its breadcrumb) but never worse than the
+    pre-delegation behavior.
+
+    PORT default matches the shim's own default (8080): the poller's scrubbed
+    env usually lacks PORT, and the Dockerfile/healthcheck pin 8080 fleet-wide.
+    """
+    port = port or int(os.environ.get("PORT") or 8080)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/internal/llm-connected",
+        data=json.dumps({"provider": provider}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 202
+    except Exception:  # noqa: BLE001 -- delegation is best-effort by contract
+        return False
+
+
 def run_connected_pipeline(provider: str, hermes_home: str | None = None) -> None:
     """The conversion moment. Order matters, and two constraints fix it:
 

@@ -764,6 +764,84 @@ finally:
     adapter6.shutdown()
     adapter6.server_close()
 
+print("== /internal/llm-connected: poller delegation endpoint ==")
+# The ChatGPT device-flow poller runs under the gateway's scrubbed tool env
+# (no TELEGRAM_BOT_TOKEN), so it delegates the conversion pipeline HERE — the
+# shim inherits supervisord's env, which has the token (live 2026-08-19). This
+# section proves: loopback POST 202 + the pipeline genuinely runs (observable
+# fake `hermes send`), unknown provider 400 + no run, public Host 403.
+import tempfile  # noqa: E402
+
+sys.path.insert(0, str(IMAGE_ROOT / "bin"))
+import squire_autopair  # noqa: E402  - reuse production store shape exactly
+
+DELEG_OWNER = "445566778"
+deleg_home = tempfile.mkdtemp()
+squire_autopair._atomic_write_0600(
+    squire_autopair.approved_path(deleg_home),
+    {DELEG_OWNER: {"user_name": "owner", "approved_at": 1.0}},
+)
+# Pipeline touches config.yaml (model switch) and .env — seed both.
+open(os.path.join(deleg_home, "config.yaml"), "w").write(
+    'model: "anthropic:claude-sonnet-5"\n')
+open(os.path.join(deleg_home, ".env"), "w").close()
+
+deleg_bindir = tempfile.mkdtemp()
+deleg_argv = os.path.join(deleg_bindir, "hermes-argv")
+deleg_hermes = os.path.join(deleg_bindir, "hermes")
+open(deleg_hermes, "w").write(
+    "#!/bin/sh\n"
+    'for a in "$@"; do printf "%s\\000" "$a" >> "' + deleg_argv + '"; done\n'
+    "exit 0\n"
+)
+os.chmod(deleg_hermes, 0o755)
+
+proc = run({
+    "SQUIRE_PUBLIC_DOMAIN": PUB,          # so the Host gate is live too
+    "SQUIRE_HERMES_BIN": deleg_hermes,
+    "SQUIRE_SUPERVISORCTL": "/bin/true",
+    "CONTROL_API_URL": "",
+    "HERMES_HOME": deleg_home,
+    "SQUIRE_STATE_DIR": os.path.join(deleg_home, ".squire"),
+})
+try:
+    # Loopback + private Host -> accepted, and the pipeline PROVABLY runs:
+    # the fake hermes records its argv from inside the shim's thread.
+    status, _ = raw_request("POST", "/internal/llm-connected",
+                            {"provider": "chatgpt"})
+    check("loopback delegation -> 202", status == 202, status)
+    deadline = time.time() + 10
+    argv = None
+    while time.time() < deadline:
+        if os.path.exists(deleg_argv):
+            raw = open(deleg_argv, "rb").read().split(b"\x00")
+            argv = [p.decode() for p in raw if p]
+            break
+        time.sleep(0.2)
+    check("pipeline ran in the shim: hermes send invoked", argv is not None, argv)
+    if argv:
+        check("…addressed to the approved owner",
+              argv[:3] == ["send", "--to", f"telegram:{DELEG_OWNER}"], argv[:3])
+
+    # Garbage provider: rejected, and no second pipeline fires.
+    os.unlink(deleg_argv)
+    status, _ = raw_request("POST", "/internal/llm-connected",
+                            {"provider": "evil"})
+    check("unknown provider -> 400", status == 400, status)
+    time.sleep(1.0)
+    check("unknown provider -> pipeline did NOT run",
+          not os.path.exists(deleg_argv), "argv file exists")
+
+    # The public domain must not expose the trigger: forged Host -> 403.
+    status, _ = raw_request("POST", "/internal/llm-connected",
+                            {"provider": "chatgpt"}, host=PUB)
+    check("public Host -> 403", status == 403, status)
+    check("public Host -> pipeline did NOT run",
+          not os.path.exists(deleg_argv), "argv file exists")
+finally:
+    proc.terminate()
+    proc.wait(timeout=10)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

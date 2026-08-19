@@ -485,6 +485,44 @@ finally:
     ua_server.shutdown()
     ua_server.server_close()
 
+print("== _finalize_connected: delegate to the shim, fall back locally ==")
+# The poller cannot deliver the celebration itself (gateway tool env is
+# scrubbed of TELEGRAM_BOT_TOKEN — live 2026-08-19), so it must TRY the shim
+# first and run locally ONLY when the shim refuses. Both orders of mistake
+# ship a real bug: always-local resurrects the silent celebration, and
+# no-fallback means a wedged shim breaks the whole conversion.
+# The CLI has no .py extension, so spec_from_file_location can't infer a
+# loader — name one explicitly.
+import importlib.machinery  # noqa: E402
+
+_loader = importlib.machinery.SourceFileLoader("squire_llm_connect_cli", CLI)
+_spec = importlib.util.spec_from_loader("squire_llm_connect_cli", _loader)
+_cli = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_cli)
+
+_calls = []
+_saved_delegate = _cli.squire_connect.delegate_connected_pipeline
+_saved_local = _cli.squire_connect.run_connected_pipeline
+try:
+    _cli.squire_connect.delegate_connected_pipeline = (
+        lambda p, **kw: (_calls.append(("delegate", p)), True)[1])
+    _cli.squire_connect.run_connected_pipeline = (
+        lambda p, **kw: _calls.append(("local", p)))
+
+    _cli._finalize_connected("chatgpt")
+    check("shim accepted -> delegated once, no local run",
+          _calls == [("delegate", "chatgpt")], _calls)
+
+    _calls.clear()
+    _cli.squire_connect.delegate_connected_pipeline = (
+        lambda p, **kw: (_calls.append(("delegate", p)), False)[1])
+    _cli._finalize_connected("chatgpt")
+    check("shim refused -> local fallback ran, delegate first",
+          _calls == [("delegate", "chatgpt"), ("local", "chatgpt")], _calls)
+finally:
+    _cli.squire_connect.delegate_connected_pipeline = _saved_delegate
+    _cli.squire_connect.run_connected_pipeline = _saved_local
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

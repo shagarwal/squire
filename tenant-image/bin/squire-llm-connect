@@ -217,9 +217,24 @@ def cmd_poll(device_auth_id: str, user_code: str, interval: str) -> int:
         write_status("error", provider="chatgpt",
                      detail="could not store credential securely; try again")
         return 1
-    squire_connect.run_connected_pipeline("chatgpt")
+    _finalize_connected("chatgpt")
     write_status("connected", provider="chatgpt")
     return 0
+
+
+def _finalize_connected(provider: str) -> None:
+    """Run the conversion pipeline — in the shim's process when possible.
+
+    This poller inherits the GATEWAY's scrubbed tool environment, which lacks
+    TELEGRAM_BOT_TOKEN, so a pipeline run here cannot deliver the celebration
+    (`hermes send` reads the token from the environment; live 2026-08-19). The
+    webhook shim has the token and already runs this pipeline for the API-key
+    path, so delegate there first. Local fallback keeps the conversion itself
+    (model switch, restart, trial-key revoke) working even if the shim is down
+    — only the celebration degrades, and it leaves its breadcrumb.
+    """
+    if not squire_connect.delegate_connected_pipeline(provider):
+        squire_connect.run_connected_pipeline(provider)
 
 
 def cmd_refresh_openai_device() -> int:

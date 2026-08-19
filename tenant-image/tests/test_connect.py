@@ -841,6 +841,53 @@ finally:
     os.environ.pop("SQUIRE_SUPERVISORCTL", None)
     os.environ.pop("CONTROL_API_URL", None)
 
+# --- Test 4e: delegate_connected_pipeline talks to the shim correctly -------
+# The poller's env is scrubbed of TELEGRAM_BOT_TOKEN (gateway tool exec), so it
+# hands the pipeline to the webhook shim over loopback. Contract: POST JSON
+# {"provider": ...} to /internal/llm-connected; True iff 202; NEVER raises.
+print("== delegate_connected_pipeline (shim handoff) ==")
+import http.server  # noqa: E402
+import socketserver  # noqa: E402
+import threading as _threading  # noqa: E402
+
+_deleg_seen = []
+
+
+class _FakeShim(http.server.BaseHTTPRequestHandler):
+    status_to_return = 202
+
+    def log_message(self, *a):  # noqa: N802
+        return
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        _deleg_seen.append((self.path, self.rfile.read(n)))
+        self.send_response(self.status_to_return)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+_fake_shim = socketserver.TCPServer(("127.0.0.1", 0), _FakeShim)
+_shim_port = _fake_shim.server_address[1]
+_threading.Thread(target=_fake_shim.serve_forever, daemon=True).start()
+
+ok = squire_connect.delegate_connected_pipeline("chatgpt", port=_shim_port)
+check("shim answers 202 -> delegation returns True", ok is True, ok)
+check("request hit /internal/llm-connected",
+      _deleg_seen and _deleg_seen[0][0] == "/internal/llm-connected", _deleg_seen)
+check("body carries the provider as JSON",
+      _deleg_seen and json.loads(_deleg_seen[0][1]) == {"provider": "chatgpt"},
+      _deleg_seen)
+
+_FakeShim.status_to_return = 500
+ok = squire_connect.delegate_connected_pipeline("chatgpt", port=_shim_port)
+check("shim answers 500 -> delegation returns False", ok is False, ok)
+_fake_shim.shutdown()
+_fake_shim.server_close()
+
+ok = squire_connect.delegate_connected_pipeline("chatgpt", port=_shim_port)
+check("shim unreachable -> False, never raises", ok is False, ok)
+
 # --- Test 5: config.yaml carries the compression notice gate & still parses --
 print("== config.yaml compression notice gate ==")
 try:
