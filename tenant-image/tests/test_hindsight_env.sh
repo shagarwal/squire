@@ -156,10 +156,8 @@ ck "stale singleton token not used" "$(grep -q "$JWT_STALE" "$DERIVED" && echo 0
 ck "refresh_token NEVER copied (hermes is the sole refresher)" \
    "$(grep -q 'rt-NEVER-COPY' "$DERIVED" && echo 0 || echo 1)"
 ck "derived file is 0600" "$([ "$(stat -c %a "$DERIVED")" = 600 ] && echo 1 || echo 0)" "$(stat -c %a "$DERIVED")"
-ck "embeddings ride the codex subscription" \
-   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai-codex$' "$OUT" && echo 1 || echo 0)"
-ck "embeddings dimensions pinned to 384 (bge-small compatible)" \
-   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS=384$' "$OUT" && echo 1 || echo 0)"
+ck "codex tenants get NO embeddings vars (sub tokens auth but 429 insufficient_quota — verified live 2026-08-20)" \
+   "$(grep -q 'HINDSIGHT_API_EMBEDDINGS' "$OUT" && echo 0 || echo 1)"
 
 # --- codex idempotency + rotation ---
 bash "$BIN/squire-hindsight-env.sh" >/dev/null; rc=$?

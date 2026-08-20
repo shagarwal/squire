@@ -273,10 +273,16 @@ chmod 0600 "$tmp"
     # refuses to boot on a dimension change over a non-empty vector table, so
     # 384 is what makes flipping providers mid-life safe. (text-embedding-3
     # supports truncation to 384.)
-    if [ "$provider" = "openai-codex" ]; then
-        echo "HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai-codex"
-        echo "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS=384"
-    elif [ "$provider" = "openai" ] && [ -z "$base" ]; then
+    # ChatGPT tenants deliberately get NO embeddings block despite hindsight
+    # shipping an openai-codex embeddings provider. VERIFIED LIVE 2026-08-20
+    # (tenant 1ctest7): the subscription OAuth token AUTHENTICATES against
+    # api.openai.com/v1/embeddings but the call returns 429 insufficient_quota
+    # — embeddings bill the PLATFORM account, which a pure-subscription user
+    # has never funded — and hindsight surfaces that as a hard recall/retain
+    # failure, not a graceful fallback. Local model it is. (The codex LLM is
+    # different: it talks to the ChatGPT backend, which the subscription DOES
+    # cover — dry-run-extract verified live the same day.)
+    if [ "$provider" = "openai" ] && [ -z "$base" ]; then
         # Only for a PLAIN OpenAI key. A custom OPENAI_BASE_URL means an
         # OpenAI-compatible endpoint that may well not serve /v1/embeddings —
         # fail toward the local model, not toward runtime embedding errors.
