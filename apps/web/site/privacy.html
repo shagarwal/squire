@@ -4,19 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Squire — Privacy Policy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Gabarito:wght@600;700&family=Hanken+Grotesk:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0c0e12; --text:#e8eaee; --muted:#9aa3b2; --accent:#e8b64c; --line:#262b34; }
+  :root { --paper:#fafaf7; --ink:#20272b; --muted:#6a7480; --accent:#2f6d53; --line:#e3e7e2;
+          --display:"Gabarito","Avenir Next","Trebuchet MS",sans-serif;
+          --body:"Hanken Grotesk","Segoe UI",system-ui,sans-serif; }
   * { box-sizing: border-box; margin: 0; }
-  body { background: var(--bg); color: var(--text);
-         font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 24px 64px; }
+  body { background: var(--paper); color: var(--ink); font: 16.5px/1.7 var(--body); }
+  .wrap { max-width: 680px; margin: 0 auto; padding: 34px 28px 72px; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  h1 { font-size: 1.7rem; margin: 24px 0 8px; }
-  h2 { font-size: 1.15rem; margin: 28px 0 8px; }
+  h1 { font: 700 1.8rem var(--display); margin: 26px 0 8px; letter-spacing: -.01em; }
+  h2 { font: 650 1.15rem var(--display); margin: 30px 0 8px; }
   p, li { color: var(--muted); }
+  strong { color: var(--ink); }
   ul { padding-left: 20px; }
-  .updated { font-size: .85rem; color: var(--muted); }
+  .updated { font-size: .85rem; }
 </style>
 </head>
 <body>
@@ -53,8 +58,8 @@
      entirely.</p>
 
   <h2>The product itself</h2>
-  <p>Squire is being built so that your agent's conversations and credentials live in an
-     isolated per-user runtime that we cannot casually access — the launch product will ship
+  <p>Squire is being built so that your assistant's conversations and credentials live in an
+     isolated per-user space that we cannot casually access — the launch product will ship
      with its own, much longer privacy policy describing that architecture.</p>
 </div>
 </body>
