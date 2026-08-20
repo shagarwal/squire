@@ -108,6 +108,103 @@ unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
 bash "$BIN/squire-hindsight-env.sh" >/dev/null
 ck "no creds -> no LLM vars emitted" "$(grep -q 'HINDSIGHT_API_LLM_PROVIDER' "$OUT" && echo 0 || echo 1)"
 
+# --- ChatGPT (Codex OAuth): auth.json only, no .env marker -------------------
+# Since the 2026-08-16 connect fix a ChatGPT tenant has NOTHING in .env; the
+# tokens live in hermes's auth.json envelope. The script must take the codex
+# branch, not fall through to the (revoked) trial key in the process env.
+b64url() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '='; }
+JWT_STALE="hdr.$(b64url '{"exp":1000000000}').sig"
+JWT_FRESH="hdr.$(b64url '{"exp":2000000000}').sig"
+: > "$T/shm/.env"
+cat > "$T/shm/auth.json" <<E
+{
+  "version": 1,
+  "active_provider": "openai-codex",
+  "providers": {
+    "openai-codex": {
+      "auth_mode": "device_code",
+      "tokens": {"access_token": "$JWT_STALE", "refresh_token": "rt-NEVER-COPY", "account_id": "acct-1"}
+    }
+  },
+  "credential_pool": {
+    "openai-codex": [
+      {"source": "device_code", "tokens": {"access_token": "$JWT_FRESH", "refresh_token": "rt-NEVER-COPY-2", "account_id": "acct-1"}}
+    ]
+  }
+}
+E
+export ANTHROPIC_API_KEY=REVOKED-TRIAL-KEY
+export ANTHROPIC_BASE_URL=https://proxy.squire.internal
+bash "$BIN/squire-hindsight-env.sh" >/dev/null; rc=$?
+DERIVED="$T/shm/codex-home/auth.json"
+ck "codex derivation reports changed (rc=10)" "$([ $rc -eq 10 ] && echo 1 || echo 0)" "rc=$rc"
+ck "codex beats the revoked trial key" \
+   "$(grep -q '^HINDSIGHT_API_LLM_PROVIDER=openai-codex$' "$OUT" && echo 1 || echo 0)" \
+   "got: $(grep '^HINDSIGHT_API_LLM_PROVIDER=' "$OUT")"
+ck "trial key absent from codex config" "$(grep -q 'REVOKED-TRIAL-KEY' "$OUT" && echo 0 || echo 1)"
+ck "codex emits no LLM_API_KEY line (auth is file-based)" \
+   "$(grep -q '^HINDSIGHT_API_LLM_API_KEY=' "$OUT" && echo 0 || echo 1)"
+ck "mini-class codex model" "$(grep -q '^HINDSIGHT_API_LLM_MODEL=gpt-5.4-mini$' "$OUT" && echo 1 || echo 0)"
+ck "CODEX_HOME points at the derived dir" \
+   "$(grep -q "^CODEX_HOME=$T/shm/codex-home$" "$OUT" && echo 1 || echo 0)"
+ck "derived auth.json exists" "$([ -f "$DERIVED" ] && echo 1 || echo 0)"
+ck "derived file is Codex-CLI format (auth_mode=chatgpt)" \
+   "$(grep -q '"auth_mode": "chatgpt"' "$DERIVED" && echo 1 || echo 0)"
+ck "FRESHEST access token wins (pool over stale singleton)" \
+   "$(grep -q "$JWT_FRESH" "$DERIVED" && echo 1 || echo 0)"
+ck "stale singleton token not used" "$(grep -q "$JWT_STALE" "$DERIVED" && echo 0 || echo 1)"
+ck "refresh_token NEVER copied (hermes is the sole refresher)" \
+   "$(grep -q 'rt-NEVER-COPY' "$DERIVED" && echo 0 || echo 1)"
+ck "derived file is 0600" "$([ "$(stat -c %a "$DERIVED")" = 600 ] && echo 1 || echo 0)" "$(stat -c %a "$DERIVED")"
+ck "embeddings ride the codex subscription" \
+   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai-codex$' "$OUT" && echo 1 || echo 0)"
+ck "embeddings dimensions pinned to 384 (bge-small compatible)" \
+   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS=384$' "$OUT" && echo 1 || echo 0)"
+
+# --- codex idempotency + rotation ---
+bash "$BIN/squire-hindsight-env.sh" >/dev/null; rc=$?
+ck "unchanged codex rerun reports 0" "$([ $rc -eq 0 ] && echo 1 || echo 0)" "rc=$rc"
+JWT_FRESHER="hdr.$(b64url '{"exp":3000000000}').sig"
+sed -i "s|$JWT_FRESH|$JWT_FRESHER|" "$T/shm/auth.json"
+bash "$BIN/squire-hindsight-env.sh" >/dev/null; rc=$?
+ck "hermes token rotation reports changed (rc=10 -> restart)" "$([ $rc -eq 10 ] && echo 1 || echo 0)" "rc=$rc"
+ck "derived file picked up the rotated token" "$(grep -q "$JWT_FRESHER" "$DERIVED" && echo 1 || echo 0)"
+
+# --- .env key beats codex; leaving codex cleans up the derived file ---
+cat > "$T/shm/.env" <<'E'
+ANTHROPIC_API_KEY=sk-ant-user-own-key
+E
+bash "$BIN/squire-hindsight-env.sh" >/dev/null
+ck ".env key beats codex auth.json" \
+   "$(grep -q '^HINDSIGHT_API_LLM_PROVIDER=anthropic$' "$OUT" && echo 1 || echo 0)"
+ck "derived codex auth.json removed when codex is not the provider" \
+   "$([ -f "$DERIVED" ] && echo 0 || echo 1)"
+ck "anthropic tenants get NO embeddings vars (no Anthropic embeddings API)" \
+   "$(grep -q 'HINDSIGHT_API_EMBEDDINGS' "$OUT" && echo 0 || echo 1)"
+rm -f "$T/shm/auth.json"
+unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
+
+# --- embeddings on a plain OpenAI key ---
+cat > "$T/shm/.env" <<'E'
+OPENAI_API_KEY=sk-openai-embed-me
+E
+bash "$BIN/squire-hindsight-env.sh" >/dev/null
+ck "plain OpenAI key: embeddings on the user's provider" \
+   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai$' "$OUT" && echo 1 || echo 0)"
+ck "embeddings use an EXPLICIT key (LLM-key fallback trap)" \
+   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=sk-openai-embed-me$' "$OUT" && echo 1 || echo 0)"
+ck "openai embeddings dimensions pinned to 384" \
+   "$(grep -q '^HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS=384$' "$OUT" && echo 1 || echo 0)"
+
+# --- custom base URL: fail toward the local model, not runtime errors ---
+cat > "$T/shm/.env" <<'E'
+OPENAI_API_KEY=sk-openai-compat
+OPENAI_BASE_URL=https://some-openai-compatible.example
+E
+bash "$BIN/squire-hindsight-env.sh" >/dev/null
+ck "custom OPENAI_BASE_URL: no embeddings vars (endpoint may lack /v1/embeddings)" \
+   "$(grep -q 'HINDSIGHT_API_EMBEDDINGS' "$OUT" && echo 0 || echo 1)"
+
 # --- the key must never be logged ---
 cat > "$T/shm/.env" <<'E'
 ANTHROPIC_API_KEY=sk-ant-super-secret
