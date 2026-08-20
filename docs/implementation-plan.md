@@ -60,7 +60,46 @@ Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive
 
 Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
 
-> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-19, after the 1C live-verification day)
+> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-20, after the G1 measurement day)
+>
+> **Gate G1 is MEASURED and PASSES → the data plane stays on Railway.**
+> Measured live on staging (full numbers: memory `g1-measurement-results.md`):
+> - **$/tenant**: memory bills only while awake (verified — SLEEPING deploys
+>   read 0). $/tenant ≈ awake_fraction × RSS × $10/GB-mo + ~$0.05 volume
+>   (billed on *used* GB, ~350MB) + pennies of CPU. Median tenant ≈ $0.5–2/mo;
+>   only an 8h-awake/day heavy user brushes the $3 bar. PASS.
+> - **p95 wake ≤8s to first typing indicator**: passes by architecture — the
+>   ingress buffer-and-wake nudge fires `sendChatAction` sub-second (same-second
+>   503→nudge→redelivery observed live); worst observed full redelivery 6s.
+> - **Embedder lever**: hindsight-api RSS 792MB (local) → **511MB** (cloud
+>   OpenAI) → 926MB–1.6GB (onnx — a DUD, don't use; the guide's "gemini" value
+>   is also wrong, the string is `google`). Idle container 1.19GB → 0.94GB.
+> - **Levers SHIPPED on the back of the measurement:**
+>   - Pool sleep (`e336c25`, control-api only): provisioned tenants get
+>     `SQUIRE_UNBOUND_AWAKE_HOURS=1.0` (was image-default 48h ≈ $0.80/signup
+>     burned). Signup deploy = the wake; stragglers ride the typing nudge.
+>   - Embeddings on the tenant's OWN provider (`0f758e1`, image v0.2.11):
+>     ChatGPT tenants → `openai-codex`, plain-OpenAI-key tenants → `openai`
+>     (explicit key, 384 dims); Anthropic/trial keep the local model (no
+>     Anthropic embeddings API — RAM instead of disclosure). Same commit fixes
+>     a REAL bug: since the 2026-08-16 auth.json move, ChatGPT tenants'
+>     hindsight fell back to the revoked trial key — extraction was silently
+>     401ing for both live conversions. Hermes stays the sole OAuth refresher
+>     (derived `$CODEX_HOME/auth.json` carries no refresh_token).
+>   - The Squire-owned-OpenAI-key variant (control-api `TENANT_EMBEDDINGS_*`,
+>     gated off) sits UNCOMMITTED pending a founder decision — only needed if
+>     trial/Anthropic tenants must ever shed the local model.
+> - **Open G1 tails**: formal re-measurement at 10-alpha scale (Task 0.6);
+>   Railway support questions (max services/project, GraphQL rate limits,
+>   private-network wake) still unasked; verify live that openai-codex
+>   embeddings/LLM actually accept subscription OAuth on the first redeployed
+>   converted tenant; decide whether trial-era memories need re-embedding
+>   after a provider switch (vector-space mix degrades recall of onboarding
+>   facts).
+>
+> *(Below: the 2026-08-19 rewrite, kept for context.)*
+>
+> ### ▶ Previous (2026-08-19, after the 1C live-verification day)
 >
 > **Phase 0 code is complete and LIVE, and workstream 1C shipped early and is
 > VERIFIED end-to-end** — a real user connected a real ChatGPT subscription,
@@ -131,7 +170,7 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 - [x] Bake productized `~/.hermes` template: SOUL.md (de-personalized), skills, config.yaml with Telegram adapter (webhook mode via shim), Hindsight tuned per guide (with corrections — guide's MAX_SLOTS knob was a deprecated no-op alias).
 - [x] Concierge skill v1 (baked): 9-state machine in `state-machine.yaml`, 4 provider options with honest labels.
 - [x] Secrets init shim: AES-256-GCM, plaintext only on tmpfs (/dev/shm), first-boot init, wrong-DEK boot refusal, volume-durability gates.
-- [ ] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s. *(Partial: idle RSS measured ~1.3GB — levers identified, unpulled; sleep now verified to engage after patch 006. The $/tenant and p95-wake halves are the open G1 work.)*
+- [x] Measure: idle RSS, boot time, wake time. Targets: ≤ 512MB / ≤ 20s / ≤ 8s. *(Measured 2026-08-19/20: idle RSS 1.19GB local-embedder / 0.94GB cloud — the 512MB RSS target is NOT met, but G1's $ math passes anyway because sleep dominates the bill; wake-to-typing ≤8s passes via the ingress nudge. See the G1 block above.)*
 
 ### Task 0.3 — Control API v0 + provisioning
 - [x] FastAPI + SQLModel on `control-db`: `tenants`, `bots`, `provision_jobs` tables (140 tests; privacy-schema guard is build-breaking).
