@@ -222,11 +222,19 @@ RUN uv venv --no-config --python 3.13 /opt/squire/venv \
 # `2.9.1+cpu` does not exist on PyPI: if this resolve ever falls back to the
 # default index it now fails loudly instead of quietly installing the
 # multi-gigabyte CUDA build into a container that has no GPU.
+#
+# local-onnx (added for Gate G1, 2026-08-19): onnxruntime + tokenizers, ~50MB
+# and NO torch dependency. Makes HINDSIGHT_API_EMBEDDINGS_PROVIDER=onnx a
+# viable low-RAM embedder (default model intfloat/multilingual-e5-small,
+# 384-dim — same dimension as local's bge-small, so existing vector tables
+# survive the switch). Keyless and in-container, unlike the openai provider;
+# kept alongside local-ml so `local` remains the image default until a
+# fleet-wide embedder decision is made.
 RUN uv venv --no-config --python 3.13 /opt/squire/hindsight-venv \
  && uv pip install --no-config --python /opt/squire/hindsight-venv/bin/python --no-cache \
         --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}" \
  && uv pip install --no-config --python /opt/squire/hindsight-venv/bin/python --no-cache \
-        "hindsight-api-slim[embedded-db,local-ml]==${HINDSIGHT_VERSION}" \
+        "hindsight-api-slim[embedded-db,local-ml,local-onnx]==${HINDSIGHT_VERSION}" \
  && /opt/squire/hindsight-venv/bin/hindsight-api --help > /dev/null
 
 # ---------------------------------------------------------------------------
