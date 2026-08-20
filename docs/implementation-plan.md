@@ -89,13 +89,20 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 >   - The Squire-owned-OpenAI-key variant (control-api `TENANT_EMBEDDINGS_*`,
 >     gated off) sits UNCOMMITTED pending a founder decision — only needed if
 >     trial/Anthropic tenants must ever shed the local model.
+> - **Codex verification came back split (live on 1ctest7, 2026-08-20, →
+>   v0.2.12):** the codex **LLM** works on the subscription — dry-run-extract
+>   returned real facts + token usage through gpt-5.4-mini — so extraction is
+>   ALIVE again for ChatGPT tenants. The codex **embeddings** path is dead:
+>   the OAuth token authenticates but every call 429s `insufficient_quota`
+>   (embeddings bill the *platform* account, which a pure-subscription user
+>   never funded), and hindsight fails hard, not gracefully. ChatGPT tenants
+>   therefore keep the LOCAL embedder (v0.2.12 reverts that emission); only
+>   plain-OpenAI-key tenants get cloud embeddings.
 > - **Open G1 tails**: formal re-measurement at 10-alpha scale (Task 0.6);
 >   Railway support questions (max services/project, GraphQL rate limits,
->   private-network wake) still unasked; verify live that openai-codex
->   embeddings/LLM actually accept subscription OAuth on the first redeployed
->   converted tenant; decide whether trial-era memories need re-embedding
->   after a provider switch (vector-space mix degrades recall of onboarding
->   facts).
+>   private-network wake) still unasked; decide whether trial-era memories
+>   need re-embedding after a provider switch (vector-space mix degrades
+>   recall of onboarding facts — only affects plain-OpenAI-key tenants now).
 >
 > *(Below: the 2026-08-19 rewrite, kept for context.)*
 >
