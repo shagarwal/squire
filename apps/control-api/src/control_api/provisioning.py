@@ -582,6 +582,13 @@ def _step_set_variables(session: Session, tenant: Tenant, clients: ProvisionClie
         # with patch 006 (identity-refresh loop off). The image default stays 300
         # for dev/self-hosted, where nothing sleeps.
         "SQUIRE_HEARTBEAT_INTERVAL": str(settings.tenant_heartbeat_interval_seconds),
+        # Cap on the awake-until-bound warm window (image default: 48h). The
+        # tenant is freshly deployed at signup, so it is already awake when the
+        # owner's deep-link tap normally arrives; after this many owner-less
+        # hours it drops to the slow beat above and earns its sleep, and a late
+        # first tap rides the ingress buffer-and-wake path (typing indicator
+        # fires sub-second, tenant boots behind it). See config.py.
+        "SQUIRE_UNBOUND_AWAKE_HOURS": str(settings.tenant_unbound_awake_hours),
         # 1C: the tenant's public domain, written explicitly so the connect
         # CLI never depends on Railway's deploy-time RAILWAY_PUBLIC_DOMAIN
         # injection actually happening. Read back by name from Railway (the

@@ -146,6 +146,11 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
         # which would keep every tenant awake past Railway's ~10-minute
         # outbound-quiet sleep window forever.
         "SQUIRE_HEARTBEAT_INTERVAL",
+        # Pool-sleep (Gate G1, 2026-08-20): caps the awake-until-bound warm
+        # window at hours, not the image's forgiving 48h default. The tenant is
+        # deployed (= awake) at signup; a late first tap wakes it via the
+        # ingress buffer + typing nudge like any sleeping tenant.
+        "SQUIRE_UNBOUND_AWAKE_HOURS",
         # 1C: the tenant's public domain (the /connect page's front door),
         # written explicitly so the connect CLI never depends on Railway's
         # deploy-time RAILWAY_PUBLIC_DOMAIN injection actually landing.
@@ -164,6 +169,11 @@ def test_tenant_env_vars_match_the_interface_contract(pool_bot, fake_railway):
     assert sent["CONTROL_API_URL"] == "https://control-api.squire.test"
     assert sent["ANTHROPIC_BASE_URL"] == "https://trial-proxy.squire.test"
     assert sent["ANTHROPIC_API_KEY"] == "sk-trial-abc"
+    # Warm-window cap: a string like every Railway variable, parseable as the
+    # float the image's heartbeat expects (_env_number(..., float)), and small
+    # -- the whole point is to be far below the image's 48h default.
+    assert sent["SQUIRE_UNBOUND_AWAKE_HOURS"] == "1.0"
+    assert float(sent["SQUIRE_UNBOUND_AWAKE_HOURS"]) <= 4
     # Matches the image the service was created from, and the tenant row's mirror
     # of it -- /fleet compares the two to spot a tenant that never converged.
     assert sent["SQUIRE_IMAGE_REF"] == "ghcr.io/shagarwal/squire/hermes-tenant:v0"

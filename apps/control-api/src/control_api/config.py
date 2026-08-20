@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     # /fleet cannot tell "asleep" from "dead" until it consults Railway's own
     # service state (out of scope for this change).
     heartbeat_stale_seconds: float = 5400.0
+    # SQUIRE_UNBOUND_AWAKE_HOURS handed to every provisioned tenant: how long
+    # an owner-less tenant keeps the fast (300s) heartbeat that holds it awake
+    # for its owner's first deep-link tap. The image's own default is 48h --
+    # sized for self-hosted forgiveness, but on Railway that is ~2 days of
+    # billed container-hours (~$0.80/signup at 1.2GB awake RSS) spent waiting
+    # for a tap that usually comes within minutes. 1h covers the realistic
+    # signup -> first-tap gap; a straggler who taps later wakes the tenant
+    # through the normal ingress buffer-and-wake path behind a typing
+    # indicator (~3-6s observed), exactly like any sleeping bound tenant.
+    # Decision + wake-path evidence: G1 measurement session, 2026-08-19/20.
+    tenant_unbound_awake_hours: float = 1.0
 
     # -- Ingress ------------------------------------------------------------
     # Telegram webhooks are registered as `<ingress_public_url>/telegram/<bot_id>`.
