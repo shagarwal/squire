@@ -41,7 +41,7 @@ FORBIDDEN_COLUMN_SUBSTRINGS = [
 # counters and gauges -- and note that the fleet metrics are named `updates_*`, not
 # `messages_*`, both because Telegram calls them updates and because the forbidden
 # substring below must keep meaning what it says.
-ALLOWED_TABLES = {"tenant", "bot", "provisionjob", "heartbeat"}
+ALLOWED_TABLES = {"tenant", "bot", "provisionjob", "heartbeat", "waitlist"}
 
 
 def test_only_expected_tables_exist():
@@ -141,6 +141,31 @@ EXPECTED_COLUMNS = {
         "status",
         "webhook_secret",
         "assigned_tenant_id",
+        "created_at",
+    },
+    # Pre-launch marketing waitlist (routers/public.py). The bar from the
+    # heartbeat note above -- "can this hold anything derived from what a user
+    # *said to their agent*?" -- is still the test:
+    #   * `email` is signup PII with the same precedent as tenant.email.
+    #   * `features` is a JSON-encoded list pinned to the closed
+    #     schemas.WAITLIST_FEATURES set; free-form text cannot reach it.
+    #   * `use_case` is the one free-text column: a <=500-char survey answer
+    #     typed on the PUBLIC site before any tenant exists. It is marketing
+    #     input, not conversation content, and the ingest schema's
+    #     `extra="forbid"` + caps keep it that way.
+    #   * `confirm_token` is control-plane-minted (like bot.webhook_secret),
+    #     never user credential material.
+    "waitlist": {
+        "id",
+        "email",
+        "features",
+        "use_case",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "referrer",
+        "confirm_token",
+        "confirmed_at",
         "created_at",
     },
     # `last_error` carries third-party error text, which is why it is scrubbed

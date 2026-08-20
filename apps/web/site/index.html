@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Squire — sign up, get a text. That's your AI agent.</title>
+<meta name="description" content="A personal AI agent in your messages — memory, tools, reminders, always on — living in a private space we can't look into. Join the waitlist.">
+<style>
+  /* Single-file page on purpose: no build step, no external assets, nothing to
+     break. System font stack; dark, calm, engineer-credible. */
+  :root {
+    --bg: #0c0e12;
+    --panel: #14171d;
+    --panel-2: #191d24;
+    --text: #e8eaee;
+    --muted: #9aa3b2;
+    --accent: #e8b64c;      /* squire gold */
+    --accent-ink: #1a1403;
+    --line: #262b34;
+    --ok: #6fce8f;
+    --err: #e07070;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.site { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+  .logo { font-weight: 700; letter-spacing: .02em; font-size: 1.1rem; color: var(--text); }
+  .logo span { color: var(--accent); }
+
+  .hero { padding: 64px 0 48px; text-align: center; }
+  .hero h1 { font-size: clamp(1.9rem, 5vw, 3rem); line-height: 1.15; letter-spacing: -.01em; }
+  .hero h1 em { color: var(--accent); font-style: normal; }
+  .hero p.sub { color: var(--muted); max-width: 620px; margin: 20px auto 0; font-size: 1.08rem; }
+  .cta {
+    display: inline-block; margin-top: 32px; padding: 13px 28px; border-radius: 10px;
+    background: var(--accent); color: var(--accent-ink); font-weight: 650; font-size: 1rem;
+  }
+  .cta:hover { filter: brightness(1.08); text-decoration: none; }
+
+  section { padding: 48px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 1.5rem; margin-bottom: 24px; letter-spacing: -.01em; }
+
+  .steps { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .step { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .step .n { color: var(--accent); font-weight: 700; font-size: .9rem; }
+  .step h3 { font-size: 1.02rem; margin: 6px 0 6px; }
+  .step p { color: var(--muted); font-size: .95rem; }
+
+  .feats { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .feat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .feat h3 { font-size: 1rem; margin-bottom: 4px; }
+  .feat p { color: var(--muted); font-size: .93rem; }
+
+  form { background: var(--panel-2); border: 1px solid var(--line); border-radius: 14px; padding: 28px; }
+  label.top { display: block; font-weight: 600; margin-bottom: 8px; }
+  input[type=email], textarea {
+    width: 100%; padding: 12px 14px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  input[type=email]:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  .checks { display: grid; gap: 8px 18px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin-top: 8px; }
+  .checks label {
+    display: flex; gap: 10px; align-items: center; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+    cursor: pointer; font-size: .95rem;
+  }
+  .checks label:has(input:checked) { border-color: var(--accent); }
+  .checks input { accent-color: var(--accent); width: 16px; height: 16px; }
+  .field { margin-top: 22px; }
+  textarea { min-height: 74px; resize: vertical; }
+  button[type=submit] {
+    margin-top: 24px; width: 100%; padding: 14px; border: 0; border-radius: 10px;
+    background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 700; cursor: pointer;
+  }
+  button[type=submit]:hover { filter: brightness(1.08); }
+  button[disabled] { opacity: .6; cursor: default; }
+  .note { color: var(--muted); font-size: .85rem; margin-top: 12px; }
+  #form-msg { margin-top: 14px; font-size: .95rem; display: none; }
+  #form-msg.ok { color: var(--ok); display: block; }
+  #form-msg.err { color: var(--err); display: block; }
+  /* Honeypot: visually gone but present in the DOM for bots to fill. */
+  .hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+
+  .privacy-strip { color: var(--muted); font-size: .95rem; }
+  .privacy-strip strong { color: var(--text); }
+
+  footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: .9rem;
+           display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <div class="logo">Squire<span>.</span></div>
+    <a href="#join">Join the waitlist</a>
+  </header>
+
+  <div class="hero">
+    <h1>Sign up, get a text.<br>That text is <em>your AI agent</em>.</h1>
+    <p class="sub">A personal AI agent in your messages — long-term memory, real tools,
+      reminders, a personality — always on, and living in a private space we can't look into.
+      No setup, no terminal, no self-hosting.</p>
+    <a class="cta" href="#join">Join the waitlist</a>
+  </div>
+
+  <section>
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><h3>Join &amp; sign up</h3>
+        <p>Leave your email today. At launch: sign up and your agent is provisioned in under a minute.</p></div>
+      <div class="step"><div class="n">2</div><h3>Get a text</h3>
+        <p>Your agent messages you first — on Telegram at launch, WhatsApp soon after. It introduces itself and learns what you need.</p></div>
+      <div class="step"><div class="n">3</div><h3>It just helps</h3>
+        <p>Briefings, reminders, email and calendar, research, voice notes. It remembers everything you tell it — and runs on your own ChatGPT or Claude account.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Not a chatbot. A squire.</h2>
+    <div class="feats">
+      <div class="feat"><h3>Pre-tuned from day one</h3><p>Ships with memory, skills, scheduling and an approval flow for risky actions already configured. Day-one capability, not a blank bot.</p></div>
+      <div class="feat"><h3>Bring your own AI</h3><p>Free trial included, then it runs on <em>your</em> ChatGPT or Claude subscription or API key — your costs, your rate limits, your relationship.</p></div>
+      <div class="feat"><h3>Connects to your life</h3><p>Gmail, Google Calendar, GitHub, Notion — connected conversationally, credentials sealed inside your own private runtime.</p></div>
+      <div class="feat"><h3>Private by architecture</h3><p>Isolated runtime per user, per-user encryption keys, operator access audited and break-glass only. Designed so we <em>can't</em> casually see your data.</p></div>
+      <div class="feat"><h3>Always on</h3><p>Wakes you with a morning briefing, watches for what you asked it to watch, runs scheduled tasks while you sleep.</p></div>
+      <div class="feat"><h3>Lives where you text</h3><p>No new app to install or remember to open. Your agent is a contact in the messenger you already use all day.</p></div>
+    </div>
+  </section>
+
+  <section id="join">
+    <h2>Get early access</h2>
+    <form id="waitlist-form" novalidate>
+      <label class="top" for="email">Email</label>
+      <input type="email" id="email" name="email" required maxlength="254" placeholder="you@example.com" autocomplete="email">
+
+      <div class="field">
+        <label class="top">Which of these would you actually use?</label>
+        <!-- `value` slugs are an interface contract with control-api
+             (schemas.WAITLIST_FEATURES) — change both together. -->
+        <div class="checks">
+          <label><input type="checkbox" name="features" value="whatsapp"> WhatsApp</label>
+          <label><input type="checkbox" name="features" value="telegram"> Telegram</label>
+          <label><input type="checkbox" name="features" value="daily_briefings"> Daily briefings &amp; reminders</label>
+          <label><input type="checkbox" name="features" value="email_calendar"> Email + calendar assistant</label>
+          <label><input type="checkbox" name="features" value="github_dev"> GitHub &amp; dev workflows</label>
+          <label><input type="checkbox" name="features" value="voice_notes"> Voice notes</label>
+          <label><input type="checkbox" name="features" value="byo_subscription"> Use my ChatGPT / Claude subscription</label>
+          <label><input type="checkbox" name="features" value="privacy_isolation"> Privacy-first isolation</label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="top" for="use_case">What would you want it to do for you? <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <textarea id="use_case" name="use_case" maxlength="500" placeholder="e.g. triage my inbox and remind me about invoices"></textarea>
+      </div>
+
+      <!-- Honeypot: humans never see it; bots that fill it are silently dropped. -->
+      <div class="hp" aria-hidden="true">
+        <label>Website <input type="text" name="website" tabindex="-1" autocomplete="off"></label>
+      </div>
+
+      <button type="submit" id="submit-btn">Join the waitlist</button>
+      <div id="form-msg" role="status"></div>
+      <p class="note">One or two emails total — early access and launch. No spam, no sharing.
+        See the <a href="/privacy.html">privacy policy</a>.</p>
+    </form>
+  </section>
+
+  <section>
+    <p class="privacy-strip"><strong>Why "we can't look into it" is a design claim, not a promise:</strong>
+      every Squire runs in its own isolated runtime with its own encryption keys. Your credentials
+      go from your browser straight into your agent's space — our control plane has no columns to
+      store your conversations or keys in, and that's enforced by tests that break the build.</p>
+  </section>
+
+  <footer>
+    <div>© 2026 Squire</div>
+    <div><a href="/privacy.html">Privacy</a></div>
+  </footer>
+</div>
+
+<script>
+  // UTM attribution: read once from the landing URL, keep for the session so the
+  // source survives the user browsing to /privacy.html and back before joining.
+  (function () {
+    var params = new URLSearchParams(location.search);
+    ["utm_source", "utm_medium", "utm_campaign"].forEach(function (k) {
+      if (params.get(k)) sessionStorage.setItem(k, params.get(k));
+    });
+    if (document.referrer && !sessionStorage.getItem("referrer")) {
+      sessionStorage.setItem("referrer", document.referrer);
+    }
+  })();
+
+  document.getElementById("waitlist-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var form = e.target;
+    var btn = document.getElementById("submit-btn");
+    var msg = document.getElementById("form-msg");
+
+    var payload = {
+      email: form.email.value.trim(),
+      features: Array.from(form.querySelectorAll('input[name="features"]:checked')).map(function (c) { return c.value; }),
+      use_case: form.use_case.value.trim() || null,
+      utm_source: sessionStorage.getItem("utm_source"),
+      utm_medium: sessionStorage.getItem("utm_medium"),
+      utm_campaign: sessionStorage.getItem("utm_campaign"),
+      referrer: sessionStorage.getItem("referrer"),
+      website: form.website.value || null   // honeypot passthrough
+    };
+
+    if (!payload.email) {
+      msg.className = "err"; msg.textContent = "Please enter your email."; return;
+    }
+
+    btn.disabled = true;
+    fetch("/api/waitlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (resp) {
+      if (resp.ok) {
+        form.querySelectorAll("input, textarea, button").forEach(function (el) { el.disabled = true; });
+        msg.className = "ok";
+        msg.textContent = "You're on the list. We'll text you before anyone else. 🎉";
+      } else if (resp.status === 429) {
+        btn.disabled = false;
+        msg.className = "err"; msg.textContent = "Too many signups from your network — try again in an hour.";
+      } else if (resp.status === 422) {
+        btn.disabled = false;
+        msg.className = "err"; msg.textContent = "That email doesn't look right — mind checking it?";
+      } else {
+        btn.disabled = false;
+        msg.className = "err"; msg.textContent = "Something went wrong on our side. Please try again.";
+      }
+    }).catch(function () {
+      btn.disabled = false;
+      msg.className = "err"; msg.textContent = "Network error — please try again.";
+    });
+  });
+</script>
+</body>
+</html>

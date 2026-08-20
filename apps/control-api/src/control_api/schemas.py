@@ -7,6 +7,7 @@ without coordinating.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -308,3 +309,70 @@ class RedeployResponse(BaseModel):
     #: started, because a fleet upgrade must not resurrect a container the product
     #: switched off (trial expiry, non-payment).
     deployment_triggered: bool
+
+
+# ---------------------------------------------------------------------------
+# Public waitlist (routers/public.py -- the ONLY unauthenticated write route)
+# ---------------------------------------------------------------------------
+
+#: The closed feature-interest set. The landing-page checkboxes and this tuple
+#: must stay in sync (apps/web/site/index.html); the Literal below is what makes
+#: `waitlist.features` structurally unable to hold free-form text.
+WAITLIST_FEATURES = (
+    "whatsapp",
+    "telegram",
+    "daily_briefings",
+    "email_calendar",
+    "github_dev",
+    "voice_notes",
+    "byo_subscription",
+    "privacy_isolation",
+)
+
+WaitlistFeature = Literal[
+    "whatsapp",
+    "telegram",
+    "daily_briefings",
+    "email_calendar",
+    "github_dev",
+    "voice_notes",
+    "byo_subscription",
+    "privacy_isolation",
+]
+
+# Deliberately conservative: we would rather bounce an RFC-valid oddity than
+# accept junk into the launch mailing list. No email-validator dependency needed.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+class WaitlistRequest(BaseModel):
+    """POST /waitlist -- public, so `extra="forbid"` and hard caps on everything.
+
+    `website` is the honeypot: a hidden field humans never see. The route
+    accepts-and-drops submissions that fill it, so bots get a 200 and no row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+    features: list[WaitlistFeature] = Field(default_factory=list, max_length=len(WAITLIST_FEATURES))
+    use_case: str | None = Field(default=None, max_length=500)
+
+    utm_source: str | None = Field(default=None, max_length=100)
+    utm_medium: str | None = Field(default=None, max_length=100)
+    utm_campaign: str | None = Field(default=None, max_length=100)
+    referrer: str | None = Field(default=None, max_length=500)
+
+    website: str | None = Field(default=None, max_length=500)  # honeypot
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _EMAIL_RE.match(value):
+            raise ValueError("not a valid email address")
+        return value
+
+
+class WaitlistResponse(BaseModel):
+    ok: bool = True

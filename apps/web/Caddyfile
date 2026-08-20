@@ -1,0 +1,20 @@
+# Railway terminates TLS at its edge, so Caddy serves plain HTTP on $PORT.
+{
+	auto_https off
+}
+
+:{$PORT} {
+	# The waitlist API. `handle_path` strips the /api prefix, so the browser's
+	# POST /api/waitlist becomes POST /waitlist on control-api.
+	#
+	# CONTROL_API_ORIGIN is a Railway service variable; the default is the
+	# private-network address so waitlist traffic never leaves the project.
+	handle_path /api/* {
+		reverse_proxy {$CONTROL_API_ORIGIN:control-api.railway.internal:8080}
+	}
+
+	handle {
+		root * /srv
+		file_server
+	}
+}

@@ -238,6 +238,48 @@ class Heartbeat(SQLModel, table=True):
     backup_last_success_age_seconds: int | None = None
 
 
+class Waitlist(SQLModel, table=True):
+    """Pre-launch waitlist signup from the marketing site (apps/web).
+
+    Lives in the control DB on purpose: at launch, `waitlist.email` joins against
+    `tenant.email` to answer "which ad channel produced *activated* users", not
+    just emails. Privacy stance (test_privacy_schema.py is the enforcement):
+      * `email` -- signup PII, same precedent as `Tenant.email`.
+      * `features` -- a JSON-encoded list drawn from a CLOSED set
+        (schemas.WAITLIST_FEATURES); the ingest schema rejects anything else,
+        so this column cannot grow free-form user text.
+      * `use_case` -- the one free-text field: a <=500-char marketing survey
+        answer volunteered on the public site. Not tenant conversation content,
+        and `extra="forbid"` on the ingest schema keeps it the only one.
+      * `confirm_token`/`confirmed_at` -- double-opt-in plumbing, shipped now
+        because `create_all` never ALTERs an existing table: adding them after
+        the table exists in prod would mean live DDL. v1 auto-confirms
+        (`confirmed_at` set on insert); the Resend email flow is a fast-follow.
+    """
+
+    id: str = Field(primary_key=True)
+    email: str = Field(index=True, unique=True)
+    # JSON-encoded list[str] from the closed WAITLIST_FEATURES set. A plain text
+    # column (not sa JSON) keeps SQLite tests and Postgres identical.
+    features: str = "[]"
+    use_case: str | None = None
+
+    # Ad attribution, straight from the landing page's hidden fields. This is
+    # what makes the $200 ad experiments measurable: signups-per-source is a
+    # GROUP BY on this table.
+    utm_source: str | None = Field(default=None, index=True)
+    utm_medium: str | None = None
+    utm_campaign: str | None = None
+    referrer: str | None = None
+
+    # Double opt-in (fast-follow; see docstring). Null in v1; when the Resend
+    # flow ships WE mint it -- never user credential material.
+    confirm_token: str | None = None
+    confirmed_at: datetime | None = None
+
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class ProvisionJob(SQLModel, table=True):
     """One provisioning run for one tenant. Re-runnable at any step."""
 

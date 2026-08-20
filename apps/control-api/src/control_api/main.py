@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from control_api import __version__, provisioning
 from control_api.config import get_settings
 from control_api.db import init_db
-from control_api.routers import internal
+from control_api.routers import internal, public
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(internal.router)
+    app.include_router(public.router)
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict[str, str]:
