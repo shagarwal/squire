@@ -60,7 +60,7 @@ Railway compute is ~**$10/GB-RAM/mo + $20/vCPU/mo** (+ $0.15/GB volume). A naive
 
 Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `control-api` with no dashboard clicks; G1 measured; image upgrade drill passed.
 
-> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-20, after the G1 measurement day)
+> ### ▶ NEXT-SESSION START HERE (rewritten 2026-08-20 end-of-day: G1 passed, levers shipped AND rolled out)
 >
 > **Gate G1 is MEASURED and PASSES → the data plane stays on Railway.**
 > Measured live on staging (full numbers: memory `g1-measurement-results.md`):
@@ -98,11 +98,48 @@ Exit criteria: 10 real tenants chatting on Telegram, provisioned end-to-end by `
 >   never funded), and hindsight fails hard, not gracefully. ChatGPT tenants
 >   therefore keep the LOCAL embedder (v0.2.12 reverts that emission); only
 >   plain-OpenAI-key tenants get cloud embeddings.
+> - **Rollout state (end of 2026-08-20 — everything above is LIVE):**
+>   - `TENANT_IMAGE` = **0.2.12** (fleet standard; new provisions get it plus
+>     `SQUIRE_UNBOUND_AWAKE_HOURS=1.0` from control-api).
+>   - Converted tenants redeployed onto 0.2.12 and verified: **+1ctest7**
+>     banner reads `LLM: openai-codex / gpt-5.4-mini`, `Embeddings: local`,
+>     no 401/429. **+1ctest6** deployed healthy and went SLEEPING (Railway
+>     only sleeps a running service); ONE residual queued deploy (same image)
+>     may still be sitting in its queue — glance at it next session.
+>   - Pool sleep verified live: backfilled alpha6 slept ~10 min after boot.
+>     Caveat: alpha6 turned out owner-BOUND, so the *unbound→cap* transition
+>     has only unit-test coverage — check the cadence log of the NEXT fresh
+>     provision (expect `~300s` then `~1800s` after 1h). +1ctest9 (founder's
+>     demo tenant) deliberately untouched: still 0.2.9 + 48h window until its
+>     next redeploy.
+>   - Ops lesson: a tenant deploy can wedge in DEPLOYING and block its queue —
+>     `deploymentCancel(id)` via the Railway GraphQL API unblocks it (worked
+>     twice on 1ctest6, 2026-08-20).
 > - **Open G1 tails**: formal re-measurement at 10-alpha scale (Task 0.6);
 >   Railway support questions (max services/project, GraphQL rate limits,
 >   private-network wake) still unasked; decide whether trial-era memories
 >   need re-embedding after a provider switch (vector-space mix degrades
 >   recall of onboarding facts — only affects plain-OpenAI-key tenants now).
+>
+> **HANDOFF — what's ideally next (Phase 0's only remaining exit criterion is
+> "10 real tenants chatting"; the technical list under it is done):**
+> 1. **Upgrade drill** (`infra/upgrade_drill.py`): canary → roll → rollback,
+>    written but never exercised. Half a day; do it BEFORE strangers exist.
+>    Sleeping tenants are skipped by design (see REDEPLOYABLE_STATUSES) and
+>    need a manual follow-up pass.
+> 2. **1H shared-bots decision** (founder), then top up the pool
+>    (`infra/load_bots.py` — pool is 5/5, every test provision evicts someone).
+> 3. **Waitlist site**: merge `worktree-waitlist-site`, buy the domain, point
+>    the $200 ad budget at it → first stranger cohort.
+> 4. **B2 backups** (blocked on founder creating the Backblaze account) —
+>    tenants still have no off-volume backup.
+> 5. Parked founder decisions: Squire-owned embeddings key (control-api
+>    `TENANT_EMBEDDINGS_*` diff, UNCOMMITTED in the working tree — commit or
+>    drop); start Google restricted-scope verification early for 2B (weeks of
+>    lead time, gates the WhatsApp-launch OAuth client).
+> 6. Known non-blocking: bug 3 (s6 `gateway-default` grabs the profile on
+>    boots of aged volumes → supervisord's gateway FATAL, `gateway_up` false
+>    negative; bot fine via the s6 gateway).
 >
 > *(Below: the 2026-08-19 rewrite, kept for context.)*
 >
