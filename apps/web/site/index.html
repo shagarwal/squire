@@ -73,13 +73,21 @@
   .kicker { color: var(--accent); font: 600 .82rem var(--body); letter-spacing: .1em; text-transform: uppercase; }
   .kicker + h2 { margin-top: 10px; }
 
-  /* ---- "Things people hand it" — asks, phrased as texts ---- */
-  .asks { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 12px; }
-  .ask {
-    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
-    padding: 10px 18px; font-size: .95rem; color: var(--ink);
-  }
-  .asks + p { margin-top: 26px; color: var(--muted); max-width: 46em; }
+  /* ---- Capabilities + integrations ---- */
+  .caps { margin-top: 34px; display: grid; gap: 30px 36px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .caps h3 { font-size: 1.05rem; font-weight: 650; margin-bottom: 6px; }
+  .caps p { color: var(--muted); font-size: .95rem; }
+  .connects { margin-top: 46px; }
+  .connects .label { color: var(--muted); font-size: .92rem; margin-bottom: 12px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip { background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+          padding: 8px 16px; font-size: .92rem; font-weight: 500; }
+  .chip.soon { color: var(--muted); font-weight: 400; border-style: dashed; }
+
+  /* Step numbers: the founder wants How-it-works explicitly numbered. */
+  .num { width: 34px; height: 34px; border-radius: 50%; background: var(--mist);
+         color: var(--accent-deep); font: 650 1.05rem var(--display);
+         display: flex; align-items: center; justify-content: center; margin-bottom: 14px; }
 
   .three { display: grid; gap: 40px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 34px; }
   .three h3 { font-size: 1.08rem; font-weight: 650; margin-bottom: 8px; }
@@ -146,28 +154,38 @@
   </div>
 
   <section>
-    <div class="kicker">What people hand it</div>
-    <h2>Say it once. It's handled.</h2>
-    <div class="asks">
-      <div class="ask">“Remind me to renew my passport in March”</div>
-      <div class="ask">“What did the dentist say last month?”</div>
-      <div class="ask">“Watch flights to Lisbon and tell me when they drop”</div>
-      <div class="ask">“Draft a kind reply to this email”</div>
-      <div class="ask">“Every Friday, send me what I spent this week”</div>
-      <div class="ask">“Don't let me forget Dad's birthday again”</div>
+    <div class="kicker">What it can do</div>
+    <h2>A real assistant, not a chatbot.</h2>
+    <div class="caps">
+      <div><h3>Remembers everything</h3><p>Your people, your dates, your preferences — and that thing you mentioned three weeks ago. Ask anytime.</p></div>
+      <div><h3>Reminds you in time</h3><p>One-off or recurring, in plain words: “every first of the month”, “the night before”.</p></div>
+      <div><h3>Handles your email</h3><p>Triages your inbox, surfaces what matters, drafts replies in your voice.</p></div>
+      <div><h3>Runs your calendar</h3><p>Books, reschedules, and flags conflicts before they bite.</p></div>
+      <div><h3>Does the legwork online</h3><p>Research, comparisons, price-watching — it goes and finds out, then reports back.</p></div>
+      <div><h3>Works while you sleep</h3><p>Morning briefings and standing tasks run on schedule, without being asked twice.</p></div>
+      <div><h3>Speaks developer</h3><p>Watches your GitHub — issues, pull requests, and “nudge me to review that”.</p></div>
+      <div><h3>Asks before it acts</h3><p>Anything consequential gets a “want me to?” first. You stay in charge.</p></div>
     </div>
-    <p>It reads your reminders back at the right moment, keeps notes on what matters to you,
-       drafts messages in your voice, and checks things off while you get on with your day.
-       The longer you use it, the more it knows how you like things done.</p>
+    <div class="connects">
+      <div class="label">Connects to the tools you already use</div>
+      <div class="chips">
+        <div class="chip">Gmail</div>
+        <div class="chip">Google Calendar</div>
+        <div class="chip">Google Drive</div>
+        <div class="chip">GitHub</div>
+        <div class="chip">Your ChatGPT or Claude account</div>
+        <div class="chip soon">More on the way</div>
+      </div>
+    </div>
   </section>
 
   <section>
     <div class="kicker">How it works</div>
     <h2>No app. No setup. Just a new contact.</h2>
     <div class="three">
-      <div><h3>Join today</h3><p>Leave your email below and we'll hold your place in line.</p></div>
-      <div><h3>Get a text at launch</h3><p>Your assistant messages you first — on Telegram to start, WhatsApp soon after. It introduces itself and asks what you need.</p></div>
-      <div><h3>Make it yours</h3><p>It learns your people, your dates, your preferences. Connect your email and calendar when you're ready — or never. Your call.</p></div>
+      <div><div class="num">1</div><h3>Join today</h3><p>Leave your email below and we'll hold your place in line.</p></div>
+      <div><div class="num">2</div><h3>Get a text at launch</h3><p>Your assistant messages you first — on Telegram to start, WhatsApp soon after. It introduces itself and asks what you need.</p></div>
+      <div><div class="num">3</div><h3>Make it yours</h3><p>It learns your people, your dates, your preferences. Connect your email and calendar when you're ready — or never. Your call.</p></div>
     </div>
   </section>
 
