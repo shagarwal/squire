@@ -374,19 +374,36 @@
     var SCENES = [
       [ // 1. Travel rescue
         { who: "me", text: "my flight to Denver just got cancelled 😩" },
-        { who: "sq", text: "On it. United has a 7:05pm tonight with one aisle seat left, or 9:20am tomorrow. Which one?" },
+        { who: "sq", text: "Ugh. One sec, pulling up your options." },
+        { who: "sq", text: "United has a 7:05pm tonight — one aisle seat left — or 9:20am tomorrow, landing 10:41. Which one?" },
         { who: "me", text: "7:05 please" },
-        { who: "sq", text: "Rebooked — confirmation UA-4821. I moved your 6pm call to Thursday and let Sam know you'll land late." }
+        { who: "sq", text: "Rebooked — confirmation UA-4821. Want me to move tonight's 6pm call with Sam?" },
+        { who: "me", text: "yes, and let him know why" },
+        { who: "sq", text: "Done: call moved to Thursday 2pm, and Sam knows you'll land late. Uber to the airport at 5:10?" },
+        { who: "me", text: "perfect 🙌" },
+        { who: "sq", text: "Booked. I'll check you in and text you the boarding pass an hour before." }
       ],
       [ // 2. Proactive morning briefing
-        { who: "sq", text: "Morning ☀️ Three things: your car registration expires Friday (renewal form is filled out), Mia's recital is at 5pm, and you still owe Alex a reply — I drafted one." },
-        { who: "me", text: "send the reply, remind me at 4:15 about the recital" },
-        { who: "sq", text: "Sent, and reminder set for 4:15. Anything else before your 10 o'clock?" }
+        { who: "sq", text: "Morning ☀️ Three things today: your car registration expires Friday — renewal form's filled out, just needs your OK. Mia's recital is at 5pm. And you still owe Alex a reply — I drafted one in your tone." },
+        { who: "me", text: "read me the draft" },
+        { who: "sq", text: "“Alex — sorry for the slow reply. Thursday works. Let's do 12:30 at the usual place, I'll bring the paperwork.”" },
+        { who: "me", text: "make it 1pm and send it" },
+        { who: "sq", text: "Sent with 1pm. Your calendar's updated and the table's booked for two." },
+        { who: "me", text: "and remind me at 4:15 about the recital" },
+        { who: "sq", text: "Will do — 4:15 reminder set. There's a flower shop on the way to the school; want me to reserve a bouquet for pickup? 💐" },
+        { who: "me", text: "you think of everything" },
+        { who: "sq", text: "That's the job. Reserved under your name for 4:40." }
       ],
       [ // 3. Developer chores
-        { who: "sq", text: "Heads up — CI failed on your release branch. Same flaky test as last week. Re-run, or should I open an issue?" },
-        { who: "me", text: "re-run it, open the issue if it fails again" },
-        { who: "sq", text: "Re-run passed ✅ I'll keep an eye on that test and nag you if it flakes twice more." }
+        { who: "sq", text: "Heads up — CI failed on your release branch. Same flaky test as last week (test_retry_backoff)." },
+        { who: "me", text: "re-run it" },
+        { who: "sq", text: "Re-run passed ✅ That's three flakes in two weeks though. Want an issue so it stops haunting you?" },
+        { who: "me", text: "yes, assign it to me and attach the failure logs" },
+        { who: "sq", text: "Issue #214 opened with both failure logs. Also: two PRs are waiting on your review, and one is blocking Dana." },
+        { who: "me", text: "which one's blocking her?" },
+        { who: "sq", text: "#209, the auth middleware refactor — about 200 lines, tests green. You're free after your 6pm; review it then?" },
+        { who: "me", text: "yeah, put 30 min on my calendar" },
+        { who: "sq", text: "Scheduled 8:00–8:30, and I'll send you the diff summary right before." }
       ]
     ];
 
